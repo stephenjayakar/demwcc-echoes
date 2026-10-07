@@ -194,11 +194,25 @@ pub fn explain_sched_diff(comp: &Compiler, cand_src: &str, func: &str, target_ob
         }
         None
     };
-    let line_of = |off: u32| -> Option<u32> { lines.as_ref().and_then(|l| l.get((off / 4) as usize).copied().flatten()) };
+    // prologue/epilogue instructions carry the function's first/last line: never a statement to move
+    let frame = schedcheck::frame_offsets(&cf);
+    let line_of = |off: u32| -> Option<u32> {
+        if frame.contains(&off) {
+            return None;
+        }
+        lines.as_ref().and_then(|l| l.get((off / 4) as usize).copied().flatten())
+    };
     let mut out = vec![];
     for blk in &rep.blocks {
         for inv in &blk.inversions {
-            let (f, s) = (&inv.cand_first, &inv.cand_second);
+            let unframe = |r: &InstrRef| {
+                let mut r = r.clone();
+                if frame.contains(&r.cand_off) {
+                    r.line = None;
+                }
+                r
+            };
+            let (f, s) = (&unframe(&inv.cand_first), &unframe(&inv.cand_second));
             let mut adv = OrderAdvice {
                 first: f.clone(),
                 second: s.clone(),

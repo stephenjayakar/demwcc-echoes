@@ -170,6 +170,74 @@ pub fn canon_cond(e: &mut Expr) {
     }
 }
 
+/// A bool inline's value as a condition: ternaries over 0/1 arms (`c ? (a ? 1 : b != 0) : 0`,
+/// the form a returned `bool` folds to) as `&&` / `||` chains (`c && (a || b != 0)`), the form
+/// the inline takes inside an `if` condition. None if `e` has no such ternary.
+pub fn bool_form(e: &Expr) -> Option<Expr> {
+    fn lit(e: &Expr) -> Option<bool> {
+        match e {
+            Expr::Int { value: 0, .. } => Some(false),
+            Expr::Int { value: 1, .. } => Some(true),
+            _ => None,
+        }
+    }
+    fn b(e: &Expr) -> Option<Expr> {
+        match e {
+            Expr::Ternary { .. } => conv(e),
+            Expr::Int { .. } => None,
+            e => Some(e.clone()),
+        }
+    }
+    fn n(e: &Expr) -> Option<Expr> {
+        let mut x = Expr::Unary { op: UnOp::Not, e: Box::new(b(e)?), ty: Type::Bool };
+        canon_cond(&mut x);
+        Some(x)
+    }
+    fn and(l: Expr, r: Expr) -> Expr {
+        Expr::Binary { op: BinOp::LogAnd, l: Box::new(l), r: Box::new(r), ty: Type::Bool }
+    }
+    fn or(l: Expr, r: Expr) -> Expr {
+        Expr::Binary { op: BinOp::LogOr, l: Box::new(l), r: Box::new(r), ty: Type::Bool }
+    }
+    fn conv(e: &Expr) -> Option<Expr> {
+        let Expr::Ternary { c, t, f, .. } = e else { return None };
+        Some(match (lit(t), lit(f)) {
+            (Some(true), Some(false)) => b(c)?,
+            (Some(false), Some(true)) => n(c)?,
+            (None, Some(false)) => and(b(c)?, b(t)?),
+            (Some(false), None) => and(n(c)?, b(f)?),
+            (Some(true), None) => or(b(c)?, b(f)?),
+            (None, Some(true)) => or(n(c)?, b(t)?),
+            _ => return None,
+        })
+    }
+    let mut has = false;
+    e.walk(&mut |x| has |= matches!(x, Expr::Ternary { .. }));
+    if !has {
+        return None;
+    }
+    let out = conv(e)?;
+    let mut left = false;
+    out.walk(&mut |x| left |= matches!(x, Expr::Ternary { .. }));
+    (!left).then_some(out)
+}
+
+/// The condition form of a `bool` inline with a control-flow value (see [`bool_form`]).
+pub fn bool_template(t: &crate::Template) -> Option<crate::Template> {
+    let Shape::Scalar(p) = &t.shape else { return None };
+    if !matches!(crate::util::strip(&t.sig.ret), Type::Bool) || t.ret_ref {
+        return None;
+    }
+    let q = bool_form(p)?;
+    if !matches!(q, Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, .. }) {
+        return None;
+    }
+    let mut d = t.clone();
+    d.ops = crate::template::count_ops(&q);
+    d.shape = Shape::Scalar(q);
+    Some(d)
+}
+
 /// Does `e` contain a ternary or logical operator (a control-flow value)?
 pub fn has_cflow(e: &Expr) -> bool {
     let mut f = false;

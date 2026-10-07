@@ -253,7 +253,7 @@ pub struct TraceOptions {
 
 // ------------------------------------------------------------------ Win32 FFI (no crates)
 #[allow(non_snake_case, non_camel_case_types, dead_code)]
-mod ffi {
+pub(crate) mod ffi {
     use std::ffi::c_void;
     pub type HANDLE = *mut c_void;
     #[repr(C)]
@@ -313,6 +313,7 @@ mod ffi {
         pub u: DEBUG_EVENT_U,
     }
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct WOW64_CONTEXT {
         pub ContextFlags: u32,
         pub Dr: [u32; 6],
@@ -451,7 +452,7 @@ impl Debuggee {
     }
 }
 
-fn quote_arg(a: &str) -> String {
+pub(crate) fn quote_arg(a: &str) -> String {
     if a.is_empty() || a.contains(' ') || a.contains('"') {
         format!("\"{}\"", a.replace('"', "\\\""))
     } else {
@@ -459,7 +460,7 @@ fn quote_arg(a: &str) -> String {
     }
 }
 
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 

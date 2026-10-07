@@ -30,7 +30,10 @@ project root with a bounded process pool: `precompile` (per-unit `.mch` precompi
 `MwccError` separates compile errors, crashes and timeouts. The `split` module works around
 compiler crashes with some precompiled headers (`repair`, `uses_split`). `compare`,
 `compare_detailed` and `compare_indexed` (with `ObjIndex`, `ExternIndex` for literals defined
-in other objects of the module) implement the comparator and return a `DiffClass`.
+in other objects of the module) implement the comparator and return a `DiffClass`. The `fast`
+module (`enable_fast`, on for the search drivers) serves `compile_in` from persistent compiler
+processes (`mwdec_oracle::persist`) on dedicated worker threads; failures are recompiled
+normally, `Compiled::fast` marks such objects and `compile_in_normal` confirms exact matches.
 
 **`mwdec-ctx`**: type context. `build_typedb(context_tu, cflags, work_dir) -> TypeDb`
 preprocesses the context, scans declarations (`scan`), compiles forcing declarations with `-g`,
@@ -87,7 +90,7 @@ graph TD
   emit[mwdec-emit] --> lift & core
   lift[mwdec-lift] --> ctx & obj & core
   ctx[mwdec-ctx] --> mwcc & obj & core
-  mwcc[mwdec-mwcc] --> obj & core
+  mwcc[mwdec-mwcc] --> oracle & obj & core
   project[mwdec-project] --> obj & core
   obj[mwdec-obj] --> core
   oracle[mwdec-oracle] --> core
@@ -100,10 +103,10 @@ The same as layers (each layer uses only layers below it):
             mwdec (CLI)
      mwdec-search        mwdec-inline
           |              mwdec-emit
-     mwdec-oracle        mwdec-lift
+          |              mwdec-lift
           |              mwdec-ctx
-          |     mwdec-mwcc     mwdec-project
-          |           mwdec-obj
+          |-------- mwdec-mwcc     mwdec-project
+     mwdec-oracle         mwdec-obj
                      mwdec-core
 ```
 
@@ -172,6 +175,7 @@ with it; nothing grows with the number of functions processed.
 | split-PCH repairs (`<hash>.split`) | `mwdec_mwcc::split` | disk, next to the PCH | one per context |
 | compiled candidates (`<hash>.o` / `.err`) | `Mwcc::compile_in` | disk: `<mwcc work>/cache` | off for search drivers (`Compilers::for_unit` sets `disk_cache = None`); on for `check` and probe drivers |
 | compiled candidates | `Mwcc` `MemCache` | memory | byte budget, 96 MB default (`MWDEC_MEMCACHE_MB`), oldest evicted first; per driver |
+| parsed contexts (persistent compiler snapshots) | `Mwcc` fast path | memory + one idle compiler process each | at most workers (<= 4) x 2 per driver, LRU per worker; ended with the driver (harvest: 2 workers per unit driver); `MWDEC_PERSIST=0` turns it off |
 | TypeDb per context (`<hash>.json.gz`) | `mwdec_ctx::build_typedb_in` | disk: `<work base>/mwdec-ctx/ctxcache` | one per (context, flags, root) |
 | inline templates and probe failures | `mwdec_inline::ProbeCache` | disk: `<work base>/mwdec-inline/tcache/<generation>` | keyed by probe text + compiler + flags |
 | probe compiles | `Compilers::probe_driver` | disk: `<mwcc work>/inline-probes/<compiler>` | shared across units and runs |

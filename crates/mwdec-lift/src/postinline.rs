@@ -1,0 +1,151 @@
+//! Clean-ups for bodies after recognised inline expansions were folded back into calls.
+
+use crate::ir::*;
+use std::collections::HashMap;
+
+/// A call that stands for an inline expansion (built after lifting: no symbol of its own).
+pub fn is_inline_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call { callee: Callee::Direct { symbol, sig }, .. } => *symbol == sig.qualified_name && sig.mangled.as_deref().map_or(true, |m| m != symbol),
+        Expr::Call { callee: Callee::Method { symbol, .. }, .. } => symbol.is_empty(),
+        _ => false,
+    }
+}
+
+/// An inline call written as a call (operators render infix, where a forwarded argument would
+/// need its own parentheses).
+fn is_plain_inline_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } => is_inline_call(e) && !sig.qualified_name.contains("operator"),
+        _ => false,
+    }
+}
+
+fn count_defs(body: &mut Vec<Stmt>) -> HashMap<VarId, usize> {
+    let mut n: HashMap<VarId, usize> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), .. } = s {
+                *n.entry(*v).or_default() += 1;
+            }
+        }
+    });
+    n
+}
+
+/// Does `e` contain a call other than inline expansions?
+fn has_real_call(e: &Expr) -> bool {
+    let mut found = false;
+    e.walk(&mut |x| match x {
+        Expr::Call { .. } if !is_inline_call(x) => found = true,
+        Expr::New { .. } | Expr::IncDec { .. } => found = true,
+        _ => {}
+    });
+    found
+}
+
+fn stmt_has_real_call(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => has_real_call(e),
+        Stmt::Assign { dst, src } => has_real_call(dst) || has_real_call(src),
+        _ => true,
+    }
+}
+
+/// Reads memory (or anything a call could change)?
+fn reads_memory(e: &Expr) -> bool {
+    let mut found = false;
+    e.walk(&mut |x| {
+        if matches!(x, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::BitField { .. } | Expr::Global { .. } | Expr::Call { .. } | Expr::New { .. } | Expr::IncDec { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Replace the single argument `Var(v)` of an inline call in `e` by `val`. True if replaced.
+fn subst_inline_arg(e: &mut Expr, v: VarId, val: &Expr) -> bool {
+    let mut done = false;
+    e.rewrite(&mut |x| {
+        if done || !is_plain_inline_call(x) {
+            return;
+        }
+        if let Expr::Call { args, .. } = x {
+            for a in args.iter_mut() {
+                if matches!(a, Expr::Var(y) if *y == v) {
+                    *a = val.clone();
+                    done = true;
+                    return;
+                }
+            }
+        }
+    });
+    done
+}
+
+/// `v = e; x = inl(.., v, ..);` with `v` a local defined and read only there is
+/// `x = inl(.., e, ..)`: a named local bound to the inline's (reference) parameter is a
+/// different object from the argument temporary and changes the expansion's registers and
+/// branch layout (`b` over an empty arm of a min/max select). Assignments of other locals in
+/// between (no calls, not read by `e`) stay before the use.
+pub fn forward_inline_args(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    let defs = count_defs(body);
+    let mut uses = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let mut target = None;
+            if let Stmt::Assign { dst: Expr::Var(v), src } = &b[i] {
+                // the next statement reading v, past assignments that can't change `e`
+                let mut j = i + 1;
+                while j < b.len() && j <= i + 4 && !crate::idioms::stmt_mentions(&b[j], *v) {
+                    match &b[j] {
+                        Stmt::Assign { dst: Expr::Var(w), src: s } if !src.uses_var(*w) && !has_real_call(s) => j += 1,
+                        _ => break,
+                    }
+                }
+                if j < b.len() && crate::idioms::stmt_mentions(&b[j], *v) {
+                    // read only there: the only def and use, or that statement redefines it from
+                    // its single read (`v = e; v = inl(.., v, ..)`)
+                    let only_here = defs.get(v) == Some(&1) && uses.get(v) == Some(&1);
+                    let redefined = matches!(&b[j], Stmt::Assign { dst: Expr::Var(w), src: s2 } if w == v && {
+                        let mut u = HashMap::new();
+                        crate::inline::count_uses(std::slice::from_ref(&b[j]), &mut u);
+                        u.get(v) == Some(&1) && s2.uses_var(*v)
+                    });
+                    // a value merged with the inline's result (several definitions when lifted,
+                    // `var_`) or the variable the result goes back to; a single-definition temp
+                    // the lifter kept apart was a variable of its own
+                    let merged = vars.get(*v).map_or(false, |x| x.name.starts_with("var_"));
+                    let ok = matches!(vars.get(*v).map(|x| &x.kind), Some(VarKind::Local))
+                        // (past other assignments only when the use redefines it)
+                        && ((only_here && merged && j == i + 1) || redefined)
+                        && !has_real_call(src)
+                        && !src.uses_var(*v)
+                        // nothing evaluated before the argument may change what `e` reads
+                        && (!reads_memory(src) || !stmt_has_real_call(&b[j]));
+                    if ok {
+                        target = Some(j);
+                    }
+                }
+            }
+            if let Some(j) = target {
+                let Stmt::Assign { dst: Expr::Var(v), src } = b[i].clone() else { unreachable!() };
+                let replaced = match &mut b[j] {
+                    Stmt::Assign { dst, src: s2 } => (matches!(dst, Expr::Var(w) if *w == v) || !dst.uses_var(v)) && subst_inline_arg(s2, v, &src),
+                    Stmt::Expr(e) | Stmt::Return(Some(e)) => subst_inline_arg(e, v, &src),
+                    _ => false,
+                };
+                if replaced {
+                    b.remove(i);
+                    n += 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    });
+    n
+}

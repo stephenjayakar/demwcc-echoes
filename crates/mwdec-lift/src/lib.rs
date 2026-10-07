@@ -26,6 +26,8 @@ pub mod idioms;
 pub mod indexing;
 pub mod inline;
 pub mod localtypes;
+pub mod objcmp;
+pub mod postinline;
 pub mod insn;
 pub mod ir;
 pub mod sig;
@@ -226,9 +228,13 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     localtypes::global_types(&mut body, &l.vars, &l.ret_ty, db);
     localtypes::undeclared_returns(&mut body, &l.ret_ty, db);
     localtypes::drop_redundant_masks(&mut body, &l.vars, db);
+    localtypes::cast_intrinsic_args(&mut body, &l.vars);
     debug::stage("aggregates/bitfields", &body, &l.vars);
+    objcmp::object_compares(&mut body, &l.vars, db);
+    unroll::reroll_const(&mut body);
     ctrloop::recover(&mut body, &mut l.vars, &mut l.is_temp);
     ctrloop::recover_shape_b(&mut body, &l.vars, &l.is_temp);
+    ctrloop::counted_for(&mut body, &mut l.vars, &mut l.is_temp);
     ctrloop::rematerialize_global_temps(&mut body, &l.vars, &l.is_temp);
     debug::stage("ctrloop", &body, &l.vars);
     simplify::recover_ctr_loops(&mut body, &mut l.vars, &mut l.is_temp);
@@ -242,6 +248,8 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::form_incdec(&mut body, &l.vars, &l.is_temp, db);
     simplify::fold_ternary_constants(&mut body);
     simplify::inline_ternary_results(&mut body);
+    bitfields::insert_chains(&mut body, &mut l.vars, &mut l.is_temp);
+    localtypes::forward_global_pointers(&mut body, &l.vars, &l.is_temp);
     if ret_void {
         simplify::drop_trailing_return(&mut body);
     }

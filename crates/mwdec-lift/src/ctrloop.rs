@@ -505,6 +505,18 @@ pub fn recover(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool
     }
 }
 
+/// `continue`/`break` of this loop level (not of nested loops; `break` in a switch is the
+/// switch's own).
+fn has_own_jump(b: &[Stmt], in_switch: bool) -> bool {
+    b.iter().any(|s| match s {
+        Stmt::Continue => true,
+        Stmt::Break => !in_switch,
+        Stmt::If { then, els, .. } => has_own_jump(then, in_switch) || has_own_jump(els, in_switch),
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| has_own_jump(&c.body, true)),
+        _ => false,
+    })
+}
+
 /// Returns Some(new var to add (if any)) when the loop at b[j] was rerolled.
 fn try_reroll(b: &mut Vec<Stmt>, j: usize, vars: &[Var], is_temp: &[bool], whole: &[Stmt], next_var: VarId) -> Option<Option<Var>> {
     let shape = loop_shape(&b[j], vars, b.get(j + 1))?;
@@ -994,6 +1006,137 @@ pub fn recover_shape_b(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
             }
         }
     });
+}
+
+/// `X + 1 - A` (inclusive) or `X - A` (exclusive) trip counts: (A, X, inclusive).
+fn trip_bounds(src: &Expr) -> Option<(Expr, Expr, bool)> {
+    match strip(src) {
+        Expr::Binary { op: BinOp::Sub, l, r, .. } => match strip(l) {
+            Expr::Binary { op: BinOp::Add, l: x, r: one, .. } if one.as_int() == Some(1) => Some(((**r).clone(), (**x).clone(), true)),
+            _ => Some(((**r).clone(), (**l).clone(), false)),
+        },
+        Expr::Binary { op: BinOp::Add, l, r: one, .. } if one.as_int() == Some(1) => match strip(l) {
+            Expr::Binary { op: BinOp::Sub, l: x, r: a, .. } => Some(((**a).clone(), (**x).clone(), true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn assigns_any(b: &[Stmt], vs: &[VarId]) -> bool {
+    let mut found = false;
+    let mut v = b.to_vec();
+    Stmt::for_each_block_mut(&mut v, &mut |blk| {
+        for s in blk.iter() {
+            if let Stmt::Assign { dst: Expr::Var(x), .. } = s {
+                if vs.contains(x) {
+                    found = true;
+                }
+            }
+        }
+    });
+    let mut inc = false;
+    for s in b {
+        if let Stmt::Expr(e) | Stmt::Assign { src: e, .. } = s {
+            e.walk(&mut |x| {
+                if let Expr::IncDec { e, .. } = x {
+                    if matches!(strip(e), Expr::Var(y) if vs.contains(y)) {
+                        inc = true;
+                    }
+                }
+            });
+        }
+    }
+    found || inc
+}
+
+/// The unknown-count loop recovered from shape B under its own range guard:
+/// `n = X + 1 - A; if (A <= X) { while (n != 0) { B; n--; } }` is
+/// `for (i = A; i <= X; i++) { B }` (the compiler's count `X - A` for `<`). The guard is the
+/// for's first test; a `while (n != 0)` would add a test of its own.
+pub fn counted_for(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
+    let snapshot = body.clone();
+    let mut new_vars: Vec<Var> = vec![];
+    let nvars = vars.len();
+    {
+        let vars_ro: &[Var] = vars;
+        Stmt::for_each_block_mut(body, &mut |b| {
+            let mut i = 0;
+            while i + 1 < b.len() {
+                let found = (|| {
+                    let Stmt::Assign { dst: Expr::Var(n), src } = &b[i] else { return None };
+                    let n = *n;
+                    if !matches!(vars_ro[n].kind, VarKind::Local) || count_reads(&snapshot, n) != 2 {
+                        return None;
+                    }
+                    let (a, x, incl) = trip_bounds(src)?;
+                    let Stmt::If { cond, then, els } = &b[i + 1] else { return None };
+                    if !els.is_empty() || then.len() != 1 {
+                        return None;
+                    }
+                    let Expr::Binary { op, l, r, .. } = strip(cond) else { return None };
+                    let (sa, sx) = (strip(&a), strip(&x));
+                    let ok = match op {
+                        BinOp::Le => incl && strip(l) == sa && strip(r) == sx,
+                        BinOp::Ge => incl && strip(l) == sx && strip(r) == sa,
+                        BinOp::Lt => !incl && strip(l) == sa && strip(r) == sx,
+                        BinOp::Gt => !incl && strip(l) == sx && strip(r) == sa,
+                        _ => false,
+                    };
+                    if !ok {
+                        return None;
+                    }
+                    let Stmt::While { cond: wc, body: wb } = &then[0] else { return None };
+                    if !matches!(strip_ne0(wc), Expr::Var(y) if *y == n) {
+                        return None;
+                    }
+                    let last = wb.iter().rposition(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_)))?;
+                    if !is_dec(&wb[last], n) {
+                        return None;
+                    }
+                    let mut lb = wb.clone();
+                    lb.remove(last);
+                    if lb.iter().any(|s| crate::idioms::stmt_mentions(s, n)) || has_own_jump(&lb, false) {
+                        return None;
+                    }
+                    // the bounds are read once, before the loop: nothing in it may change them
+                    let mut bvars = vec![];
+                    for e in [&a, &x] {
+                        let mut pure = true;
+                        e.walk(&mut |y| match y {
+                            Expr::Var(v) => bvars.push(*v),
+                            Expr::Int { .. } | Expr::Cast { .. } | Expr::Binary { .. } | Expr::Unary { .. } => {}
+                            _ => pure = false,
+                        });
+                        if !pure {
+                            return None;
+                        }
+                    }
+                    if assigns_any(&lb, &bvars) {
+                        return None;
+                    }
+                    Some((a, x, incl, lb))
+                })();
+                if let Some((a, x, incl, lb)) = found {
+                    let iv = nvars + new_vars.len();
+                    let ty = t_s32();
+                    new_vars.push(Var { name: "i".into(), ty: ty.clone(), kind: VarKind::Local });
+                    let f = Stmt::For {
+                        init: vec![Stmt::Assign { dst: Expr::Var(iv), src: a }],
+                        cond: Expr::cmp(if incl { BinOp::Le } else { BinOp::Lt }, Expr::Var(iv), x),
+                        step: vec![Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(iv)), delta: 1, post: true })],
+                        body: lb,
+                    };
+                    b.splice(i..=i + 1, [f]);
+                }
+                i += 1;
+            }
+        });
+    }
+    for v in new_vars {
+        vars.push(v);
+        is_temp.push(false);
+    }
 }
 
 fn strip_ne0(e: &Expr) -> &Expr {

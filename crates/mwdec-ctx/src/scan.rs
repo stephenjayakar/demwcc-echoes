@@ -689,20 +689,70 @@ impl<'t> Scanner<'t> {
                 }
             } else if scope != "@anon" && !decl.iter().any(|t| t.is("operator")) {
                 self.out.globals.push(qual(scope, &name));
-                // `T name[N] : 0xADDR` (CodeWarrior absolute-address variable)
+                // `T name[N] : 0xADDR` (CodeWarrior absolute-address variable; the address may be a
+                // constant expression: `: (0x80000000 | 0x00F8)`)
                 if let Some(c) = toks.iter().position(|w| w == ":") {
-                    let lit = toks.get(c + 1).map(|s| s.trim_end_matches(|ch: char| matches!(ch, 'u' | 'U' | 'l' | 'L')));
-                    let addr = lit.and_then(|s| match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                        Some(h) => u32::from_str_radix(h, 16).ok(),
-                        None => s.parse::<u32>().ok(),
-                    });
-                    if let (Some(a), true) = (addr, toks.len() == c + 2) {
+                    if let Some(a) = const_expr(&toks[c + 1..]) {
                         self.out.abs_addrs.push((qual(scope, &name), a));
                     }
                 }
             }
         }
     }
+}
+
+/// Value of a constant address expression: integer literals combined with `|`, `<<`, `+` and
+/// parentheses (C precedence).
+fn const_expr(toks: &[String]) -> Option<u32> {
+    fn lit(s: &str) -> Option<u32> {
+        let s = s.trim_end_matches(|ch: char| matches!(ch, 'u' | 'U' | 'l' | 'L'));
+        match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(h) => u32::from_str_radix(h, 16).ok(),
+            None => s.parse::<u32>().ok(),
+        }
+    }
+    fn expr(t: &[String], i: &mut usize) -> Option<u32> {
+        let mut v = shift(t, i)?;
+        while *i < t.len() && t[*i] == "|" {
+            *i += 1;
+            v |= shift(t, i)?;
+        }
+        Some(v)
+    }
+    fn shift(t: &[String], i: &mut usize) -> Option<u32> {
+        let mut v = add(t, i)?;
+        // (the tokenizer splits `<<` into two `<`)
+        while *i + 1 < t.len() && t[*i] == "<" && t[*i + 1] == "<" {
+            *i += 2;
+            v = v.checked_shl(add(t, i)?)?;
+        }
+        Some(v)
+    }
+    fn add(t: &[String], i: &mut usize) -> Option<u32> {
+        let mut v = term(t, i)?;
+        while *i < t.len() && t[*i] == "+" {
+            *i += 1;
+            v = v.wrapping_add(term(t, i)?);
+        }
+        Some(v)
+    }
+    fn term(t: &[String], i: &mut usize) -> Option<u32> {
+        if t.get(*i)? == "(" {
+            *i += 1;
+            let v = expr(t, i)?;
+            if t.get(*i)? != ")" {
+                return None;
+            }
+            *i += 1;
+            return Some(v);
+        }
+        let v = lit(t.get(*i)?)?;
+        *i += 1;
+        Some(v)
+    }
+    let mut i = 0;
+    let v = expr(toks, &mut i)?;
+    (i == toks.len()).then_some(v)
 }
 
 /// Split tokens at a top-level separator (outside (), [], <>, {}).

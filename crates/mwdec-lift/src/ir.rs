@@ -576,11 +576,16 @@ impl Expr {
     pub fn has_call(&self) -> bool {
         let mut found = false;
         self.walk(&mut |e| {
-            if matches!(e, Expr::Call { .. } | Expr::New { .. } | Expr::IncDec { .. }) {
+            if matches!(e, Expr::Call { .. } | Expr::New { .. } | Expr::IncDec { .. }) && !e.is_pure_call() {
                 found = true
             }
         });
         found
+    }
+
+    /// A call of a side-effect-free intrinsic on its operands (`__rlwimi`, `__cntlzw`): an operator, not a call.
+    pub fn is_pure_call(&self) -> bool {
+        matches!(self, Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if symbol == "__rlwimi" || symbol == "__cntlzw")
     }
 }
 

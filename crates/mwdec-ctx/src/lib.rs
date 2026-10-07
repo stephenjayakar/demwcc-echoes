@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when the TypeDb produced for the same inputs changes (invalidates caches).
-const CACHE_VERSION: &str = "mwdec-ctx-17-abs-addrs-errs";
+const CACHE_VERSION: &str = "mwdec-ctx-21-void-ptr-vars-errs";
 
 /// Parse the DWARF of an already-compiled MWCC object into a TypeDb (no header scan).
 pub fn typedb_from_object_bytes(elf: &[u8]) -> Result<TypeDb> {
@@ -384,7 +384,13 @@ fn build_uncached(root: &Path, context_tu: &str, cflags: &[String], dir: &Path) 
             }
             Force::Var(n) => {
                 let key = mangle_variable(n).unwrap_or_else(|| n.clone());
-                db.globals.insert(key, (n.clone(), strip_ptr(t.clone())));
+                // the older compilers describe `void**` as the generic pointer type (`void*`): no
+                // variable is `void`, so it was a `void*`
+                let vt = match strip_ptr(t.clone()) {
+                    Type::Void => Type::Ptr(Box::new(Type::Void)),
+                    vt => vt,
+                };
+                db.globals.insert(key, (n.clone(), vt));
             }
         }
     }

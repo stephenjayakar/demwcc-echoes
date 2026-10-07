@@ -99,6 +99,16 @@ fn compat(a: &Type, b: &Type, db: &TypeDb) -> bool {
     x == y || x == 0 || y == 0 || (x == 2 && y == 3) || (x == 3 && y == 2)
 }
 
+/// Is the cast to `to` a value-preserving widening of an integer of type `from` (zero
+/// extension of an unsigned narrow type, or sign extension to a signed one)?
+fn widening(to: &Type, from: &Type) -> bool {
+    match (strip(to), strip(from)) {
+        (Type::Int { size: 4, signed: s }, Type::Int { size: n, signed: f }) => *n < 4 && (!*f || *s),
+        (Type::Int { size: 4, .. }, Type::Bool | Type::Char) => true,
+        _ => false,
+    }
+}
+
 /// `(hole, offset, type)` of a component read `h->m` / `h.m` in a pattern.
 fn comp_of<'p>(p: &'p Expr, holes: &[HoleKind]) -> Option<(usize, i32, &'p Type)> {
     match p {
@@ -246,6 +256,8 @@ impl<'a, 'e> M<'a, 'e> {
             // a pointer component read as a word (`(unsigned int)it.mNode == 0`)
             let t = match res(t, defs) {
                 Expr::Cast { ty: ct, e: inner } if matches!(strip(ct), Type::Int { size: 4, .. }) && vclass(ty, self.env.db) == 2 && vclass(&ty_of(res(inner, defs), self.env.vars), self.env.db) == 2 => &**inner,
+                // a narrow member widened for the compare (`(unsigned int)a.m == ...`)
+                Expr::Cast { ty: ct, e: inner } if widening(ct, ty) && widening(ct, &ty_of(res(inner, defs), self.env.vars)) => &**inner,
                 _ => t,
             };
             let rt = res(t, defs);
@@ -371,7 +383,11 @@ impl<'a, 'e> M<'a, 'e> {
             match (k, b) {
                 (HoleKind::Scalar(_), Bind::Val(e)) => out.push(e.clone()),
                 (HoleKind::ScalarRef(_), Bind::Val(e)) => out.push(Expr::AddrOf(Box::new(e.clone()))),
-                (HoleKind::Obj { class, .. }, Bind::Val(e)) => {
+                // a null pointer argument (`T(id, nullptr, ...)`), not `this`
+                (HoleKind::Obj { class, ptr: true, .. }, Bind::Val(Expr::Int { value: 0, .. })) if !(h == 0 && matches!(self.t.kind, CallKind::Method)) => {
+                    out.push(Expr::Int { value: 0, ty: Type::Ptr(Box::new(Type::Named(class.clone()))) });
+                }
+                (HoleKind::Obj { class, ptr, .. }, Bind::Val(e)) => {
                     // the address must hold an object of the hole's class; prefer the typed
                     // spelling of the canonical address over an untyped register
                     let (b, o) = crate::addr::canon_ptr(e, self.env);
@@ -381,10 +397,16 @@ impl<'a, 'e> M<'a, 'e> {
                             out.push(if !typed_ptr_to(e, class, self.env) { a } else { e.clone() });
                         }
                         None => {
-                            if !typed_ptr_to(e, class, self.env) {
+                            if typed_ptr_to(e, class, self.env) {
+                                out.push(e.clone());
+                            } else if *ptr && matches!(self.t.kind, CallKind::Ctor) && matches!(e, Expr::AddrOf(_)) {
+                                // a pointer argument of a constructor is only a value: an address
+                                // the types can't name (a member of a derived class reached
+                                // through a base pointer) is passed cast
+                                out.push(Expr::Cast { ty: Type::Ptr(Box::new(Type::Const(Box::new(Type::Named(class.clone()))))), e: Box::new(e.clone()) });
+                            } else {
                                 return None;
                             }
-                            out.push(e.clone());
                         }
                     }
                 }
@@ -823,7 +845,13 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         return 0;
     }
     let idx = index(lib);
-    let mut total = crate::util::prof::time(0, || crate::objlocals::group(ir, lib, &idx, db));
+    // members' own constructors' stores at the start of a constructor body are implicit
+    let mut total = if std::env::var("MWDI_NO_CTORS").is_ok() { 0 } else { crate::ctors::strip_member_ctor_stores(ir, db) };
+    // stack slots typed only by size that are objects passed to calls
+    if std::env::var("MWDI_NO_BUFFERS").is_err() {
+        total += crate::buffers::type_object_slots(ir, db);
+    }
+    total += crate::util::prof::time(0, || crate::objlocals::group(ir, lib, &idx, db));
     for _round in 0..4 {
         let raw = build_defs(&ir.body, &ir.vars);
         let vars = ir.vars.clone();
@@ -1072,6 +1100,16 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
                 // an element address of a const container is a `const T*` (the const overload)
                 if addr && args.first().is_some_and(|a| const_object(a, env)) {
                     continue;
+                }
+                // `&v.items[v.count]` is the end pointer (`end()`, `data() + size()`), not an
+                // element
+                if addr && args.len() == 2 {
+                    let (ob, oo) = crate::addr::canon_ptr(&args[0], env);
+                    if let Some((ib, io)) = crate::addr::access(res(&args[1], env.defs), env) {
+                        if teq(&ib, &ob, env.defs) && io >= oo {
+                            continue;
+                        }
+                    }
                 }
                 // the class's own members use its fields directly
                 if args.first().is_some_and(|a| matches!(res(a, env.defs), Expr::Var(v) if env.vars[*v].kind == VarKind::This)) {

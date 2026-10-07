@@ -158,13 +158,13 @@ fn member_ctors_d(db: &TypeDb, cls: &str, depth: u32) -> Vec<(FuncSig, Vec<i32>)
 /// An object of `cls` built from member stores (`(offset, value)` relative to the object) with a
 /// constructor that sets members from its parameters (`member_ctors`), nested class parameters
 /// built the same way. Returns the construction and the store offsets it used.
-pub fn build_from_stores(db: &TypeDb, cls: &str, stores: &[(i32, Expr)]) -> Option<(Expr, Vec<i32>)> {
+pub fn build_from_stores(db: &TypeDb, cls: &str, stores: &[(i32, Expr)], vars: &[Var]) -> Option<(Expr, Vec<i32>)> {
     let mut used = vec![];
-    let e = build_at(db, cls, 0, stores, 0, &mut used)?;
+    let e = build_at(db, cls, 0, stores, 0, &mut used, vars)?;
     Some((e, used))
 }
 
-fn build_at(db: &TypeDb, cls: &str, base: i32, stores: &[(i32, Expr)], depth: u32, used: &mut Vec<i32>) -> Option<Expr> {
+fn build_at(db: &TypeDb, cls: &str, base: i32, stores: &[(i32, Expr)], depth: u32, used: &mut Vec<i32>, vars: &[Var]) -> Option<Expr> {
     if depth > 4 {
         return None;
     }
@@ -178,9 +178,10 @@ fn build_at(db: &TypeDb, cls: &str, base: i32, stores: &[(i32, Expr)], depth: u3
             };
             let pr = types::resolve(Some(db), &pt).into_owned();
             let arg = if types::is_aggregate(Some(db), &pr) {
-                named(&pr).and_then(|pc| build_at(db, pc, base + o, stores, depth + 1, used))
+                named(&pr).and_then(|pc| build_at(db, pc, base + o, stores, depth + 1, used, vars))
             } else {
-                stores.iter().find(|(so, _)| *so == base + o).map(|(so, x)| {
+                // (a whole object stored as its first member's word is no member value)
+                stores.iter().find(|(so, x)| *so == base + o && !types::is_aggregate(Some(db), &types::resolve(Some(db), &types::ty_of(x, vars)).into_owned())).map(|(so, x)| {
                     used.push(*so);
                     x.clone()
                 })
@@ -400,7 +401,7 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
                         offs.sort_unstable();
                         offs.dedup();
                         if offs.len() == flat.len() {
-                            if let Some((c, used)) = build_from_stores(db, &cls, &flat) {
+                            if let Some((c, used)) = build_from_stores(db, &cls, &flat, vars) {
                                 let rest_const = flat.iter().filter(|(o, _)| !used.contains(o)).all(|(_, x)| matches!(x, Expr::Int { .. } | Expr::Float { .. }));
                                 if rest_const {
                                     built = Some(c);

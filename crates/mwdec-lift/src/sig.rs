@@ -6,15 +6,16 @@ use mwdec_core::{FuncSig, Param, Type, TypeDb};
 
 /// Demangle to text (None for C symbols / non-mangled names).
 pub fn demangle(sym: &str) -> Option<String> {
-    cwdemangle::demangle(sym, &cwdemangle::DemangleOptions::default()).or_else(|| {
-        // dtk disambiguates duplicate local names with an address suffix (`f__Fv_80412345`)
-        let s = strip_dtk_suffix(sym);
-        if s.len() < sym.len() {
-            cwdemangle::demangle(s, &cwdemangle::DemangleOptions::default())
-        } else {
-            None
+    // dtk disambiguates duplicate local names with an address suffix (`f__Fv_80412345`); the
+    // suffixed name may still demangle (into a bogus trailing parameter type), so the stripped
+    // name wins whenever it demangles
+    let s = strip_dtk_suffix(sym);
+    if s.len() < sym.len() {
+        if let Some(d) = cwdemangle::demangle(s, &cwdemangle::DemangleOptions::default()) {
+            return Some(d);
         }
-    })
+    }
+    cwdemangle::demangle(sym, &cwdemangle::DemangleOptions::default())
 }
 
 /// `name_80412345` -> `name` (dtk's address suffix on duplicate local symbols).

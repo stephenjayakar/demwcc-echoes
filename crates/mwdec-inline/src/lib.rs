@@ -10,8 +10,10 @@
 //!    the call.
 
 pub mod addr;
+pub mod buffers;
 pub mod cflow;
 pub mod complete;
+pub mod ctors;
 pub mod groups;
 pub mod matcher;
 pub mod objlocals;
@@ -154,6 +156,9 @@ fn build_library_rel(db: &TypeDb, rel: Option<&std::collections::HashSet<String>
             Err(e) => lib.rejected.push((e.split(':').next().unwrap_or("").to_string(), e)),
         }
     }
+    // bool inlines also in their condition form (`a && (b || c)` inside an `if`)
+    let conds: Vec<Template> = lib.templates.iter().filter_map(cflow::bool_template).collect();
+    lib.templates.extend(conds);
     lib.effectful = lib.templates.iter().filter(|t| matches!(t.shape, template::Shape::Stmts { .. } | template::Shape::Mutate { .. })).map(|t| t.name.clone()).collect();
     if std::env::var("MWDI_DEBUG").is_ok() {
         eprintln!("probe library: {} probes, {} to compile, {} compiles {:.1}s, total {:.1}s", total, attempted.len(), ncomp.load(std::sync::atomic::Ordering::Relaxed), t_compile, t0.elapsed().as_secs_f64());

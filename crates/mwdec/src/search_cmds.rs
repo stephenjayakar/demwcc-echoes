@@ -42,11 +42,34 @@ pub struct Compilers {
     work: PathBuf,
     jobs: usize,
     map: Mutex<HashMap<String, Arc<Mwcc>>>,
+    /// Persistent-compiler workers per unit driver (`Mwcc::enable_fast`; 0 = off).
+    fast_workers: usize,
 }
 
 impl Compilers {
+    /// Unit drivers compile candidates through the fast path with up to `min(jobs, 4)` persistent
+    /// compiler workers (`MWDEC_PERSIST=0` turns it off).
     pub fn new(root: &Path, work: &Path, jobs: usize) -> Compilers {
-        Compilers { root: root.to_path_buf(), work: work.to_path_buf(), jobs, map: Mutex::new(HashMap::new()) }
+        Compilers { root: root.to_path_buf(), work: work.to_path_buf(), jobs, map: Mutex::new(HashMap::new()), fast_workers: jobs.min(4) }
+    }
+
+    /// Set the number of fast-path workers per unit driver (0: normal compiles only).
+    pub fn with_fast_workers(mut self, n: usize) -> Compilers {
+        self.fast_workers = n;
+        self
+    }
+
+    /// End the fast-path workers of every driver; their counters summed (`None`: the fast path
+    /// was never on).
+    pub fn finish(&self) -> Option<mwdec_mwcc::FastStats> {
+        let mut total: Option<mwdec_mwcc::FastStats> = None;
+        for m in self.map.lock().unwrap().values() {
+            if let Some(s) = m.fast_stats() {
+                total.get_or_insert_with(Default::default).add(&s);
+            }
+            m.shutdown_fast();
+        }
+        total
     }
 
     /// Driver for mwdec-inline's probe TUs: the unit's compiler, with an on-disk cache (the
@@ -85,6 +108,9 @@ impl Compilers {
                 // Search candidates are rarely re-hit across runs: memory cache only (keeps the
                 // disk small and time budgets honest). PCHs are still cached on disk.
                 m.disk_cache = None;
+                if self.fast_workers > 0 {
+                    m.enable_fast(self.fast_workers);
+                }
                 Arc::new(m)
             })
             .clone()
@@ -330,6 +356,16 @@ fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bo
     Ok(format!("{}{}", em.preamble, extern_c_definition(&em.body, &f.name, ui.c_mode)))
 }
 
+/// Rewrite an exact source towards natural code (names, casts, temporaries), keeping only the
+/// changes that still match (see `mwdec_emit::tidy`).
+pub fn polish_exact(ui: &UnitInputs, scorer: &Scorer, src: &str) -> String {
+    if std::env::var("MWDEC_NO_POLISH").is_ok() {
+        return src.to_string();
+    }
+    // a rewrite bug must never cost the exact result
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_emit::tidy::polish(src, ui.db.as_ref(), 100, &mut |s: &str| scorer.eval(s).0.fitness().map_or(false, |f| f.exact)).0)).unwrap_or_else(|_| src.to_string())
+}
+
 /// A function whose symbol is not a mangled C++ name (a placeholder like `fn_<module>_<addr>`)
 /// needs C linkage in a C++ unit, or the compiler mangles the definition (`<name>__Fi`).
 pub fn extern_c_definition(body: &str, symbol: &str, c_mode: bool) -> String {
@@ -453,13 +489,23 @@ pub fn cmd_match(root: &Path, work: &Path, a: MatchArgs) -> Result<()> {
         ..Default::default()
     };
     eprintln!("setup {:.1}s; searching {} (budget {}s) ...", t.elapsed().as_secs_f64(), a.symbol, a.budget_secs);
-    let r = search(&scorer, &init, &cfg);
+    let mut r = search(&scorer, &init, &cfg);
+    if r.exact {
+        let before = mwdec_emit::tidy::measure(&r.best_src);
+        r.best_src = polish_exact(&ui, &scorer, &r.best_src);
+        eprintln!("naturalness: {} -> {}", before.summary(), mwdec_emit::tidy::measure(&r.best_src).summary());
+        let _ = std::fs::create_dir_all(&out);
+        let _ = std::fs::write(out.join("polished.cpp"), &r.best_src);
+    }
     print!("{}", r.best_src);
     if !r.best_src.ends_with('\n') {
         println!();
     }
     print_result(&r);
     eprintln!("best source: {}", out.join("best.cpp").display());
+    if let Some(s) = cc.finish() {
+        eprintln!("{}", s.line());
+    }
     if !r.exact {
         std::process::exit(1);
     }
@@ -544,6 +590,10 @@ struct Row {
     traces: u64,
     /// Process commit (MB) when the row finished.
     mem_mb: u64,
+    /// naturalness (`mwdec_emit::tidy`) of the draft and of the final source (polished when
+    /// exact and MWDEC_EVAL_POLISH is set)
+    nat_draft: Option<String>,
+    nat_final: Option<String>,
 }
 
 impl Row {
@@ -556,6 +606,7 @@ impl Row {
             "evals": self.evals, "compiles": self.compiles, "seconds": self.seconds, "error": self.error,
             "winning_ops": self.winning_ops, "ops": self.ops, "polished": self.polished, "implicit": self.implicit,
             "first_profile": self.first_profile, "best_profile": self.best_profile, "traces": self.traces, "mem_mb": self.mem_mb,
+            "nat_draft": self.nat_draft, "nat_final": self.nat_final,
         })
     }
 }
@@ -599,7 +650,9 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
     }
     let jobs = a.jobs.clamp(1, 16);
     let workers = a.workers.unwrap_or(6usize.div_ceil(jobs)).max(1);
-    let cc = Compilers::new(root, work, 6);
+    // Drafts alone compile each unit context once or twice per function: starting persistent
+    // compilers costs more than it saves there (measured), so the fast path is for searches.
+    let cc = Compilers::new(root, work, 6).with_fast_workers(if a.budget_secs == 0 { 0 } else { 4 });
     let out_path = a.out.clone().unwrap_or_else(|| {
         eval_dir().join(format!("eval_{}_s{}_b{}_{}.jsonl", a.split, a.seed, a.budget_secs, std::process::id()))
     });
@@ -706,6 +759,9 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
     });
     let rows = rows.into_inner().unwrap();
     print_table(&rows);
+    if let Some(s) = cc.finish() {
+        println!("{}", s.line());
+    }
     println!("wrote {} ({:.0}s total)", out_path.display(), t0.elapsed().as_secs_f64());
     if a.mem_report {
         println!("{}", mwdec_core::memcap::report_line());
@@ -783,6 +839,9 @@ fn run_one(
     row.first_profile = r.initial.as_ref().map(|f| f.profile);
     row.best_profile = r.best.as_ref().map(|f| f.profile);
     row.traces = r.traces;
+    row.nat_draft = Some(mwdec_emit::tidy::measure(&src).summary());
+    let fin = if r.exact && std::env::var("MWDEC_EVAL_POLISH").is_ok() { polish_exact(ui, &scorer, &r.best_src) } else { r.best_src.clone() };
+    row.nat_final = Some(mwdec_emit::tidy::measure(&fin).summary());
     for s in r.op_stats.iter().filter(|s| s.tries > 0) {
         row.ops.insert(s.name.to_string(), serde_json::json!([s.tries, s.improved, s.new_best]));
     }

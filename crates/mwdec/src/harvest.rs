@@ -391,8 +391,9 @@ pub fn cmd_harvest(root: &Path, work: &Path, a: HarvestArgs) -> Result<()> {
                         let r = (|| -> Result<(UnitInputs, String)> {
                             let u = p.unit(&c.unit).ok_or_else(|| anyhow::anyhow!("unknown unit"))?;
                             let (u, context) = unit_context(&p, u, &idx)?;
-                            // one driver set per unit: its in-memory object cache dies with the unit
-                            let cc = Compilers::new(&p.root, work, 6);
+                            // one driver set per unit: its in-memory object cache and its fast-path
+                            // compiler processes (2 workers; up to 3 units are kept) die with the unit
+                            let cc = Compilers::new(&p.root, work, 6).with_fast_workers(2);
                             let ui = unit_inputs_with_context(&p, &u, &cc, &ext.0.objs, true, context.clone(), Some(&ext.0))?;
                             Ok((ui, context))
                         })();
@@ -538,7 +539,7 @@ fn run_one(us: &UnitSlot, ext: &(ExternIndex, ExternIndex), c: &Cand, a: &Harves
         row.error = r.initial_error.clone();
     }
     row.status = if r.exact {
-        row.source = Some(r.best_src.clone());
+        row.source = Some(super::search_cmds::polish_exact(ui, &scorer, &r.best_src));
         if row.first_exact { "exact".into() } else { "searched".into() }
     } else if r.initial.is_some() {
         // keep the best candidate of a miss for later analysis / longer searches
@@ -654,5 +655,86 @@ pub fn cmd_verify_units(root: &Path, units: &[String]) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Re-polish the exact results of a harvest directory (`exact.jsonl`) towards natural source:
+/// each result is recompiled in its unit, polished with `mwdec_emit::tidy`, and written with
+/// its naturalness before/after to `<out>` (JSONL, same fields as `exact.jsonl`).
+pub fn cmd_repolish(root: &Path, work: &Path, dir: &Path, out: &Path, split: Option<&str>, limit: Option<usize>, unit_filter: Option<&str>) -> Result<()> {
+    let p = load_project(root)?;
+    let idx = autoctx::HeaderIndex::build(&p.root);
+    let text = std::fs::read_to_string(dir.join("exact.jsonl")).with_context(|| format!("reading {}", dir.join("exact.jsonl").display()))?;
+    let mut by_unit: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    let mut n = 0;
+    for l in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { continue };
+        let Some(unit) = v.get("unit").and_then(|x| x.as_str()).map(String::from) else { continue };
+        if split.map_or(false, |s| mwdec_project::split_of(&unit) != s) || unit_filter.map_or(false, |f| !unit.contains(f)) {
+            continue;
+        }
+        if limit.map_or(false, |k| n >= k) {
+            break;
+        }
+        n += 1;
+        by_unit.entry(unit).or_default().push(v);
+    }
+    let mut outf = std::fs::File::create(out)?;
+    let (mut before_sum, mut after_sum) = (mwdec_emit::tidy::Naturalness::default(), mwdec_emit::tidy::Naturalness::default());
+    let (mut done, mut changed, mut lost, mut clean_before, mut clean_after) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for (unit, rows) in by_unit {
+        let r = (|| -> Result<UnitInputs> {
+            let u = p.unit(&unit).ok_or_else(|| anyhow::anyhow!("unknown unit"))?;
+            let (u, context) = unit_context(&p, u, &idx)?;
+            let ext = externs_for(&p, &u.name);
+            let cc = Compilers::new(&p.root, work, 3);
+            unit_inputs_with_context(&p, &u, &cc, &ext.0.objs, true, context, Some(&ext.0))
+        })();
+        let ui = match r {
+            Ok(ui) => ui,
+            Err(e) => {
+                eprintln!("{unit}: {e:#}");
+                continue;
+            }
+        };
+        let ext = externs_for(&p, &unit);
+        for mut v in rows {
+            let sym = v.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let src = v.get("source").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let Some(f) = mwdec_obj::find_function(&ui.target, &sym) else { continue };
+            let ti = ObjIndex::with_externs(&ui.target, &ext.0);
+            let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &sym);
+            // the stored result must still be exact here (same context and compiler)
+            if !scorer.eval(&src).0.fitness().map_or(false, |x| x.exact) {
+                lost += 1;
+                eprintln!("{unit} {sym}: stored source not exact in this context; kept as is");
+                continue;
+            }
+            let pol = super::search_cmds::polish_exact(&ui, &scorer, &src);
+            let (b, a) = (mwdec_emit::tidy::measure(&src), mwdec_emit::tidy::measure(&pol));
+            before_sum.add(&b);
+            after_sum.add(&a);
+            done += 1;
+            changed += (pol != src) as usize;
+            clean_before += (b.penalty() == 0) as usize;
+            clean_after += (a.penalty() == 0) as usize;
+            let (preamble, def) = split_preamble(&pol);
+            v["source"] = serde_json::Value::String(pol.clone());
+            v["preamble"] = serde_json::Value::String(preamble);
+            v["definition"] = serde_json::Value::String(def);
+            v["naturalness_before"] = serde_json::Value::String(b.summary());
+            v["naturalness_after"] = serde_json::Value::String(a.summary());
+            writeln!(outf, "{v}")?;
+            println!("{unit} {sym} | {} -> {}", b.summary(), a.summary());
+        }
+    }
+    let k = done.max(1) as f64;
+    println!(
+        "REPOLISH {done} results ({changed} changed, {lost} not reproducible): penalty per function {:.2} -> {:.2}; clean {clean_before} -> {clean_after}",
+        before_sum.penalty() as f64 / k,
+        after_sum.penalty() as f64 / k
+    );
+    println!("  before: {}", before_sum.summary());
+    println!("  after:  {}", after_sum.summary());
     Ok(())
 }

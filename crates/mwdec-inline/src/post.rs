@@ -155,7 +155,10 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
 
 fn collect_folded<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     e.walk(&mut |x| {
-        if folded_value(x) && matches!(x, Expr::Call { ret, .. } if matches!(crate::util::strip(ret), Type::Named(_))) {
+        // (a non-const method has effects: two `in.Read()` are two reads, whatever the
+        // typedef'd result type looks like)
+        let mutator = matches!(x, Expr::Call { callee: Callee::Method { sig, .. }, .. } if !sig.is_const);
+        if folded_value(x) && !mutator && matches!(x, Expr::Call { ret, .. } if matches!(crate::util::strip(ret), Type::Named(_))) {
             out.push(x);
         }
     });
@@ -314,9 +317,7 @@ pub fn return_values(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
             if arms {
                 if let Stmt::If { then, els, .. } = &mut b[i] {
                     for arm in [then, els] {
-                        let last = arm.len() - 1;
                         arm.push(Stmt::Return(None));
-                        let _ = last;
                     }
                 }
                 b.remove(i + 1);

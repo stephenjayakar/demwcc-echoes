@@ -126,6 +126,11 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
                 fx.reads_mem = true;
             }
         }
+        Expr::Call { args, .. } if e.is_pure_call() => {
+            for a in args {
+                effects_into(a, is_temp, vars, fx, false);
+            }
+        }
         Expr::Call { callee, args, .. } => {
             fx.calls = true;
             fx.reads_mem = true;
@@ -251,7 +256,7 @@ fn sibling_calls(e: &Expr, t: VarId) -> usize {
     let mut n = 0;
     e.walk(&mut |x| {
         if let Expr::Call { .. } = x {
-            if !x.uses_var(t) {
+            if !x.uses_var(t) && !x.is_pure_call() {
                 n += 1;
             }
         }

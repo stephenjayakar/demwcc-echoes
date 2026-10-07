@@ -552,19 +552,37 @@ impl Scorer<'_> {
             None => ObjIndex::new(&ours),
         };
         let fit = fitness(self.target, self.tf, &oi, of);
+        // An exact match from the fast path (a persistent compiler) only counts once a normal
+        // compile of the same candidate confirms it.
+        if fit.exact && c.fast {
+            let ctx = match self.plain {
+                Some(p) if self.pch_broken.load(Relaxed) => p,
+                _ => self.ctx,
+            };
+            let mut n = self.mwcc.compile_in_normal(ctx, src);
+            if let (Err(e), Some(plain)) = (&n, self.plain) {
+                if is_crash(e) {
+                    n = self.mwcc.compile_in_normal(plain, src);
+                }
+            }
+            match n.ok().and_then(|c| self.fitness_of(&c.obj)) {
+                Some(f) => {
+                    self.mwcc.note_fast_confirm(f.exact);
+                    if !f.exact {
+                        return (Eval::Ok(f), true);
+                    }
+                }
+                None => {
+                    self.mwcc.note_fast_confirm(false);
+                    return (Eval::CompileError("normal-compile confirmation failed".into()), true);
+                }
+            }
+        }
         // Candidates of a context with a split PCH (mwdec-mwcc works around a compiler crash by
         // moving a few headers out of the PCH): confirm an exact match with the plain context.
         if fit.exact && !self.pch_broken.load(Relaxed) && self.mwcc.uses_split(self.ctx) {
             if let Some(plain) = self.plain {
-                let confirmed = self.mwcc.compile_in(plain, src).ok().and_then(|c| {
-                    let o = mwdec_obj::load_object_bytes("candidate.o", &c.obj).ok()?;
-                    let of = mwdec_obj::find_function(&o, &self.symbol)?;
-                    let oi = match self.ours_ext {
-                        Some(e) => ObjIndex::with_externs(&o, e),
-                        None => ObjIndex::new(&o),
-                    };
-                    Some(fitness(self.target, self.tf, &oi, of))
-                });
+                let confirmed = self.mwcc.compile_in_normal(plain, src).ok().and_then(|c| self.fitness_of(&c.obj));
                 match confirmed {
                     Some(f) if f.exact => {}
                     Some(f) => {
@@ -576,6 +594,17 @@ impl Scorer<'_> {
             }
         }
         (Eval::Ok(fit), ran)
+    }
+
+    /// Fitness of the target function in a compiled object (`None`: unreadable or missing).
+    fn fitness_of(&self, obj: &[u8]) -> Option<Fitness> {
+        let o = mwdec_obj::load_object_bytes("candidate.o", obj).ok()?;
+        let of = mwdec_obj::find_function(&o, &self.symbol)?;
+        let oi = match self.ours_ext {
+            Some(e) => ObjIndex::with_externs(&o, e),
+            None => ObjIndex::new(&o),
+        };
+        Some(fitness(self.target, self.tf, &oi, of))
     }
 }
 

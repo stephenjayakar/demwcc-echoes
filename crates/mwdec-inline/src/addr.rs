@@ -98,6 +98,24 @@ pub fn object_at(p: &Expr, off: i32, cls: &str, env: &Env) -> Option<(Expr, Expr
     }
     let same = off == 0 && is_base_or_same(env.db, cls, &outer);
     let ct = Type::Named(cls.to_string());
+    // the first member of a member object (`box.min` at the start of `box`) is named through
+    // that member: the bare offset would read as the outer member itself
+    let holder = (!same)
+        .then(|| mwdec_lift::sig::find_class(env.db, &outer))
+        .flatten()
+        .and_then(|c| c.fields.iter().find(|f| f.offset as i32 == off && f.bitfield.is_none()))
+        .and_then(|f| crate::util::class_name(&f.ty, env.db))
+        .filter(|d| !is_base_or_same(env.db, cls, d) && crate::matcher::class_at_pub(env.db, d, 0, cls));
+    if let Some(d) = holder {
+        let dt = Type::Named(d);
+        let outer_lv = match p {
+            Expr::AddrOf(x) => Expr::Member { base: x.clone(), offset: off, ty: dt },
+            _ if matches!(strip(&ty_of(p, env.vars)), Type::Ref(_)) => Expr::Member { base: Box::new(p.clone()), offset: off, ty: dt },
+            _ => Expr::Load { base: Box::new(p.clone()), offset: off, ty: dt },
+        };
+        let lv = Expr::Member { base: Box::new(outer_lv), offset: 0, ty: ct };
+        return Some((Expr::AddrOf(Box::new(lv.clone())), lv));
+    }
     Some(match p {
         Expr::AddrOf(x) => {
             if same {

@@ -169,6 +169,22 @@ pub struct Explanation {
     pub text: String,
 }
 
+/// See [`SchedBlock::rule_evidence`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RuleEvidence {
+    pub agree: u32,
+    pub contradict: u32,
+    pub other: u32,
+}
+
+impl std::ops::AddAssign for RuleEvidence {
+    fn add_assign(&mut self, o: Self) {
+        self.agree += o.agree;
+        self.contradict += o.contradict;
+        self.other += o.other;
+    }
+}
+
 impl SchedBlock {
     /// Node indices in issue order.
     pub fn order(&self) -> Vec<usize> {
@@ -182,6 +198,12 @@ impl SchedBlock {
 
     /// The pick rule's comparison: does `cand` replace `best` at `cycle`?
     fn beats(&self, cand: usize, best: usize, cycle: u16, uncover: &dyn Fn(usize) -> usize) -> Option<PickReason> {
+        self.beats_with(cand, best, cycle, uncover, self.pre_ra)
+    }
+
+    /// [`beats`](Self::beats) with the opcode-rank tie-break on or off (`rank`), for testing rule
+    /// variants against the recorded picks.
+    fn beats_with(&self, cand: usize, best: usize, cycle: u16, uncover: &dyn Fn(usize) -> usize, rank: bool) -> Option<PickReason> {
         let (b, c) = (&self.nodes[best], &self.nodes[cand]);
         let b_urgent = b.deadline <= cycle;
         let c_urgent = c.deadline <= cycle;
@@ -198,10 +220,54 @@ impl SchedBlock {
         if c.height != b.height {
             return if c.height > b.height { Some(PickReason::Height) } else { None };
         }
-        if self.pre_ra && c.opcode_rank < b.opcode_rank {
+        if rank && c.opcode_rank < b.opcode_rank {
             return Some(PickReason::OpcodeRank);
         }
         None
+    }
+
+    /// Evidence for a variant of the pick rule (opcode-rank tie-break on or off): replays the
+    /// recorded picks and counts, for every pick with another ready node, whether the variant
+    /// chooses the recorded node (`agree`), or a node that was issued later in the same cycle
+    /// (`contradict`: the unit model accepted it, so the variant would have issued it first), or
+    /// another node (`other`: unit availability may explain it).
+    pub fn rule_evidence(&self, rank: bool) -> RuleEvidence {
+        let n = self.nodes.len();
+        let mut preds_left: Vec<u16> = vec![0; n];
+        for a in &self.nodes {
+            for e in &a.succs {
+                preds_left[e.to] += 1;
+            }
+        }
+        let mut earliest = vec![0u16; n];
+        let mut done = vec![false; n];
+        let mut ev = RuleEvidence::default();
+        for (k, pk) in self.picks.iter().enumerate() {
+            let cycle = pk.cycle;
+            let ready: Vec<usize> = (0..n).filter(|&i| !done[i] && preds_left[i] == 0 && earliest[i] <= cycle).collect();
+            let uncover = |i: usize| self.nodes[i].succs.iter().filter(|e| preds_left[e.to] == 1).count();
+            if ready.len() > 1 && ready.contains(&pk.node) {
+                let mut best = ready[0];
+                for &r in &ready[1..] {
+                    if self.beats_with(r, best, cycle, &uncover, rank).is_some() {
+                        best = r;
+                    }
+                }
+                if best == pk.node {
+                    ev.agree += 1;
+                } else if self.picks[k + 1..].iter().take_while(|p| p.cycle == cycle).any(|p| p.node == best) {
+                    ev.contradict += 1;
+                } else {
+                    ev.other += 1;
+                }
+            }
+            done[pk.node] = true;
+            for e in &self.nodes[pk.node].succs {
+                preds_left[e.to] = preds_left[e.to].saturating_sub(1);
+                earliest[e.to] = earliest[e.to].max(cycle + e.latency);
+            }
+        }
+        ev
     }
 
     /// Replay the recorded picks with the exact rule and give each pick its reason.

@@ -123,7 +123,9 @@ fn field_path_in(db: &TypeDb, c: &Class, off: i32, size: u32, depth: u32) -> Opt
         }
         let rel = off - fo;
         let rt = resolve(Some(db), &f.ty).into_owned();
-        if rel == 0 && (size == 0 || fs == size) && !is_aggregate(Some(db), &rt) {
+        // (an element-sized access of a one-element array member is its element, not the array)
+        let one_elem = matches!(strip_cv(&rt), Type::Array(e, _) if size_of(Some(db), e) == Some(size));
+        if rel == 0 && (size == 0 || (fs == size && !one_elem)) && !is_aggregate(Some(db), &rt) {
             return Some((vec![PathElem::Field(f.name.clone(), c.name.clone())], f.ty.clone()));
         }
         if rel == 0 && size == 0 {

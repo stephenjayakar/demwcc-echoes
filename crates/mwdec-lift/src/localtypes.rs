@@ -537,6 +537,116 @@ pub fn drop_redundant_masks(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&mwde
     });
 }
 
+/// Integer intrinsics (`__rlwimi`) take their operands as integers: pointers are converted.
+pub fn cast_intrinsic_args(body: &mut Vec<Stmt>, vars: &[Var]) {
+    Stmt::rewrite_exprs(body, &mut |x| {
+        let Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } = x else { return };
+        if symbol != "__rlwimi" {
+            return;
+        }
+        for a in args.iter_mut().take(2) {
+            let t = types::ty_of(a, vars);
+            if is_ptr(&t) || matches!(strip_cv(&t), Type::Ref(_) | Type::Unknown { .. }) {
+                *a = Expr::cast(t_u32(), a.clone());
+            }
+        }
+    });
+}
+
+/// A pointer global copied into a temp read through until the next call is the global itself at
+/// each use (`__GXData->x = ..; __GXData->y = ..;`): the compiler keeps its single load in a
+/// register of its own choosing; a named local is allocated differently.
+pub fn forward_global_pointers(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
+    let mut uses = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let mut defs: HashMap<VarId, usize> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), .. } = s {
+                *defs.entry(*v).or_default() += 1;
+            }
+        }
+    });
+    fn count(s: &Stmt, t: VarId) -> usize {
+        let mut n = 0;
+        Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+            if matches!(e, Expr::Var(v) if *v == t) {
+                n += 1;
+            }
+        });
+        n
+    }
+    fn writes_global(s: &Stmt, g: &str) -> bool {
+        let mut w = false;
+        Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+            if let Expr::AddrOf(x) = e {
+                if matches!(&**x, Expr::Global { symbol, .. } if symbol == g) {
+                    w = true;
+                }
+            }
+        });
+        fn assigns(s: &Stmt, g: &str) -> bool {
+            match s {
+                Stmt::Assign { dst: Expr::Global { symbol, .. }, .. } => symbol == g,
+                Stmt::If { then, els, .. } => then.iter().chain(els.iter()).any(|s| assigns(s, g)),
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => body.iter().any(|s| assigns(s, g)),
+                Stmt::For { init, step, body, .. } => init.iter().chain(step.iter()).chain(body.iter()).any(|s| assigns(s, g)),
+                Stmt::Switch { cases, .. } => cases.iter().any(|c| c.body.iter().any(|s| assigns(s, g))),
+                _ => false,
+            }
+        }
+        w || assigns(s, g)
+    }
+    fn has_call(s: &Stmt) -> bool {
+        let mut c = false;
+        Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+            if matches!(e, Expr::Call { .. } | Expr::New { .. } | Expr::IncDec { .. }) && !e.is_pure_call() {
+                c = true;
+            }
+        });
+        c
+    }
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            let (t, g) = match &b[i] {
+                Stmt::Assign { dst: Expr::Var(t), src: g @ Expr::Global { ty, .. } }
+                    if is_temp.get(*t).copied().unwrap_or(false) && defs.get(t) == Some(&1) && is_ptr(strip_cv(ty)) && matches!(vars[*t].kind, VarKind::Local) =>
+                {
+                    (*t, g.clone())
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let Expr::Global { symbol, .. } = &g else { unreachable!() };
+            let total = uses.get(&t).copied().unwrap_or(0);
+            let mut seen = 0;
+            let mut end = i + 1;
+            while end < b.len() && seen < total {
+                if has_call(&b[end]) || writes_global(&b[end], symbol) {
+                    break;
+                }
+                seen += count(&b[end], t);
+                end += 1;
+            }
+            if total == 0 || seen != total {
+                i += 1;
+                continue;
+            }
+            for s in &mut b[i + 1..end] {
+                Stmt::rewrite_exprs(std::slice::from_mut(s), &mut |e| {
+                    if matches!(e, Expr::Var(v) if *v == t) {
+                        *e = g.clone();
+                    }
+                });
+            }
+            b.remove(i);
+        }
+    });
+}
+
 /// `if (p) delete p;` -> `delete p;` (the delete expression has its own null check).
 pub fn fold_delete_checks(body: &mut Vec<Stmt>) {
     fn strip(e: &Expr) -> &Expr {

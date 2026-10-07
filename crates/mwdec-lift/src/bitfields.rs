@@ -183,8 +183,11 @@ fn forward_unit_temps(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
     fn has_call(s: &Stmt) -> bool {
         let mut c = false;
         Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
-            if matches!(e, Expr::Call { .. } | Expr::New { .. }) {
-                c = true;
+            match e {
+                // the insert intrinsic of a write-back
+                Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if symbol == "__rlwimi" => {}
+                Expr::Call { .. } | Expr::New { .. } => c = true,
+                _ => {}
             }
         });
         c
@@ -257,6 +260,29 @@ fn forward_unit_temps(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
     });
 }
 
+/// `__rlwimi(dst, v, sh, mb, me)` spelled as `(dst & ~M) | ((v << sh) & M)`.
+fn rlwimi_form(src: &Expr, dst: &Expr) -> Option<Expr> {
+    let Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } = src else { return None };
+    if symbol != "__rlwimi" || args.len() != 5 || strip_cast(&args[0]) != dst {
+        return None;
+    }
+    let (sh, mb, me) = (int_of(&args[2])?, int_of(&args[3])?, int_of(&args[4])?);
+    if mb > me || me > 31 || sh > 31 {
+        return None;
+    }
+    let m = (u32::MAX >> mb) & (u32::MAX << (31 - me));
+    let u = || Type::Int { size: 4, signed: false };
+    let keep = Expr::bin(BinOp::And, args[0].clone(), Expr::uint((!m) as i64), u());
+    let y = match args[1].as_int() {
+        Some(v) => Expr::uint((((v as u32) << sh) & m) as i64),
+        None => {
+            let shifted = if sh == 0 { args[1].clone() } else { Expr::bin(BinOp::Shl, args[1].clone(), Expr::int(sh as i64), u()) };
+            Expr::bin(BinOp::And, shifted, Expr::uint(m as i64), u())
+        }
+    };
+    Some(Expr::bin(BinOp::Or, keep, y, u()))
+}
+
 fn recover_in(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
     // writes
     Stmt::for_each_block_mut(body, &mut |b| {
@@ -265,6 +291,14 @@ fn recover_in(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
             if unit_bits(dst).is_none() {
                 continue;
             }
+            let spelled;
+            let src = match rlwimi_form(src, dst) {
+                Some(e) => {
+                    spelled = e;
+                    &spelled
+                }
+                None => &*src,
+            };
             let Expr::Binary { op: BinOp::Or, l: keep, r: y, .. } = src else { continue };
             let Expr::Binary { op: BinOp::And, l: old, r: nm, .. } = &**keep else { continue };
             if strip_cast(old) != dst {
@@ -364,4 +398,168 @@ fn top_down(e: &mut Expr, vars: &[Var], db: &TypeDb) {
         }
         _ => {}
     }
+}
+
+/// Field inserts (`__rlwimi`) chained through temps are one register variable updated in place,
+/// the SDK's `reg = gx->cmode0; SET_REG_FIELD(reg, ...); SET_REG_FIELD(reg, ...);`:
+/// `t1 = __rlwimi(x, a, ..); t2 = __rlwimi(__rlwimi(t1, b, ..), c, ..);` becomes
+/// `t1 = x; t1 = __rlwimi(t1, a, ..); t1 = __rlwimi(t1, b, ..); t1 = __rlwimi(t1, c, ..);`.
+pub fn insert_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
+    stored_chains(body, vars, is_temp);
+    fn is_insert(e: &Expr) -> bool {
+        matches!(e, Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } if symbol == "__rlwimi" && args.len() == 5)
+    }
+    // (base, inserts innermost first)
+    fn flatten(e: &Expr) -> (Expr, Vec<Expr>) {
+        let mut inserts = vec![];
+        let mut cur = e;
+        while is_insert(cur) {
+            inserts.push(cur.clone());
+            let Expr::Call { args, .. } = cur else { unreachable!() };
+            cur = &args[0];
+        }
+        inserts.reverse();
+        (cur.clone(), inserts)
+    }
+    let mut uses = std::collections::HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let mut chain: std::collections::HashMap<VarId, VarId> = Default::default();
+    let mut renames: Vec<(VarId, VarId)> = vec![];
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            let Stmt::Assign { dst: Expr::Var(t), src } = &b[i] else {
+                i += 1;
+                continue;
+            };
+            let t = *t;
+            if !is_temp.get(t).copied().unwrap_or(false) || !is_insert(src) || chain.contains_key(&t) {
+                i += 1;
+                continue;
+            }
+            let (base, inserts) = flatten(src);
+            let mut out = vec![];
+            let r = match &base {
+                Expr::Var(u) if chain.contains_key(u) && uses.get(u) == Some(&1) => chain[u],
+                _ => {
+                    out.push(Stmt::Assign { dst: Expr::Var(t), src: base.clone() });
+                    t
+                }
+            };
+            for ins in inserts {
+                let Expr::Call { callee, mut args, ret } = ins else { unreachable!() };
+                args[0] = Expr::Var(r);
+                out.push(Stmt::Assign { dst: Expr::Var(r), src: Expr::Call { callee, args, ret } });
+            }
+            chain.insert(t, r);
+            if r != t {
+                renames.push((t, r));
+            }
+            let n = out.len();
+            b.splice(i..i + 1, out);
+            i += n;
+        }
+    });
+    for (_, r) in &chain {
+        if let Some(x) = is_temp.get_mut(*r) {
+            *x = false;
+        }
+    }
+    if !renames.is_empty() {
+        let map: std::collections::HashMap<VarId, VarId> = renames.into_iter().collect();
+        let resolve = |mut v: VarId| {
+            while let Some(&n) = map.get(&v) {
+                v = n;
+            }
+            v
+        };
+        Stmt::rewrite_exprs(body, &mut |e| {
+            if let Expr::Var(v) = e {
+                *v = resolve(*v);
+            }
+        });
+    }
+}
+
+/// A register word built from a constant or with several inserts and stored right away
+/// (`GXWGFifo.u32 = __rlwimi(__rlwimi(0, a, ..), b, ..)`) is a variable set up field by field
+/// first (`reg = 0; reg = __rlwimi(reg, a, ..); ..; GXWGFifo.u32 = reg;`), computed before the
+/// stores just ahead of it when it reads no memory.
+fn stored_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
+    fn is_insert(e: &Expr) -> bool {
+        matches!(e, Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } if symbol == "__rlwimi" && args.len() == 5)
+    }
+    fn reads_memory(e: &Expr) -> bool {
+        let mut m = false;
+        e.walk(&mut |x| {
+            if matches!(x, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. } | Expr::BitField { .. } | Expr::New { .. } | Expr::IncDec { .. })
+                || (matches!(x, Expr::Call { .. }) && !x.is_pure_call())
+            {
+                m = true;
+            }
+        });
+        m
+    }
+    let mut new_vars: Vec<Var> = vec![];
+    let base_id = vars.len();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            let Stmt::Assign { dst, src } = &b[i] else {
+                i += 1;
+                continue;
+            };
+            if matches!(dst, Expr::Var(_)) {
+                i += 1;
+                continue;
+            }
+            let (outer_cast, chain) = match src {
+                Expr::Cast { ty, e } if is_insert(e) => (Some(ty.clone()), (**e).clone()),
+                e if is_insert(e) => (None, e.clone()),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let mut inserts = vec![];
+            let mut cur = &chain;
+            while is_insert(cur) {
+                inserts.push(cur.clone());
+                let Expr::Call { args, .. } = cur else { unreachable!() };
+                cur = &args[0];
+            }
+            let base = cur.clone();
+            if !(inserts.len() >= 2 || base.as_int().is_some()) {
+                i += 1;
+                continue;
+            }
+            inserts.reverse();
+            let r = base_id + new_vars.len();
+            new_vars.push(Var { name: if new_vars.is_empty() { "reg".into() } else { format!("reg{}", new_vars.len() + 1) }, ty: Type::Int { size: 4, signed: false }, kind: VarKind::Local });
+            let mut setup = vec![Stmt::Assign { dst: Expr::Var(r), src: base }];
+            for ins in inserts {
+                let Expr::Call { callee, mut args, ret } = ins else { unreachable!() };
+                args[0] = Expr::Var(r);
+                setup.push(Stmt::Assign { dst: Expr::Var(r), src: Expr::Call { callee, args, ret } });
+            }
+            let dst = dst.clone();
+            let v = match outer_cast {
+                Some(ty) => Expr::Cast { ty, e: Box::new(Expr::Var(r)) },
+                None => Expr::Var(r),
+            };
+            b[i] = Stmt::Assign { dst, src: v };
+            // ahead of the plain stores before it
+            let mut at = i;
+            if !reads_memory(&chain) {
+                while at > 0 && matches!(&b[at - 1], Stmt::Assign { dst, src } if !matches!(dst, Expr::Var(_)) && !src.has_call() && !dst.has_call()) {
+                    at -= 1;
+                }
+            }
+            let n = setup.len();
+            b.splice(at..at, setup);
+            i += n + 1;
+        }
+    });
+    is_temp.resize(base_id + new_vars.len(), false);
+    vars.extend(new_vars);
 }

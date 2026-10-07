@@ -463,12 +463,42 @@ fn forward_address_temps(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>
                 }
             };
             let total = uses.get(&t).copied().unwrap_or(0);
-            // uses in the next statement (plus a second one when the first has no call)
+            // uses in the following statements up to the first call (a register word read,
+            // updated through other stores and written back)
+            let mut def_vars = vec![];
+            let mut def_globals = vec![];
+            def.walk(&mut |e| match e {
+                Expr::Var(v) => def_vars.push(*v),
+                Expr::Global { symbol, .. } => def_globals.push(symbol.clone()),
+                _ => {}
+            });
+            // (a pointer the source kept, `u32* p = &a[i]`, is dereferenced at offset 0: its uses
+            // must follow right away; a shared partial address may reach further)
+            let mut at_zero = false;
+            Stmt::walk_exprs(&b[i + 1..(i + 12).min(b.len())], &mut |e| {
+                if let Expr::Load { base, offset: 0, .. } = e {
+                    at_zero |= matches!(**base, Expr::Var(v) if v == t);
+                }
+            });
+            let reach = if at_zero { 3 } else { 12 };
             let mut span = 0;
             let mut seen = 0;
-            for j in i + 1..(i + 3).min(b.len()) {
+            for j in i + 1..(i + reach).min(b.len()) {
                 if !matches!(b[j], Stmt::Assign { .. } | Stmt::Expr(_)) {
                     break;
+                }
+                // (the address's inputs must stay unchanged up to each use)
+                if j > i + 1 {
+                    if let Stmt::Assign { dst, .. } = &b[j - 1] {
+                        let clobbers = match dst {
+                            Expr::Var(v) => def_vars.contains(v),
+                            Expr::Global { symbol, .. } => def_globals.contains(symbol),
+                            _ => false,
+                        };
+                        if clobbers {
+                            break;
+                        }
+                    }
                 }
                 let mut n = HashMap::new();
                 crate::inline::count_uses(std::slice::from_ref(&b[j]), &mut n);
@@ -478,7 +508,22 @@ fn forward_address_temps(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>
                     break;
                 }
             }
-            if total == 0 || seen != total {
+            // (beyond the next two statements only across stores of values computed without
+            // reading memory: field inserts, constants)
+            let reads_memory = |s: &Stmt| -> bool {
+                let src = match s {
+                    Stmt::Assign { src, .. } => src,
+                    Stmt::Expr(e) => e,
+                    _ => return true,
+                };
+                let mut m = false;
+                src.walk(&mut |e| {
+                    m |= matches!(e, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. } | Expr::BitField { .. } | Expr::New { .. } | Expr::IncDec { .. })
+                        || (matches!(e, Expr::Call { .. }) && !e.is_pure_call());
+                });
+                m
+            };
+            if total == 0 || seen != total || (span > i + 2 && (b[i + 1..=span].iter().any(stmt_has_call) || b[i + 2..span].iter().any(|s| reads_memory(s)))) {
                 i += 1;
                 continue;
             }
@@ -524,7 +569,7 @@ fn forward_address_temps(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>
 fn stmt_has_call(s: &Stmt) -> bool {
     let mut c = false;
     Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
-        if matches!(e, Expr::Call { .. } | Expr::New { .. }) {
+        if matches!(e, Expr::Call { .. } | Expr::New { .. }) && !e.is_pure_call() {
             c = true;
         }
     });
@@ -1039,10 +1084,9 @@ pub fn absolute_globals(body: &mut Vec<Stmt>, db: &TypeDb) {
             if let Some(es) = types::size_of(Some(db), e).filter(|s| matches!(s, 1 | 2 | 4)) {
                 regions.push((n.clone(), *a, (**e).clone(), es, *cnt));
             }
-        } else if types::is_aggregate(Some(db), &r) {
-            if let Some(s) = types::size_of(Some(db), &r).filter(|s| *s > 0) {
-                objects.push((n.clone(), *a, t.clone(), s));
-            }
+        } else if let Some(s) = types::size_of(Some(db), &r).filter(|s| *s > 0) {
+            // aggregates, and scalars (`u32 __OSBusClock : 0x800000F8`)
+            objects.push((n.clone(), *a, t.clone(), s));
         }
     }
     if regions.is_empty() && objects.is_empty() {
@@ -1069,7 +1113,13 @@ pub fn absolute_globals(body: &mut Vec<Stmt>, db: &TypeDb) {
         }
         for (n, start, t, s) in &objects {
             if a >= *start && a < start.wrapping_add(*s) && scalar_size(ty).is_some() {
-                *e = Expr::Member { base: Box::new(Expr::Global { symbol: n.clone(), ty: t.clone() }), offset: (a - start) as i32, ty: ty.clone() };
+                let g = Expr::Global { symbol: n.clone(), ty: t.clone() };
+                if types::is_aggregate(Some(db), t) {
+                    *e = Expr::Member { base: Box::new(g), offset: (a - start) as i32, ty: ty.clone() };
+                } else if a == *start && scalar_size(ty) == Some(*s) && matches!(strip_cv(ty), Type::Float { .. }) == matches!(strip_cv(&types::resolve(Some(db), t)), Type::Float { .. }) {
+                    // a scalar read whole (as its own kind) is the variable itself
+                    *e = g;
+                }
                 return;
             }
         }

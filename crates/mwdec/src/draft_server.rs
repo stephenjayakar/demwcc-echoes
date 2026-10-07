@@ -88,7 +88,7 @@ pub fn serve(root: &Path, work: &Path, no_db: bool) -> Result<()> {
     let p = load_project(root)?;
     // Probe compiles of the inline library: 2 slots (the parent's search workers of the job
     // waiting for this draft aren't compiling meanwhile).
-    let cc = Compilers::new(root, work, 2);
+    let cc = Compilers::new(root, work, 2).with_fast_workers(0);
     // The module's target objects: vtables (with the TypeDb) and literal values the target only
     // references. The main module's index is built once and layered under each REL's.
     let mut main_ext: Option<Arc<mwdec_mwcc::ExternIndex>> = None;

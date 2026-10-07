@@ -5,12 +5,14 @@
 //! - [`variants`]: experiment files with variants + machine-checked expectations.
 //! - [`webs`]: recover callee-saved register webs (live ranges, interference) from object code.
 //! - [`regalloc`]: model of MWCC's register colouring (predict / inverse-solve priority orders).
+pub mod advice;
 pub mod asm;
 pub mod compile;
 pub mod explain;
 pub mod flags;
 pub mod hints;
 pub mod iro;
+pub mod persist;
 pub mod regalloc;
 pub mod sched;
 pub mod schedcheck;

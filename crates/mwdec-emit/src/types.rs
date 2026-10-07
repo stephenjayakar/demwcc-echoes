@@ -102,12 +102,13 @@ fn declarator(t: &Type, inner: String) -> (String, String) {
         }
         Type::Ptr(x) => {
             let d = format!("*{inner}");
-            let d = if matches!(**x, Type::Array(..) | Type::FuncPtr(_)) { format!("({d})") } else { d };
+            // (through a cv-qualified array: `const T (*p)[n]`)
+            let d = if matches!(unqualified(x), Type::Array(..) | Type::FuncPtr(_)) { format!("({d})") } else { d };
             declarator(x, d)
         }
         Type::Ref(x) => {
             let d = format!("&{inner}");
-            let d = if matches!(**x, Type::Array(..)) { format!("({d})") } else { d };
+            let d = if matches!(unqualified(x), Type::Array(..)) { format!("({d})") } else { d };
             declarator(x, d)
         }
         Type::Array(x, n) if *n == 0 => declarator(x, format!("{inner}[]")),
@@ -141,4 +142,12 @@ pub fn split_closers(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// `t` without its outer const/volatile qualifiers.
+fn unqualified(t: &Type) -> &Type {
+    match t {
+        Type::Const(x) | Type::Volatile(x) => unqualified(x),
+        t => t,
+    }
 }

@@ -913,6 +913,12 @@ impl<'a> Lifter<'a> {
         };
         let (f_ok, f_nc) = judge(fpr(1), self);
         let (g_ok, g_nc) = judge(gpr(3), self);
+        // a recursive call whose r3 result is read: the function returns a value there
+        let self_value = self.insns.iter().enumerate().any(|(k, i)| {
+            i.is_call() && i.reloc.as_ref().is_some_and(|r| r.target == self.f.name) && other_uses.get(&(k as u32, gpr(3))).copied().unwrap_or(0) > 0
+        });
+        let g_ok = g_ok || self_value;
+        let g_nc = g_nc || self_value;
         if f_ok && (f_nc || getter_like) {
             self.ret_reg = Some(fpr(1));
             self.ret_ty = t_f32();
@@ -1135,10 +1141,11 @@ impl<'a> Lifter<'a> {
             }
         }
         // indirect/virtual calls (signature found later): word stores into the parameter area
-        // right before the call to slots nothing reads or takes the address of
+        // right before the call to slots nothing reads or takes the address of (an address taken
+        // lower in the area may be an object spanning the slot, e.g. a by-reference vector temp)
         let read_or_addressed = |off: i32, me: &Self| {
             me.insns.iter().any(|q| {
-                let addr = matches!(q.op(), Opcode::Addi) && q.ra() == 1 && q.simm() as i32 == off;
+                let addr = matches!(q.op(), Opcode::Addi) && q.ra() == 1 && (8..=off).contains(&(q.simm() as i32));
                 let load = q.ra() == 1 && q.reloc.is_none() && matches!(q.op(), Opcode::Lwz | Opcode::Lfs | Opcode::Lfd | Opcode::Lhz | Opcode::Lha | Opcode::Lbz) && q.simm() as i32 == off;
                 addr || load
             })
@@ -1685,7 +1692,17 @@ impl<'a> Lifter<'a> {
             }
             return;
         }
-        let ty = ty_of(&e, &self.vars);
+        let mut ty = ty_of(&e, &self.vars);
+        // a floating-point register holds a float whatever the value's guessed type
+        // (an untyped literal pool word read with lfs)
+        let mut e = e;
+        if (32..64).contains(&reg) && matches!(strip_cv(&ty), Type::Unknown { size: 4 } | Type::Int { size: 4, .. }) {
+            ty = t_f32();
+            // (the word itself is read as a float, not converted)
+            if let Expr::Global { ty: gt, .. } | Expr::Load { ty: gt, .. } | Expr::Member { ty: gt, .. } = &mut e {
+                *gt = t_f32();
+            }
+        }
         let t = self.new_var(format!("temp_{}", reg_name(reg)), ty, VarKind::Local, true);
         st.out.push(Stmt::Assign { dst: Expr::Var(t), src: e.clone() });
         self.temp_def.insert(t, e);
@@ -2983,11 +3000,47 @@ impl<'a> Lifter<'a> {
             Rlwimi => {
                 let s = self.get(st, gpr(i.rs()));
                 let a = self.get(st, gpr(i.ra()));
-                let (sh, mb, me) = (ins.field_sh(), ins.field_mb(), ins.field_me());
+                let (mut sh, mb, me) = (ins.field_sh(), ins.field_mb(), ins.field_me());
+                // inserting a compare result (`subf; cntlzw` rotated so its bit 5 lands in a
+                // one-bit field): the value is `__cntlzw(x) >> 5` (`a == b`) shifted into place
+                let is_clz = |e: &Expr| matches!(e, Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if symbol == "__cntlzw");
+                let clz = is_clz(&s) || matches!(&s, Expr::Var(t) if self.temp_def.get(t).is_some_and(|d| is_clz(d)));
+                let s = match &s {
+                    _ if clz && mb == me && (sh as u32 + 5) % 32 == 31 - mb as u32 => {
+                        sh = 31 - mb;
+                        arith(BinOp::Shr, s, Expr::int(5), &self.vars)
+                    }
+                    _ => s,
+                };
+                let konst = matches!(&s, Expr::Int { .. }) || matches!(&s, Expr::Cast { e, .. } if matches!(**e, Expr::Int { .. }));
                 let m = mask32(mb, me);
-                let ins_part = self.rlwinm(s, sh, mb, me);
-                let keep = arith(BinOp::And, a, Expr::uint((!m) as i64), &self.vars);
-                let v = arith(BinOp::Or, keep, ins_part, &self.vars);
+                let base_konst = matches!(&a, Expr::Int { .. }) || matches!(&a, Expr::Cast { e, .. } if matches!(**e, Expr::Int { .. }));
+                let v = if konst || base_konst || !known_zero(&a, m, &self.vars, &|t| self.temp_def.get(&t), 0) {
+                    // inserting a constant or into a constant (C shift/mask forms would fold to a
+                    // plain and/or), or into
+                    // a value whose target bits aren't known clear (the older compiler clears them
+                    // with a separate `rlwinm` for C forms): the source used the intrinsic
+                    // (`SET_REG_FIELD` in the SDK headers). Bitfield recovery turns read-modify-writes
+                    // of declared bitfields back into assignments.
+                    Expr::Call {
+                        callee: Callee::Direct { symbol: "__rlwimi".into(), sig: builtin_sig("__rlwimi", 5) },
+                        args: vec![a, s, Expr::int(sh as i64), Expr::int(mb as i64), Expr::int(me as i64)],
+                        ret: t_u32(),
+                    }
+                } else {
+                    let ins_part = self.rlwinm(s, sh, mb, me);
+                    // (the target bits are known clear here: no mask to keep the rest)
+                    let keep = a;
+                    // operand order decides which value the compiler builds in place: the right
+                    // operand of `|` becomes the insert target (C functions: SDK code built by
+                    // the older compiler, which always takes it), allocated r0 when it can be
+                    let c_linkage = sig::demangle(sig::strip_dtk_suffix(&self.f.name)).is_none();
+                    if c_linkage || (i.ra() == 0 && i.rs() != 0) {
+                        arith(BinOp::Or, ins_part, keep, &self.vars)
+                    } else {
+                        arith(BinOp::Or, keep, ins_part, &self.vars)
+                    }
+                };
                 self.def(st, k, gpr(i.ra()), v);
                 if i.rc() {
                     self.record(st, k, gpr(i.ra()));
@@ -3408,6 +3461,47 @@ pub fn delete_call(p: Expr, dtor: &FuncSig) -> Expr {
     Expr::Call { callee: Callee::Direct { symbol: "__delete".into(), sig: s }, args: vec![p], ret: Type::Void }
 }
 
+/// The bits of `m` are known to be clear in `e` (masked, narrow unsigned, shifted out).
+pub fn known_zero<'d>(e: &Expr, m: u32, vars: &[Var], def: &dyn Fn(VarId) -> Option<&'d Expr>, depth: u32) -> bool {
+    zero_bits(e, vars, def, depth) & m == m
+}
+
+/// Bits known to be clear in the value of `e`.
+fn zero_bits<'d>(e: &Expr, vars: &[Var], def: &dyn Fn(VarId) -> Option<&'d Expr>, depth: u32) -> u32 {
+    if depth > 8 {
+        return 0;
+    }
+    let zb = |x: &Expr| zero_bits(x, vars, def, depth + 1);
+    let narrow = |t: &Type| match strip_cv(t) {
+        Type::Int { size: 1, signed: false } | Type::Bool => !0xffu32,
+        Type::Int { size: 2, signed: false } | Type::WChar => !0xffffu32,
+        _ => 0,
+    };
+    let by_type = narrow(&ty_of(e, vars));
+    by_type
+        | match e {
+            Expr::Int { value, .. } => !(*value as u32),
+            Expr::Cast { ty, e: x, .. } => match narrow(ty) {
+                0 if scalar_size(ty) == Some(4) => zb(x),
+                0 => 0,
+                n => n | zb(x),
+            },
+            Expr::Binary { op: BinOp::And, l, r, .. } => zb(l) | zb(r),
+            Expr::Binary { op: BinOp::Or, l, r, .. } => zb(l) & zb(r),
+            Expr::Binary { op: BinOp::Shl, l, r, .. } => match r.as_int() {
+                Some(n @ 0..=31) => (zb(l) << n) | ((1u32 << n) - 1),
+                _ => 0,
+            },
+            Expr::Binary { op: BinOp::Shr, l, r, .. } => match r.as_int() {
+                Some(n @ 1..=31) if !ty_of(l, vars).int_info().is_some_and(|(_, s)| s) => (zb(l) >> n) | !(u32::MAX >> n),
+                _ => 0,
+            },
+            // (the compiler doesn't look through the insert intrinsic)
+            Expr::Var(t) => def(*t).map_or(0, |d| zb(d)),
+            _ => 0,
+        }
+}
+
 pub fn builtin_sig(name: &str, n: usize) -> FuncSig {
     FuncSig {
         qualified_name: name.into(),
@@ -3435,6 +3529,10 @@ pub fn compatible_scalar(db: Option<&TypeDb>, field: &Type, access: &Type) -> bo
         return false;
     }
     if types::is_aggregate(db, &r) {
+        return false;
+    }
+    // an array is never a scalar (a byte buffer read as a wider value)
+    if matches!(strip_cv(&r), Type::Array(..)) && !matches!(strip_cv(access), Type::Array(..)) {
         return false;
     }
     true

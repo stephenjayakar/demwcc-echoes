@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 mwdec-core.workspace = true
 mwdec-obj.workspace = true
+mwdec-oracle = { path = "../mwdec-oracle" }
 anyhow.workspace = true

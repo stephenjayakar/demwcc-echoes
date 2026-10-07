@@ -175,6 +175,22 @@ enum Cmd {
         #[arg(long)]
         min_best: Option<f64>,
     },
+    /// Polish the exact results of a harvest directory towards natural source (still exact).
+    Repolish {
+        /// Harvest directory with exact.jsonl (default: the harvest dir).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Output JSONL (default <dir>/exact_polished.jsonl).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Only units of this split (train / test).
+        #[arg(long)]
+        split: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        unit: Option<String>,
+    },
     /// Strictly compare every function of the units' built objects with their targets (JSONL).
     VerifyUnits {
         units: Vec<String>,
@@ -280,6 +296,11 @@ fn real_main() -> Result<()> {
                 &cli.work.clone().unwrap_or_else(|| harvest::harvest_dir().join("work")),
                 harvest::HarvestArgs { max_size, min_size, budget_secs, max_compiles, jobs, workers, unit, symbol, out_dir, limit, tag, scope, report, no_supervise, seed, list, min_best },
             )
+        }
+        Cmd::Repolish { dir, out, split, limit, unit } => {
+            let dir = dir.unwrap_or_else(|| harvest::harvest_dir());
+            let out = out.unwrap_or_else(|| dir.join("exact_polished.jsonl"));
+            harvest::cmd_repolish(&root, &cli.work.clone().unwrap_or_else(|| harvest::harvest_dir().join("work")), &dir, &out, split.as_deref(), limit, unit.as_deref())
         }
         Cmd::VerifyUnits { mut units, file } => {
             if let Some(f) = file {

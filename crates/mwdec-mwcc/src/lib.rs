@@ -5,6 +5,8 @@
 //!   cache of compiled candidates (memory + disk), and a bounded process pool (default 6).
 //! - [`compile`]: the simple free-function form (no PCH, no cache).
 //! - [`compare`] / [`compare_detailed`]: the strict comparator.
+//! - Fast path ([`Mwcc::enable_fast`], module `fast`): candidates compiled by persistent compiler
+//!   processes that parse the context once; failures and exact matches are redone normally.
 //!
 //! MWCC quirk: path arguments must be absolute Windows paths with backslashes; forward slashes in
 //! `-precompile` / `-prefix` arguments are rejected ("filename is invalid").
@@ -16,7 +18,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod compare;
+mod fast;
 mod split;
+pub use fast::FastStats;
 pub use compare::{compare, compare_detailed, compare_indexed, Detailed, DiffClass, ExternIndex, ObjIndex};
 
 /// Default project root (read-only inputs); override with `MWDEC_ROOT`.
@@ -165,6 +169,9 @@ pub struct Compiled {
     /// Wall time of the compiler process (0 for cache hits).
     pub ms: f64,
     pub cache_hit: bool,
+    /// Produced by the fast path (a persistent compiler, `Mwcc::enable_fast`): confirm an exact
+    /// match with [`Mwcc::compile_in_normal`] before reporting it.
+    pub fast: bool,
 }
 
 /// A precompiled unit context: `.mch` built from the context TU with the unit's flags.
@@ -201,7 +208,8 @@ impl UnitContext {
     }
 }
 
-type CacheEntry = Result<Arc<Vec<u8>>, MwccError>;
+/// Object (and whether the fast path produced it) or a compile error.
+type CacheEntry = Result<(Arc<Vec<u8>>, bool), MwccError>;
 
 /// Default byte budget of the in-memory candidate cache (`MWDEC_MEMCACHE_MB` overrides).
 pub const MEM_CACHE_MB: usize = 96;
@@ -217,7 +225,7 @@ struct MemCache {
 
 fn entry_bytes(e: &CacheEntry) -> usize {
     64 + match e {
-        Ok(o) => o.len(),
+        Ok((o, _)) => o.len(),
         Err(e) => e.messages().len(),
     }
 }
@@ -261,7 +269,9 @@ pub struct Mwcc {
     /// On-disk candidate cache (`<hash>.o` / `<hash>.err`); `None` disables it.
     pub disk_cache: Option<PathBuf>,
     pub timeout: Duration,
-    pool: Pool,
+    pool: Arc<Pool>,
+    /// Persistent-compiler fast path for candidate compiles (`enable_fast`).
+    fast: std::sync::RwLock<Option<Arc<fast::FastPool>>>,
     counter: AtomicU64,
     mem_cache: Mutex<MemCache>,
     pch_locks: Mutex<HashMap<u128, Arc<Mutex<()>>>>,
@@ -279,7 +289,8 @@ impl Mwcc {
             work: work.to_path_buf(),
             disk_cache: Some(work.join("cache")),
             timeout: Duration::from_secs(120),
-            pool: Pool::new(jobs),
+            pool: Arc::new(Pool::new(jobs)),
+            fast: std::sync::RwLock::new(None),
             counter: AtomicU64::new(0),
             mem_cache: Mutex::new(MemCache::new()),
             pch_locks: Mutex::new(HashMap::new()),
@@ -402,7 +413,7 @@ impl Mwcc {
             return Err(failure(status, messages));
         }
         let bytes = std::fs::read(&obj).map_err(io("reading object"))?;
-        Ok(Compiled { obj: Arc::new(bytes), obj_path: obj, messages, ms, cache_hit: false })
+        Ok(Compiled { obj: Arc::new(bytes), obj_path: obj, messages, ms, cache_hit: false, fast: false })
     }
 
     /// Precompile a unit context (`context` = include lines) with `cflags` into an `.mch`,
@@ -461,31 +472,75 @@ impl Mwcc {
     }
 
     /// Compile candidate code (function definitions etc.) in a unit context. Results (objects and
-    /// compile errors) are cached by content hash in memory and on disk.
+    /// compile errors) are cached by content hash in memory and on disk. With the fast path on
+    /// ([`Mwcc::enable_fast`]) the object may come from a persistent compiler (`Compiled::fast`).
     pub fn compile_in(&self, ctx: &UnitContext, code: &str) -> Result<Compiled, MwccError> {
+        self.compile_in_mode(ctx, code, true)
+    }
+
+    /// [`Mwcc::compile_in`] without the fast path: a normal compiler run (or a cached result of
+    /// one). Use it to confirm a match found with a fast-path object.
+    pub fn compile_in_normal(&self, ctx: &UnitContext, code: &str) -> Result<Compiled, MwccError> {
+        self.compile_in_mode(ctx, code, false)
+    }
+
+    fn compile_in_mode(&self, ctx: &UnitContext, code: &str, allow_fast: bool) -> Result<Compiled, MwccError> {
         let key = match &ctx.tu_name {
             Some(n) => content_hash(&[&ctx.hash.to_le_bytes(), b"tu:", n.as_bytes(), code.as_bytes()]),
             None => content_hash(&[&ctx.hash.to_le_bytes(), code.as_bytes()]),
         };
-        if let Some(hit) = self.mem_cache.lock().unwrap().get(&key).cloned() {
-            return hit.map(|obj| Compiled {
-                obj,
-                obj_path: self.cache_path(key, "o").unwrap_or_default(),
-                messages: String::new(),
-                ms: 0.0,
-                cache_hit: true,
-            });
+        let hit = |e: CacheEntry, path: PathBuf| {
+            e.map(|(obj, fast)| Compiled { obj, obj_path: path, messages: String::new(), ms: 0.0, cache_hit: true, fast })
+        };
+        let cached = self.mem_cache.lock().unwrap().get(&key).cloned();
+        match cached {
+            Some(Ok((_, true))) if !allow_fast => {}
+            Some(e) => return hit(e, self.cache_path(key, "o").unwrap_or_default()),
+            None => {}
         }
-        if let Some(hit) = self.disk_get(key) {
-            self.mem_cache.lock().unwrap().insert(key, hit.clone());
-            return hit.map(|obj| Compiled {
-                obj,
-                obj_path: self.cache_path(key, "o").unwrap_or_default(),
-                messages: String::new(),
-                ms: 0.0,
-                cache_hit: true,
-            });
+        if let Some(e) = self.disk_get(key) {
+            self.mem_cache.lock().unwrap().insert(key, e.clone());
+            return hit(e, self.cache_path(key, "o").unwrap_or_default());
         }
+        let mut fast_failed = None;
+        if allow_fast {
+            if let Some((fp, spec)) = self.fast_spec(ctx) {
+                let t = Instant::now();
+                match fp.compile(&spec, &fast_body(ctx, code)) {
+                    fast::Outcome::Obj(obj) => {
+                        let obj = Arc::new(obj);
+                        if std::env::var_os("MWDEC_PERSIST_VERIFY").is_some() {
+                            // check mode: every fast object against a normal compile
+                            if let Ok(n) = self.compile_in_mode(ctx, code, false) {
+                                let same = split::same_code(&obj, &n.obj);
+                                fp.note_verify(same);
+                                if !same {
+                                    eprintln!("mwdec-mwcc: fast path and normal compile differ for:\n{code}");
+                                    return Ok(n);
+                                }
+                            }
+                        }
+                        self.mem_cache.lock().unwrap().insert(key, Ok((obj.clone(), true)));
+                        let ms = t.elapsed().as_secs_f64() * 1000.0;
+                        return Ok(Compiled { obj, obj_path: PathBuf::new(), messages: String::new(), ms, cache_hit: false, fast: true });
+                    }
+                    fast::Outcome::Failed(w) => fast_failed = Some((fp, w)),
+                    fast::Outcome::NotReady => {}
+                }
+            }
+        }
+        let res = self.compile_in_slow(ctx, code, key);
+        if let (Some((fp, w)), Ok(_)) = (&fast_failed, &res) {
+            fp.poisoned(*w);
+            if std::env::var_os("MWDEC_MWCC_LOG").is_some() {
+                eprintln!("mwdec-mwcc: fast path failed, normal compile succeeded");
+            }
+        }
+        res
+    }
+
+    /// The normal compile behind `compile_in` (PCH with crash workarounds, or the plain context).
+    fn compile_in_slow(&self, ctx: &UnitContext, code: &str, key: u128) -> Result<Compiled, MwccError> {
         let log = std::env::var_os("MWDEC_MWCC_LOG").is_some();
         let mut res = match &ctx.mch {
             Some(_) => {
@@ -515,7 +570,7 @@ impl Mwcc {
                     let _ = std::fs::remove_file(&c.obj_path);
                     c.obj_path = p;
                 }
-                self.mem_cache.lock().unwrap().insert(key, Ok(c.obj.clone()));
+                self.mem_cache.lock().unwrap().insert(key, Ok((c.obj.clone(), false)));
             }
             Err(e @ MwccError::Compile { .. }) => {
                 let _ = self.disk_put(key, Err(e.messages()));
@@ -524,6 +579,78 @@ impl Mwcc {
             Err(_) => {}
         }
         res
+    }
+
+    /// Turn on the fast path for candidate compiles: up to `workers` (at most 4) persistent
+    /// compiler threads (module `fast`), started on first use. GC/2.7 only; contexts compiled
+    /// with line information (`-sym`, `-g`) always compile normally. `MWDEC_PERSIST=0` in the
+    /// environment keeps it off. Returns whether it is on.
+    pub fn enable_fast(&self, workers: usize) -> bool {
+        if fast_disabled_by_env() || !self.compiler.replace('\\', "/").contains("GC/2.7/") {
+            return false;
+        }
+        let mut f = self.fast.write().unwrap();
+        if f.is_none() {
+            *f = Some(Arc::new(fast::FastPool::new(workers.clamp(1, 4), self.pool.clone())));
+        }
+        true
+    }
+
+    /// End the fast path's workers and their compiler processes (it stays off afterwards).
+    pub fn shutdown_fast(&self) {
+        let f = self.fast.write().unwrap().take();
+        if let Some(f) = f {
+            f.shutdown();
+        }
+    }
+
+    /// Counters of the fast path (`None` if it is off).
+    pub fn fast_stats(&self) -> Option<FastStats> {
+        self.fast.read().unwrap().as_ref().map(|f| f.stats())
+    }
+
+    /// Record the normal-compile confirmation of an exact match found with a fast-path object
+    /// (`agreed`: the normal compile matched too).
+    pub fn note_fast_confirm(&self, agreed: bool) {
+        if let Some(f) = self.fast.read().unwrap().as_ref() {
+            f.note_confirm(agreed);
+        }
+        if !agreed {
+            eprintln!("mwdec-mwcc: an exact match from the fast path was not confirmed by a normal compile");
+        }
+    }
+
+    /// The fast path and the persistent-compiler spec for `ctx`, if both apply.
+    fn fast_spec(&self, ctx: &UnitContext) -> Option<(Arc<fast::FastPool>, Arc<fast::Spec>)> {
+        let fp = self.fast.read().unwrap().clone()?;
+        if ctx.cflags.iter().any(|f| f == "-sym" || f.starts_with("-sym") || f == "-g") {
+            return None;
+        }
+        // Keyed by the context text (not the PCH): the plain and PCH forms share one process.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (&self.compiler, &ctx.cflags, &ctx.context, &ctx.tu_name).hash(&mut h);
+            h.finish()
+        };
+        let spec = fp.spec(key, || {
+            let c_lang = ctx.cflags.iter().any(|f| f == "-lang=c" || f == "-lang=c99");
+            let version = self.compiler.replace('\\', "/").trim_start_matches("build/compilers/").trim_end_matches("/mwcceppc.exe").to_string();
+            fast::Spec {
+                key,
+                comp: mwdec_oracle::compile::Compiler {
+                    root: self.root.clone(),
+                    work: self.work.join("persist"),
+                    profile: if c_lang { mwdec_oracle::flags::Profile::SdkC } else { mwdec_oracle::flags::Profile::Game },
+                    extra: vec![],
+                    version: Some(version),
+                    cflags: Some(ctx.cflags.clone()),
+                },
+                context: ctx.context.clone(),
+                file_name: ctx.tu_name.clone(),
+            }
+        });
+        Some((fp, spec))
     }
 
     /// Compile many candidates in one context concurrently (bounded by the pool).
@@ -541,7 +668,7 @@ impl Mwcc {
     fn disk_get(&self, key: u128) -> Option<CacheEntry> {
         let o = self.cache_path(key, "o")?;
         if let Ok(b) = std::fs::read(&o) {
-            return Some(Ok(Arc::new(b)));
+            return Some(Ok((Arc::new(b), false)));
         }
         let e = self.cache_path(key, "err")?;
         if let Ok(m) = std::fs::read_to_string(&e) {
@@ -564,6 +691,23 @@ impl Mwcc {
         }
         Some(p)
     }
+}
+
+/// `MWDEC_PERSIST=0` (or `off` / `no`) disables the fast path.
+pub fn fast_disabled_by_env() -> bool {
+    std::env::var("MWDEC_PERSIST").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "no" | "false"))
+}
+
+/// The candidate as the persistent compiler sees it: after the context and a marker line, so a
+/// `#line` directive restores the line numbers of a normal compile (`__LINE__`): line 1 after a
+/// PCH (the candidate is the whole file), after the context text otherwise.
+fn fast_body(ctx: &UnitContext, code: &str) -> String {
+    let line = if ctx.mch.is_some() || ctx.context.is_empty() {
+        1
+    } else {
+        ctx.context.matches('\n').count() + 1 + usize::from(!ctx.context.ends_with('\n'))
+    };
+    format!("#line {line}\n{code}")
 }
 
 /// Compile `source` (a full TU) with `cflags`; returns the path of the produced object.

@@ -23,7 +23,7 @@ type ObjectFileRef = mwdec_core::ObjectFile;
 
 /// Same functions (strict comparison, binding) and same data in two compiled objects. Byte
 /// equality is too strict: the object records the (unique) temporary source file name.
-fn same_code(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn same_code(a: &[u8], b: &[u8]) -> bool {
     let (Ok(oa), Ok(ob)) = (mwdec_obj::load_object_bytes("a.o", a), mwdec_obj::load_object_bytes("b.o", b)) else { return false };
     if oa.functions.len() != ob.functions.len() {
         return false;
