@@ -84,11 +84,12 @@ impl<'a> Locator<'a> {
     pub fn new(mwcc: &'a Mwcc, ctx: &UnitContext, tf: &Function) -> Option<Locator<'a>> {
         let mut flags = ctx.cflags.clone();
         flags.extend(["-sym".to_string(), "on".to_string()]);
-        let sctx = if ctx.mch.is_some() {
+        let mut sctx = if ctx.mch.is_some() {
             mwcc.precompile(&ctx.context, &flags).ok()?
         } else {
             mwcc.plain_context(&ctx.context, &flags)
         };
+        sctx.tu_name = ctx.tu_name.clone();
         let f = to_asm(tf);
         Some(Locator { mwcc, ctx: sctx, target: asm::Obj { funcs: vec![f.clone()], ..Default::default() }, tf: f, tw: masked_words(tf) })
     }

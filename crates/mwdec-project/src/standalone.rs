@@ -38,6 +38,10 @@ impl Standalone {
 
 /// `rstl::vector<int, A>::reserve` -> `rstl::vector::reserve` (decl keys carry no template args).
 fn strip_template_args(s: &str) -> String {
+    // an operator's name (`operator->`, `operator<=`, `operator<<`) is not a template argument list
+    if let Some(i) = s.match_indices("operator").map(|(i, _)| i).find(|&i| i == 0 || s[..i].ends_with("::")) {
+        return format!("{}{}", if i > 0 { strip_template_args(&s[..i]) } else { String::new() }, &s[i..]);
+    }
     let mut out = String::new();
     let mut depth = 0i32;
     for c in s.chars() {

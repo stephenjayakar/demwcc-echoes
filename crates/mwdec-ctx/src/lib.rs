@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when the TypeDb produced for the same inputs changes (invalidates caches).
-const CACHE_VERSION: &str = "mwdec-ctx-13-merged";
+const CACHE_VERSION: &str = "mwdec-ctx-15-errs";
 
 /// Parse the DWARF of an already-compiled MWCC object into a TypeDb (no header scan).
 pub fn typedb_from_object_bytes(elf: &[u8]) -> Result<TypeDb> {
@@ -413,6 +413,7 @@ fn build_uncached(root: &Path, context_tu: &str, cflags: &[String], dir: &Path) 
     }
     resolve::patch_bool_fields(&mut db, &sr.fields);
     resolve::patch_void_pointers(&mut db, &sr.fields, &sr.template_params);
+    resolve::patch_const_pointees(&mut db, &sr.fields);
     resolve::patch_void_pointers(&mut db, &sr.template_fields, &sr.template_params);
     resolve::patch_field_access(&mut db, &sr.fields, &missing_access);
     resolve::apply_decls(&mut db, &sr);
@@ -438,6 +439,10 @@ fn sig_from_decl(d: &DeclInfo, mangled: Option<&str>, db: &TypeDb) -> FuncSig {
 
 /// Is `scope` (from a mangled name) a class rather than a namespace?
 pub fn is_class_scope(scope: &str, db: &TypeDb) -> bool {
+    // the anonymous namespace (`@unnamed@CFoo_cpp@`)
+    if scope.starts_with("@unnamed@") && !scope.contains("::") {
+        return false;
+    }
     if db.classes.contains_key(scope) {
         return true;
     }

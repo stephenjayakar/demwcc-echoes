@@ -178,6 +178,10 @@ fn is_namespace_guess(scope: &str, db: Option<&TypeDb>) -> bool {
         }
     }
     let last = split_scope(scope).1;
+    // the anonymous namespace (`@unnamed@CFoo_cpp@`)
+    if last.starts_with("@unnamed@") {
+        return true;
+    }
     // Project namespaces are lower-case (`rstl`, `std`, `nl`); classes are `CFoo`/`SFoo`/`TFoo`.
     last.chars().next().map_or(false, |c| c.is_ascii_lowercase()) && !last.contains('<')
 }
@@ -188,7 +192,22 @@ pub fn find_class<'a>(db: &'a TypeDb, name: &str) -> Option<&'a mwdec_core::Clas
         return Some(c);
     }
     let n = norm_name(name);
-    db.classes.iter().find(|(k, _)| norm_name(k) == n).map(|(_, c)| c)
+    // only keys with whitespace can match a different spelling: look them up in a per-thread
+    // index of this TypeDb (misses were a scan over every class with an allocation each)
+    let id = (db as *const TypeDb as usize, db.classes.len());
+    let key = SPACED.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.0 != id {
+            s.0 = id;
+            s.1 = db.classes.keys().filter(|k| k.chars().any(char::is_whitespace)).map(|k| (norm_name(k), k.clone())).collect();
+        }
+        s.1.get(&n).cloned()
+    });
+    key.and_then(|k| db.classes.get(&k))
+}
+
+thread_local! {
+    static SPACED: std::cell::RefCell<((usize, usize), std::collections::HashMap<String, String>)> = std::cell::RefCell::new(((0, 0), std::collections::HashMap::new()));
 }
 
 /// Signature of a mangled function symbol. The return type is `Unknown{0}` ("not known") unless

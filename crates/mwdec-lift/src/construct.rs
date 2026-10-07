@@ -79,6 +79,74 @@ fn ctors(db: &TypeDb, cls: &str) -> Vec<(FuncSig, Vec<String>)> {
     out
 }
 
+/// Constructors of `cls` that set members directly from parameters, for objects whose inline
+/// constructor the compiler expanded into member stores: (signature, member offset per
+/// parameter). Initializer-list entries `m(param)` and base classes built from parameters
+/// (`Base(a, b)`) map parameters; other entries (constants, expressions) are the constructor's own.
+pub fn member_ctors(db: &TypeDb, cls: &str) -> Vec<(FuncSig, Vec<i32>)> {
+    member_ctors_d(db, cls, 0)
+}
+
+fn member_ctors_d(db: &TypeDb, cls: &str, depth: u32) -> Vec<(FuncSig, Vec<i32>)> {
+    let Some(c) = sig::find_class(db, cls) else { return vec![] };
+    let last = sig::split_scope(cls).1;
+    let key = format!("{}::{}", strip_tmpl(cls), strip_tmpl(last));
+    let mut out = vec![];
+    for d in db.decls.get(&key).map(|v| v.as_slice()).unwrap_or(&[]) {
+        if !d.is_inline_defined || d.params.is_empty() || d.access != mwdec_core::Access::Public || !d.template_params.is_empty() {
+            continue;
+        }
+        let Some(init) = &d.init_list else { continue };
+        let names: Vec<String> = d.params.iter().map(|p| p.name.clone().unwrap_or_default()).collect();
+        let mut offs: Vec<Option<i32>> = vec![None; names.len()];
+        for part in sig::split_top(init, ',') {
+            let toks: Vec<&str> = part.split_whitespace().collect();
+            if toks.len() < 3 || toks[1] != "(" || toks.last() != Some(&")") {
+                continue;
+            }
+            if toks.len() == 4 {
+                if let (Some(i), Some(f)) = (names.iter().position(|n| n == toks[2]), c.fields.iter().find(|f| f.name == toks[0] && f.bitfield.is_none())) {
+                    if offs[i].is_none() {
+                        offs[i] = Some(f.offset as i32);
+                    }
+                    continue;
+                }
+            }
+            if depth >= 4 {
+                continue;
+            }
+            let Some(b) = c.bases.iter().find(|b| sig::split_scope(&strip_tmpl(&b.name)).1 == toks[0]) else { continue };
+            let inner = toks[2..toks.len() - 1].join(" ");
+            let bargs: Vec<String> = sig::split_top(&inner, ',').into_iter().map(|a| a.trim().to_string()).collect();
+            if let Some((_, boffs)) = member_ctors_d(db, &b.name, depth + 1).into_iter().find(|(s, _)| s.params.len() == bargs.len()) {
+                for (j, a) in bargs.iter().enumerate() {
+                    if let Some(i) = names.iter().position(|n| n == a) {
+                        if offs[i].is_none() {
+                            offs[i] = Some(b.offset as i32 + boffs[j]);
+                        }
+                    }
+                }
+            }
+        }
+        if offs.iter().any(|o| o.is_none()) {
+            continue;
+        }
+        let s = FuncSig {
+            qualified_name: key.clone(),
+            mangled: None,
+            ret: Type::Void,
+            params: d.params.iter().map(|p| Param { name: p.name.clone(), ty: p.ty.clone() }).collect(),
+            this_class: Some(cls.to_string()),
+            is_const: false,
+            is_static: false,
+            is_virtual: false,
+            variadic: false,
+        };
+        out.push((s, offs.into_iter().map(|o| o.unwrap()).collect()));
+    }
+    out
+}
+
 /// The stored value as a value of member type `ft` (scalar as is; a one-member object from its
 /// member's value: whole-object read or a one-argument constructor).
 fn as_member(v: &Expr, ft: &Type, vars: &[Var], db: &TypeDb, defs: &HashMap<VarId, Expr>) -> Option<Expr> {

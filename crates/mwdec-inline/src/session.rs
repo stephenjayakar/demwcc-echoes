@@ -58,7 +58,14 @@ impl UnitSession {
         m.compiler = compiler;
         let plain = m.plain_context(&context, &u.cflags);
         let ctx = m.precompile(&context, &u.cflags).unwrap_or_else(|_| plain.clone());
-        Ok(UnitSession { unit: u.name.clone(), cflags: u.cflags.clone(), context, obj, db, mwcc: Arc::new(m), ctx, plain })
+        let mut s = UnitSession { unit: u.name.clone(), cflags: u.cflags.clone(), context, obj, db, mwcc: Arc::new(m), ctx, plain };
+        if std::env::var("MWDI_NO_COMPLETE").is_err() {
+            if let Some(mut db) = s.db.take() {
+                crate::complete::complete_instances(&mut db, &s.context, &s.cflags, &|code| s.compile(code));
+                s.db = Some(db);
+            }
+        }
+        Ok(s)
     }
 
     /// Compile `code` in the unit context (PCH, plain fallback on a crash) and load the object.

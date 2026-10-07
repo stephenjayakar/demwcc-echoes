@@ -291,11 +291,18 @@ pub fn try_region_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &MEnv, id
                 continue;
             }
             canon(&mut val);
+            let trace = std::env::var("MWDI_TRACE").is_ok();
+            if trace {
+                eprintln!("REGION value {val:?}");
+            }
             for &ti in &idx.cflow {
                 let t = &env.lib.templates[ti];
                 let Shape::Scalar(p) = &t.shape else { continue };
                 let mut m = M::new(env, t);
                 if !m.m(p, &val) {
+                    if trace && std::env::var("MWDI_TRACE").map_or(false, |f| t.name.contains(f.as_str())) {
+                        eprintln!("  no match {}: {p:?}", t.name);
+                    }
                     continue;
                 }
                 let Some((args, extra)) = m.finalize(0) else { continue };

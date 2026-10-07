@@ -428,6 +428,46 @@ pub fn try_stmts_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, idx:
                 }
             }
         }
+        // the value read later (`p = in.ptr; in.ptr = p + 4; ...; x = *p;`: the compiler
+        // scheduled the load past other statements): `x = in.ReadInt32();` at the window
+        let mut later: Option<(usize, VarId, Expr)> = None;
+        if let (Some(r), None) = (result, &replaced_next) {
+            let mut r = r.clone();
+            for (h, v) in m.folded.iter().rev() {
+                r.rewrite(&mut |x| {
+                    if matches!(x, Expr::Var(y) if *y == *h) {
+                        *x = v.clone();
+                    }
+                });
+            }
+            let first_use = (end..(end + 8).min(b.len())).find(|&k| bound_locals.iter().any(|v| uses_in(std::slice::from_ref(&b[k]), *v) > 0));
+            if let Some(k) = first_use {
+                if let Stmt::Assign { dst: Expr::Var(dv), src } = &b[k] {
+                    let mut mm = M { env: m.env, t: m.t, b: m.b.clone(), folded: vec![] };
+                    let local = matches!(env.vars[*dv].kind, VarKind::Local);
+                    let untouched = uses_in(&b[i..k], *dv) == 0;
+                    if local && untouched && mm.m(&r, src) {
+                        // nothing in between may write what the value reads
+                        let mut rd = vec![];
+                        crate::safety::reads(&crate::matcher::expand(src, env.defs), env, &mut rd);
+                        let clean = (end..k).all(|x| !crate::safety::clobbers(&b[x], &rd, env));
+                        if clean {
+                            if let Some(call) = mk(&m) {
+                                later = Some((k, *dv, call));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((k, dv, call)) = later {
+            let ok = bound_locals.iter().all(|v| uses_in(whole, *v) == uses_in(&window, *v) + uses_in(std::slice::from_ref(&b[k]), *v));
+            if ok {
+                b.remove(k);
+                b.splice(i..end, [Stmt::Assign { dst: Expr::Var(dv), src: call }]);
+                return true;
+            }
+        }
         let consumed = |v: VarId| match &replaced_next {
             Some(s) => uses_in(std::slice::from_ref(&b[end]), v).saturating_sub(uses_in(std::slice::from_ref(s), v)),
             None => 0,

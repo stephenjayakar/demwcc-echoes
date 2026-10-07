@@ -156,19 +156,34 @@ fn work_list(db: &TypeDb) -> Vec<(String, Option<String>, String, DeclInfo, bool
             }
         }
     }
-    // members of instantiated class templates (`rstl::vector<int, ...>::size`)
+    // members of instantiated class templates (`rstl::vector<int, ...>::size`) and of classes
+    // nested in them (`rstl::red_black_tree<...>::const_iterator::operator==`)
     for (cname, c) in &db.classes {
-        let Some(lt) = cname.find('<') else { continue };
-        if !cname.ends_with('>') || c.is_declaration {
+        if !cname.contains('<') || c.is_declaration {
             continue;
         }
-        let base = &cname[..lt];
-        let Some(tps) = db.templates.get(base) else { continue };
-        let args: Vec<Type> = mwdec_lift::sig::split_top(&cname[lt + 1..cname.len() - 1], ',').iter().map(|a| mwdec_lift::sig::parse_type(a.trim())).collect();
+        let parts = mwdec_ctx::mangle::split_scope(cname);
+        let Some(ti) = parts.iter().rposition(|p| p.contains('<')) else { continue };
+        let tpart = parts[ti];
+        let Some(lt) = tpart.find('<') else { continue };
+        if !tpart.ends_with('>') {
+            continue;
+        }
+        let mut bparts: Vec<&str> = parts[..ti].to_vec();
+        bparts.push(&tpart[..lt]);
+        let base = bparts.join("::");
+        let inst = parts[..=ti].join("::");
+        let nested: Vec<&str> = parts[ti + 1..].to_vec();
+        let Some(tps) = db.templates.get(&base) else { continue };
+        let arg_text = mwdec_lift::sig::split_top(&tpart[lt + 1..tpart.len() - 1], ',');
+        let args: Vec<Type> = arg_text.iter().map(|a| mwdec_lift::sig::parse_type(a.trim())).collect();
         if args.len() != tps.len() {
             continue;
         }
-        let prefix = format!("{base}::");
+        let bind: std::collections::HashMap<String, (Type, String)> = tps.iter().cloned().zip(args.iter().cloned().zip(arg_text.iter().map(|a| a.trim().to_string()))).collect();
+        let decl_scope = if nested.is_empty() { base.clone() } else { format!("{base}::{}", nested.join("::")) };
+        let own_name = nested.last().copied().unwrap_or(mwdec_lift::sig::split_scope(&base).1);
+        let prefix = format!("{decl_scope}::");
         for (key, ds) in db.decls.range(prefix.clone()..) {
             if !key.starts_with(&prefix) {
                 break;
@@ -181,12 +196,22 @@ fn work_list(db: &TypeDb) -> Vec<(String, Option<String>, String, DeclInfo, bool
                 if d.template_params != *tps {
                     continue;
                 }
-                let sub = |t: &Type| subst_class(t, tps, &args, base, cname);
+                let sub = |t: &Type| {
+                    let t = if nested.is_empty() { subst_class(t, tps, &args, &base, cname) } else { mwdec_ctx::resolve::substitute(db, t, &bind, Some((&base, &inst))) };
+                    let t = mwdec_ctx::resolve::substitute(db, &t, &bind, Some((&base, &inst)));
+                    // member types named unqualified (`const_iterator end()`, `rstl::vector::iterator`)
+                    let t = mwdec_ctx::qualify_nested(db, &t, cname);
+                    if nested.is_empty() {
+                        t
+                    } else {
+                        mwdec_ctx::qualify_nested(db, &t, &inst)
+                    }
+                };
                 let mut d2 = d.clone();
                 d2.params = d.params.iter().map(|p| Param { name: p.name.clone(), ty: sub(&p.ty) }).collect();
                 d2.ret = sub(&d.ret);
                 d2.template_params = vec![];
-                let last = if member == mwdec_lift::sig::split_scope(base).1 { mwdec_lift::sig::split_scope(base).1.to_string() } else { member.clone() };
+                let last = if member == own_name { own_name.to_string() } else { member.clone() };
                 work.push((format!("{cname}::{member}"), Some(cname.clone()), last, d2, false));
             }
         }
@@ -231,8 +256,12 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             if d.inline_body.as_deref().map_or(false, |b| b.split_whitespace().any(|t| matches!(t, "for" | "while" | "do" | "goto"))) {
                 continue;
             }
-            // constructors of class template instances (containers reading streams etc.)
-            if class.as_deref().map_or(false, |c| c.contains('<')) && class.as_deref().map(|c| mwdec_lift::sig::split_scope(c).1.split('<').next().unwrap_or("").to_string()).as_deref() == Some(last) {
+            // constructors of class template instances with stream or count parameters
+            // (containers reading streams, sized vectors: loops and allocations)
+            if class.as_deref().map_or(false, |c| c.contains('<'))
+                && class.as_deref().map(|c| mwdec_lift::sig::split_scope(c).1.split('<').next().unwrap_or("").to_string()).as_deref() == Some(last)
+                && d.params.iter().any(|p| matches!(strip_cv(&p.ty), Type::Int { .. } | Type::Long { .. }) || format!("{:?}", p.ty).contains("CInputStream"))
+            {
                 continue;
             }
             if let Some(rel) = rel {
@@ -251,9 +280,18 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                     continue;
                 }
             }
-            let is_ctor = class.as_deref().map_or(false, |c| mwdec_lift::sig::split_scope(c).1 == last);
+            let is_ctor = class.as_deref().map_or(false, |c| {
+                let own = mwdec_lift::sig::split_scope(c).1;
+                own == last || own.split('<').next() == Some(last)
+            });
             let tp: &[String] = &[];
-            let Some(pspell) = d.params.iter().map(|p| spell(&p.ty, db, tp)).collect::<Option<Vec<_>>>() else { continue };
+            let skips = std::env::var("MWDI_SKIPS").is_ok();
+            let Some(pspell) = d.params.iter().map(|p| spell(&p.ty, db, tp)).collect::<Option<Vec<_>>>() else {
+                if skips {
+                    eprintln!("SKIP {qname}: params {:?}", d.params.iter().map(|p| &p.ty).collect::<Vec<_>>());
+                }
+                continue;
+            };
             let mut params = vec![];
             let mut decl_params = vec![];
             let kind;
@@ -263,7 +301,9 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             let body: String;
             if is_ctor {
                 let c = class.clone().unwrap();
-                if d.params.is_empty() || mwdec_lift::sig::find_class(db, &c).map_or(true, |k| k.vptr_offset.is_some()) {
+                // default constructors only for class template instances (`optional_object<T>()`:
+                // an empty optional); elsewhere zero stores are too common to name
+                if (d.params.is_empty() && !c.contains('<')) || mwdec_lift::sig::find_class(db, &c).map_or(true, |k| k.vptr_offset.is_some()) {
                     continue;
                 }
                 kind = CallKind::Ctor;
@@ -297,7 +337,12 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                     }
                 }
             }
-            let Some(rspell) = spell(&ret, db, tp) else { continue };
+            let Some(rspell) = spell(&ret, db, tp) else {
+                if skips {
+                    eprintln!("SKIP {qname}: ret {ret:?}");
+                }
+                continue;
+            };
             for (i, p) in d.params.iter().enumerate() {
                 params.push(p.ty.clone());
                 decl_params.push(format!("{} a{i}", pspell[i]));

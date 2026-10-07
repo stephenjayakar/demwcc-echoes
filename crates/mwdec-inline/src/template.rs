@@ -182,8 +182,19 @@ fn object_comps(e: &Expr, class: &str, db: &TypeDb) -> Option<Vec<Comp>> {
     let fields = flat_fields(db, class)?;
     match e {
         Expr::Construct { args, .. } if args.len() == fields.len() => Some(fields.iter().zip(args).map(|((o, t), a)| Comp { off: *o, ty: t.clone(), pat: a.clone() }).collect()),
-        Expr::Load { base, offset, .. } => Some(fields.iter().map(|(o, t)| Comp { off: *o, ty: t.clone(), pat: Expr::Load { base: base.clone(), offset: offset + o, ty: t.clone() } }).collect()),
+        Expr::Load { base, offset, .. } if !(fields.len() == 1 && mwdec_lift::types::class_of(Some(db), &ty_of_load(e)).is_none()) => {
+            Some(fields.iter().map(|(o, t)| Comp { off: *o, ty: t.clone(), pat: Expr::Load { base: base.clone(), offset: offset + o, ty: t.clone() } }).collect())
+        }
+        // a one-member object (iterators) returned in its member's form
+        _ if fields.len() == 1 && !matches!(e, Expr::Construct { .. } | Expr::Call { .. }) => Some(vec![Comp { off: fields[0].0, ty: fields[0].1.clone(), pat: e.clone() }]),
         _ => None,
+    }
+}
+
+fn ty_of_load(e: &Expr) -> Type {
+    match e {
+        Expr::Load { ty, .. } => ty.clone(),
+        _ => Type::Unknown { size: 0 },
     }
 }
 
@@ -228,6 +239,9 @@ fn from_probe_expr(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, 
     let ret_class = class_name(&p.ret, db);
     let shape = match (&body[..], &ret_class) {
         ([Stmt::Return(Some(e))], Some(c)) if !matches!(strip(&p.ret), Type::Ptr(_)) => {
+            if std::env::var("MWDI_TRACE_TPL").is_ok_and(|f| p.sig.qualified_name.contains(f.as_str())) {
+                eprintln!("TPL {} object return: {e:?}", p.sig.qualified_name);
+            }
             let comps = object_comps(e, c, db).ok_or("object return form")?;
             let comps = comps.into_iter().map(|c| to_holes(&c.pat, &map).map(|pat| Comp { pat, ..c })).collect::<Option<Vec<_>>>().ok_or("free vars")?;
             Shape::Object { class: c.clone(), comps }

@@ -34,7 +34,11 @@ fn stmt_uses(s: &Stmt, t: VarId) -> usize {
     n
 }
 
-fn walk_stores(b: &[Stmt], f: &mut dyn FnMut(&Expr), calls: &mut bool) {
+fn walk_stores(b: &[Stmt], f: &mut dyn FnMut(&Expr), calls: &mut bool, lib: Option<&crate::InlineLib>) {
+    let real_call = |e: &Expr| match lib {
+        Some(l) => effect_call(e, l),
+        None => real_call(e),
+    };
     for s in b {
         match s {
             Stmt::Assign { dst, src } => {
@@ -44,23 +48,23 @@ fn walk_stores(b: &[Stmt], f: &mut dyn FnMut(&Expr), calls: &mut bool) {
             Stmt::Expr(e) | Stmt::Return(Some(e)) => *calls |= real_call(e),
             Stmt::If { cond, then, els } => {
                 *calls |= real_call(cond);
-                walk_stores(then, f, calls);
-                walk_stores(els, f, calls);
+                walk_stores(then, f, calls, lib);
+                walk_stores(els, f, calls, lib);
             }
             Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
                 *calls |= real_call(cond);
-                walk_stores(body, f, calls);
+                walk_stores(body, f, calls, lib);
             }
             Stmt::For { init, cond, step, body } => {
                 *calls |= real_call(cond);
-                walk_stores(init, f, calls);
-                walk_stores(step, f, calls);
-                walk_stores(body, f, calls);
+                walk_stores(init, f, calls, lib);
+                walk_stores(step, f, calls, lib);
+                walk_stores(body, f, calls, lib);
             }
             Stmt::Switch { e, cases } => {
                 *calls |= real_call(e);
                 for c in cases {
-                    walk_stores(&c.body, f, calls);
+                    walk_stores(&c.body, f, calls, lib);
                 }
             }
             Stmt::Goto(_) | Stmt::Label(_) => *calls = true,
@@ -90,7 +94,7 @@ pub fn clobbers(s: &Stmt, rd: &[(Expr, i32, u32)], env: &Env) -> bool {
         }
     };
     let mut calls = false;
-    walk_stores(std::slice::from_ref(s), &mut visit_store, &mut calls);
+    walk_stores(std::slice::from_ref(s), &mut visit_store, &mut calls, Some(env.lib));
     hit || calls
 }
 
@@ -174,6 +178,26 @@ pub fn safe_defs(body: &[Stmt], env: &Env) -> Defs {
 
 /// Does `e` contain a call that may write memory? Compiler intrinsics (`__fabs`, `__frsqrte`,
 /// `__cntlzw`...) don't.
+/// A call that may write memory: real calls, and folded inlines with side effects.
+pub fn effect_call(e: &Expr, lib: &crate::InlineLib) -> bool {
+    let mut found = false;
+    e.walk(&mut |x| match x {
+        Expr::Call { callee: mwdec_lift::Callee::Direct { sig, symbol }, .. } => {
+            if sig.mangled.is_none() && symbol == &sig.qualified_name {
+                found |= lib.effectful.contains(&sig.qualified_name);
+            } else if !(symbol.starts_with("__") && mwdec_lift::sig::demangle(symbol).is_none()) {
+                found = true;
+            }
+        }
+        Expr::Call { callee: mwdec_lift::Callee::Method { sig, symbol, .. }, .. } if symbol.is_empty() && sig.mangled.is_none() => {
+            found |= lib.effectful.contains(&sig.qualified_name);
+        }
+        Expr::Call { .. } | Expr::New { .. } => found = true,
+        _ => {}
+    });
+    found
+}
+
 pub fn real_call(e: &Expr) -> bool {
     let mut found = false;
     e.walk(&mut |x| match x {

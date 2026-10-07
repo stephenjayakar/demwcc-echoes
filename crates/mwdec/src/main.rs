@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod draft_server;
+mod autoctx;
+mod harvest;
 mod search_cmds;
 
 #[derive(Parser)]
@@ -121,6 +124,64 @@ enum Cmd {
         #[arg(long)]
         disable_ops: Option<String>,
     },
+    /// Draft + search over functions NOT yet matched in report.json (smallest first); keeps every
+    /// exact result (JSONL + per-function .cpp). Resumable; restarts itself after crashes.
+    Harvest {
+        #[arg(long, default_value_t = 128)]
+        max_size: u32,
+        #[arg(long, default_value_t = 0)]
+        min_size: u32,
+        #[arg(long, default_value_t = 20)]
+        budget_secs: u64,
+        #[arg(long)]
+        max_compiles: Option<usize>,
+        /// Functions processed in parallel.
+        #[arg(long, default_value_t = 3)]
+        jobs: usize,
+        /// Search workers per function (default ceil(6 / jobs)).
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Only units whose name contains this string.
+        #[arg(long)]
+        unit: Option<String>,
+        /// Only this symbol.
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Attempt tag: failed attempts under the same tag are not repeated.
+        #[arg(long, default_value = "t1")]
+        tag: String,
+        /// sourced | auto | all
+        #[arg(long, default_value = "sourced")]
+        scope: String,
+        /// report.json to read (default <root>/build/G2ME01/report.json).
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Run in this process (no restarting child).
+        #[arg(long)]
+        no_supervise: bool,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// List the candidates and exit.
+        #[arg(long)]
+        list: bool,
+        /// Print the summary of the results directory and exit.
+        #[arg(long)]
+        summary: bool,
+        /// Only near misses: best score in earlier attempts >= this (use with a new --tag).
+        #[arg(long)]
+        min_best: Option<f64>,
+    },
+    /// Strictly compare every function of the units' built objects with their targets (JSONL).
+    VerifyUnits {
+        units: Vec<String>,
+        /// Read unit names from this file (one per line) as well.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     /// Decompile + search a sample of dataset functions from one split; JSONL + table by size.
     Eval {
         #[arg(long, default_value = "test")]
@@ -162,6 +223,19 @@ enum Cmd {
         /// Comma-separated operator names to disable (ablations).
         #[arg(long)]
         disable_ops: Option<String>,
+        /// Print peak committed memory at the end.
+        #[arg(long)]
+        mem_report: bool,
+        /// Only functions listed in this JSONL file ({"unit","symbol"} rows, e.g. an earlier
+        /// eval's output), for comparable re-runs; split/size filters still apply.
+        #[arg(long)]
+        list: Option<PathBuf>,
+    },
+    /// Internal: first drafts for `eval`, one JSON request/reply per line (stdin/stdout).
+    #[command(hide = true)]
+    DraftServer {
+        #[arg(long)]
+        no_db: bool,
     },
 }
 
@@ -195,11 +269,29 @@ fn real_main() -> Result<()> {
             &cli.work.clone().unwrap_or_else(|| search_cmds::search_work()),
             search_cmds::MatchArgs { unit, symbol, budget_secs, init, max_compiles, workers, seed, no_db, verbose, out, no_locate, disable_ops },
         ),
-        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit } => {
+        Cmd::DraftServer { no_db } => draft_server::serve(&root, &cli.work.clone().unwrap_or_else(search_cmds::search_work), no_db),
+        Cmd::Harvest { max_size, min_size, budget_secs, max_compiles, jobs, workers, unit, symbol, out_dir, limit, tag, scope, report, no_supervise, seed, list, summary, min_best } => {
+            let out_dir = out_dir.unwrap_or_else(|| harvest::harvest_dir());
+            if summary {
+                return harvest::summary(&out_dir);
+            }
+            harvest::cmd_harvest(
+                &root,
+                &cli.work.clone().unwrap_or_else(|| harvest::harvest_dir().join("work")),
+                harvest::HarvestArgs { max_size, min_size, budget_secs, max_compiles, jobs, workers, unit, symbol, out_dir, limit, tag, scope, report, no_supervise, seed, list, min_best },
+            )
+        }
+        Cmd::VerifyUnits { mut units, file } => {
+            if let Some(f) = file {
+                units.extend(std::fs::read_to_string(f)?.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from));
+            }
+            harvest::cmd_verify_units(&root, &units)
+        }
+        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, mem_report, list } => {
             search_cmds::cmd_eval(
                 &root,
-                &cli.work.clone().unwrap_or_else(|| search_cmds::search_work()),
-                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit },
+                &cli.work.clone().unwrap_or_else(search_cmds::search_work),
+                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, mem_report, list },
             )
         }
     }
@@ -269,12 +361,12 @@ fn cmd_check(
     let m = Mwcc::new(root, work, 6);
     let context = if no_context { String::new() } else { harness::context_tu(&p, u)? };
     let t = Instant::now();
-    let plain = m.plain_context(&context, &u.cflags);
+    let plain = m.plain_context(&context, &u.cflags).named(&u.name);
     let ctx = if no_pch || context.is_empty() {
         plain.clone()
     } else {
         // A context that does not precompile (or crashes the compiler) still works as plain text.
-        m.precompile(&context, &u.cflags).unwrap_or_else(|e| {
+        m.precompile(&context, &u.cflags).map(|c| c.named(&u.name)).unwrap_or_else(|e| {
             eprintln!("warning: precompiling the context failed ({}); using the plain context", e.to_string().lines().next().unwrap_or(""));
             plain.clone()
         })
@@ -453,17 +545,12 @@ fn module_externs<'u>(p: &Project, units: impl Iterator<Item = &'u str>) -> Hash
     let mut mods: Vec<&str> = units.map(Project::module_of).collect();
     mods.sort();
     mods.dedup();
-    let main_t = p.load_module_data("main");
-    let main_o = p.load_module_linked("main");
+    let main_t = std::sync::Arc::new(ExternIndex::new(p.load_module_data("main")));
+    let main_o = std::sync::Arc::new(ExternIndex::new(p.load_module_linked("main")));
     mods.par_iter()
         .map(|m| {
-            let mut t = main_t.clone();
-            let mut o = main_o.clone();
-            if *m != "main" {
-                t.extend(p.load_module_data(m));
-                o.extend(p.load_module_linked(m));
-            }
-            (m.to_string(), (ExternIndex::new(t), ExternIndex::new(o)))
+            let (t, o) = if *m == "main" { (vec![], vec![]) } else { (p.load_module_data(m), p.load_module_linked(m)) };
+            (m.to_string(), (ExternIndex::layered(main_t.clone(), t), ExternIndex::layered(main_o.clone(), o)))
         })
         .collect()
 }

@@ -87,7 +87,7 @@ pub fn retype(body: &[Stmt], vars: &mut [Var]) {
         .filter(|(v, ts)| {
             matches!(vars[**v].kind, VarKind::Local)
                 // untyped, or the byte pointer of raw address arithmetic
-                && (matches!(vars[**v].ty, Type::Unknown { size: 4 }) || vars[**v].ty == t_ptr(t_int(1, false)))
+                && (matches!(vars[**v].ty, Type::Unknown { size: 4 }) || vars[**v].ty == t_ptr(t_int(1, false)) || matches!(pointee(&vars[**v].ty).map(strip_cv), Some(Type::Void)))
                 && !ts.is_empty()
                 && ts.iter().all(|t| matches!(strip_cv(t), Type::Ptr(_)) && key(t) == key(&ts[0]))
                 && key(&ts[0]) != key(&vars[**v].ty)
@@ -141,9 +141,84 @@ pub fn retype(body: &[Stmt], vars: &mut [Var]) {
     }
     for v in cands {
         if !bad.contains(&v) {
-            vars[v].ty = srcs[&v][0].clone();
+            let mut t = srcs[&v][0].clone();
+            // element addresses only read through: pointer to const (the element may be reached
+            // through a const accessor in the source spelling)
+            if let Type::Ptr(p) = &t {
+                if !matches!(**p, Type::Const(_)) && types::is_aggregate(None, p) && read_only(body, v) {
+                    t = t_ptr(Type::Const(p.clone()));
+                }
+            }
+            vars[v].ty = t;
         }
     }
+}
+
+/// Is pointer local `v` only dereferenced for reading (never stored through, passed on, returned
+/// or used as a receiver)?
+fn read_only(body: &[Stmt], v: VarId) -> bool {
+    let mut ok = true;
+    fn check(e: &Expr, v: VarId, ok: &mut bool) {
+        e.walk(&mut |x| match x {
+            Expr::Call { callee, args, .. } => {
+                if args.iter().any(|a| a.uses_var(v)) {
+                    *ok = false;
+                }
+                if let Callee::Method { this, .. } | Callee::Virtual { this, .. } = callee {
+                    if this.uses_var(v) {
+                        *ok = false;
+                    }
+                }
+            }
+            Expr::New { .. } | Expr::Construct { .. } | Expr::IncDec { .. } | Expr::AddrOf(_) if x.uses_var(v) => *ok = false,
+            _ => {}
+        });
+    }
+    fn visit(b: &[Stmt], v: VarId, ok: &mut bool) {
+        for s in b {
+            match s {
+                Stmt::Assign { dst, src } => {
+                    if !matches!(dst, Expr::Var(_)) && dst.uses_var(v) {
+                        *ok = false;
+                    }
+                    if matches!(dst, Expr::Var(w) if *w != v) && matches!(src, Expr::Var(w) if *w == v) {
+                        *ok = false;
+                    }
+                    check(src, v, ok);
+                }
+                Stmt::Expr(e) => check(e, v, ok),
+                Stmt::Return(Some(e)) => {
+                    if e.uses_var(v) {
+                        *ok = false;
+                    }
+                }
+                Stmt::If { cond, then, els } => {
+                    check(cond, v, ok);
+                    visit(then, v, ok);
+                    visit(els, v, ok);
+                }
+                Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                    check(cond, v, ok);
+                    visit(body, v, ok);
+                }
+                Stmt::For { init, cond, step, body } => {
+                    visit(init, v, ok);
+                    check(cond, v, ok);
+                    visit(step, v, ok);
+                    visit(body, v, ok);
+                }
+                Stmt::Switch { e, cases } => {
+                    check(e, v, ok);
+                    for c in cases {
+                        visit(&c.body, v, ok);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    visit(body, v, &mut ok);
+    ok
 }
 
 /// `(v << s) & (0xff << s)` / `v & 0xff` (and the 0xffff forms): a masked read of local `v` as

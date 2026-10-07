@@ -13,6 +13,36 @@ pub fn limit_mb() -> u64 {
     std::env::var("MWDEC_MEM_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_MB)
 }
 
+/// Memory figures of this process (MB): (current commit, peak commit) of the process itself,
+/// and the peak of the whole job (process + compilers it spawned). Zero where unknown.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemStats {
+    pub commit_mb: u64,
+    pub peak_commit_mb: u64,
+    pub job_peak_mb: u64,
+}
+
+pub fn stats() -> MemStats {
+    imp::stats()
+}
+
+/// Current committed memory of this process in MB (0 if unknown).
+pub fn commit_mb() -> u64 {
+    imp::stats().commit_mb
+}
+
+/// One-line summary for `--mem-report`.
+pub fn report_line() -> String {
+    let s = stats();
+    format!(
+        "mem: process commit {} MB (peak {} MB); job peak incl. compilers {} MB; cap {} MB",
+        s.commit_mb,
+        s.peak_commit_mb,
+        s.job_peak_mb,
+        limit_mb()
+    )
+}
+
 /// Installs the cap. Never fails the caller; problems are reported on stderr.
 pub fn install() {
     let mb = limit_mb();
@@ -59,6 +89,51 @@ mod imp {
         peak_job_memory_used: usize,
     }
 
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    /// The job handle (as usize) once installed.
+    static JOB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub fn stats() -> super::MemStats {
+        let mut s = super::MemStats::default();
+        unsafe {
+            let mut pmc = ProcessMemoryCounters { cb: std::mem::size_of::<ProcessMemoryCounters>() as u32, ..Default::default() };
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                s.commit_mb = (pmc.pagefile_usage >> 20) as u64;
+                s.peak_commit_mb = (pmc.peak_pagefile_usage >> 20) as u64;
+            }
+            let job = JOB.load(std::sync::atomic::Ordering::Relaxed);
+            if job != 0 {
+                let mut info = ExtendedLimit::default();
+                let mut ret = 0u32;
+                if QueryInformationJobObject(
+                    job as *mut c_void,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    &mut info as *mut ExtendedLimit as *mut c_void,
+                    std::mem::size_of::<ExtendedLimit>() as u32,
+                    &mut ret,
+                ) != 0
+                {
+                    s.job_peak_mb = (info.peak_job_memory_used >> 20) as u64;
+                }
+            }
+        }
+        s
+    }
+
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
     const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x200;
 
@@ -68,6 +143,8 @@ mod imp {
         fn SetInformationJobObject(job: *mut c_void, class: i32, info: *mut c_void, len: u32) -> i32;
         fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
         fn GetCurrentProcess() -> *mut c_void;
+        fn K32GetProcessMemoryInfo(process: *mut c_void, pmc: *mut ProcessMemoryCounters, cb: u32) -> i32;
+        fn QueryInformationJobObject(job: *mut c_void, class: i32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
     }
 
     pub fn install(bytes: u64) -> Result<(), String> {
@@ -92,6 +169,7 @@ mod imp {
             if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
                 return Err(format!("AssignProcessToJobObject: {}", std::io::Error::last_os_error()));
             }
+            JOB.store(job as usize, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
@@ -99,6 +177,9 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
+    pub fn stats() -> super::MemStats {
+        super::MemStats::default()
+    }
     pub fn install(_bytes: u64) -> Result<(), String> {
         Ok(())
     }

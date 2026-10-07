@@ -46,7 +46,7 @@ fn pure_stmt(s: &Stmt, vars: &[Var]) -> bool {
 
 /// Replace the argument `&v` / `v` of a call or construction in `e` by `with`. Returns the
 /// number of replacements.
-fn replace_arg(e: &mut Expr, v: VarId, with: &Expr) -> usize {
+fn replace_arg(e: &mut Expr, v: VarId, with: &Expr, only_folded: bool) -> usize {
     let mut n = 0;
     let is_v = |a: &Expr| match a {
         Expr::Var(x) => *x == v,
@@ -54,12 +54,22 @@ fn replace_arg(e: &mut Expr, v: VarId, with: &Expr) -> usize {
         _ => false,
     };
     e.rewrite(&mut |x| {
-        let args = match x {
-            Expr::Call { args, .. } | Expr::Construct { args, .. } | Expr::New { args, .. } => args,
+        let (args, sig) = match x {
+            Expr::Call { args, callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } => (args, Some(sig.clone())),
+            Expr::Construct { args, ctor, .. } => (args, ctor.clone()),
+            Expr::New { args, ctor, .. } => (args, ctor.clone()),
+            Expr::Call { args, .. } => (args, None),
             _ => return,
         };
-        for a in args.iter_mut() {
-            if is_v(a) {
+        // (a stack object built by a real constructor call moves only into folded inlines)
+        if only_folded && !sig.as_ref().is_some_and(|s| s.mangled.is_none()) {
+            return;
+        }
+        for (k, a) in args.iter_mut().enumerate() {
+            // only where the parameter takes the object itself (reference or by value), not
+            // its address
+            let by_ref = sig.as_ref().and_then(|s| s.params.get(k)).map_or(false, |p| matches!(crate::util::strip(&p.ty), Type::Ref(_) | Type::Named(_)));
+            if is_v(a) && by_ref {
                 *a = with.clone();
                 n += 1;
             }
@@ -68,10 +78,10 @@ fn replace_arg(e: &mut Expr, v: VarId, with: &Expr) -> usize {
     n
 }
 
-fn stmt_replace_arg(s: &mut Stmt, v: VarId, with: &Expr) -> usize {
+fn stmt_replace_arg(s: &mut Stmt, v: VarId, with: &Expr, only_folded: bool) -> usize {
     match s {
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => replace_arg(e, v, with),
-        Stmt::Assign { dst, src } => replace_arg(src, v, with) + replace_arg(dst, v, with),
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => replace_arg(e, v, with, only_folded),
+        Stmt::Assign { dst, src } => replace_arg(src, v, with, only_folded) + replace_arg(dst, v, with, only_folded),
         _ => 0,
     }
 }
@@ -82,11 +92,19 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
     Stmt::for_each_block_mut(body, &mut |b| {
         let mut i = 0;
         while i < b.len() {
-            let (v, val) = match &b[i] {
+            let (v, val, only_folded) = match &b[i] {
                 Stmt::Assign { dst: Expr::Var(v), src }
                     if matches!(vars[*v].kind, VarKind::Stack { .. }) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && folded_value(src) && counts.get(v) == Some(&2) =>
                 {
-                    (*v, src.clone())
+                    (*v, src.clone(), false)
+                }
+                // a stack object built by a constructor call, passed on once (`X(CAABox(a, b))`)
+                Stmt::Expr(Expr::Call { callee: Callee::Method { symbol, sig, this, .. }, args, .. })
+                    if symbol.starts_with("__ct__") && matches!(&**this, Expr::AddrOf(x) if matches!(&**x, Expr::Var(v) if matches!(vars[*v].kind, VarKind::Stack { .. }) && counts.get(v) == Some(&2))) =>
+                {
+                    let Expr::AddrOf(x) = &**this else { unreachable!() };
+                    let Expr::Var(v) = &**x else { unreachable!() };
+                    (*v, Expr::Construct { class: vars[*v].ty.clone(), ctor: Some(sig.clone()), args: args.clone() }, true)
                 }
                 _ => {
                     i += 1;
@@ -102,7 +120,7 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
                 continue;
             }
             let mut s = b[j].clone();
-            if stmt_replace_arg(&mut s, v, &val) == 1 && mentions(&s, v) == 0 {
+            if stmt_replace_arg(&mut s, v, &val, only_folded) == 1 && mentions(&s, v) == 0 {
                 b[j] = s;
                 b.remove(i);
                 n += 1;
@@ -202,5 +220,104 @@ pub fn name_shared_objects(body: &mut Vec<Stmt>, vars: &mut Vec<Var>) -> usize {
         }
     });
     vars.extend(new_vars);
+    n
+}
+
+/// A local holding a folded inline result that the next statement's condition (or returned
+/// value) uses once: `b = (it == end()); if (b)` becomes `if (it == end())`. MWCC materialises
+/// a control-flow inline's value and re-tests it either way.
+pub fn forward_cond_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    let counts = mentions_body(body);
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let fwd = match &b[i] {
+                Stmt::Assign { dst: Expr::Var(v), src } if matches!(vars[*v].kind, VarKind::Local) && folded_value(src) && counts.get(v) == Some(&2) && mentions(&b[i + 1], *v) == 1 => {
+                    let ok = match &b[i + 1] {
+                        Stmt::If { cond, .. } => cond.uses_var(*v),
+                        Stmt::Return(Some(e)) => e.uses_var(*v),
+                        _ => false,
+                    };
+                    ok.then(|| (*v, src.clone()))
+                }
+                _ => None,
+            };
+            if let Some((v, src)) = fwd {
+                let sub = |e: &mut Expr| {
+                    e.rewrite(&mut |x| {
+                        if matches!(x, Expr::Var(y) if *y == v) {
+                            *x = src.clone();
+                        }
+                    })
+                };
+                match &mut b[i + 1] {
+                    Stmt::If { cond, .. } => sub(cond),
+                    Stmt::Return(Some(e)) => sub(e),
+                    _ => {}
+                }
+                b.remove(i);
+                n += 1;
+                continue;
+            }
+            i += 1;
+        }
+    });
+    n
+}
+
+/// `*__return = value; return;` -> `return value;` (the returned object built by a folded
+/// inline or constructor).
+pub fn return_values(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    let sret = |e: &Expr| matches!(e, Expr::Load { base, offset: 0, .. } if matches!(&**base, Expr::Var(v) if vars[*v].kind == VarKind::StructRet));
+    let counts = mentions_body(body);
+    let Some(rv) = vars.iter().position(|v| v.kind == VarKind::StructRet) else { return 0 };
+    let mut n = 0;
+    let mut writes = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        writes += b.iter().filter(|s| matches!(s, Stmt::Assign { dst, .. } if sret(dst))).count();
+    });
+    // every mention of the return slot is one of these writes
+    if counts.get(&rv).copied().unwrap_or(0) != writes {
+        return 0;
+    }
+    let value = |s: &Stmt| matches!(s, Stmt::Assign { dst, src } if sret(dst) && (folded_value(src) || matches!(src, Expr::Construct { .. })));
+    // `if (c) { *ret = a; } else { *ret = b; } return;` -> returns in both arms
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let arms = match (&b[i], &b[i + 1]) {
+                (Stmt::If { then, els, .. }, Stmt::Return(None)) => then.last().is_some_and(&value) && els.last().is_some_and(&value),
+                _ => false,
+            };
+            if arms {
+                if let Stmt::If { then, els, .. } = &mut b[i] {
+                    for arm in [then, els] {
+                        let last = arm.len() - 1;
+                        arm.push(Stmt::Return(None));
+                        let _ = last;
+                    }
+                }
+                b.remove(i + 1);
+                n += 1;
+            }
+            i += 1;
+        }
+    });
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            if let (Stmt::Assign { dst, src }, Stmt::Return(None)) = (&b[i], &b[i + 1]) {
+                if sret(dst) && (folded_value(src) || matches!(src, Expr::Construct { .. })) {
+                    let v = src.clone();
+                    b[i + 1] = Stmt::Return(Some(v));
+                    b.remove(i);
+                    n += 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    });
     n
 }

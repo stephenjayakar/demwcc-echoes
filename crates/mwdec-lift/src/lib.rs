@@ -18,6 +18,7 @@ pub mod bitfields;
 pub mod byval;
 pub mod cfg;
 pub mod construct;
+pub mod ctrloop;
 pub mod divmagic;
 pub mod debug;
 pub mod frame;
@@ -122,19 +123,28 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
             debug::stage(&format!("block {b} (translated)"), items, &l.vars);
         }
     }
-    if opts.inline_temps {
-        let mut uses = count_all(&lists);
-        for (items, mask) in lists.iter_mut() {
-            inline::inline_list(items, &mut uses, &l.is_temp, &l.vars, mask.count_ones() as usize);
+    // fold, drop dead temps, and fold again: a dead read (the vtable load of a virtual call)
+    // can keep a temp at two uses in the first round
+    for round in 0..2 {
+        if opts.inline_temps {
+            let mut uses = count_all(&lists);
+            for (items, mask) in lists.iter_mut() {
+                inline::inline_list(items, &mut uses, &l.is_temp, &l.vars, mask.count_ones() as usize);
+            }
         }
-    }
-    loop {
-        let uses = count_all(&lists);
-        let mut changed = false;
-        for (items, _) in lists.iter_mut() {
-            changed |= inline::dce(items, &uses, &l.is_temp);
+        let mut any = false;
+        loop {
+            let uses = count_all(&lists);
+            let mut changed = false;
+            for (items, _) in lists.iter_mut() {
+                changed |= inline::dce(items, &uses, &l.is_temp);
+            }
+            if !changed {
+                break;
+            }
+            any = true;
         }
-        if !changed {
+        if !any || round == 1 {
             break;
         }
     }
@@ -176,6 +186,9 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         s.run()
     };
     debug::stage("structure", &body, &l.vars);
+    simplify::fold_logical_values(&mut body, &l.vars);
+    ctrloop::forward_constant_copies(&mut body, &l.is_temp);
+    ctrloop::propagate_constant_temps(&mut body, &l.vars, &l.is_temp);
     simplify::refine_bool_vars(&body, &mut l.vars);
     simplify::simplify_body(&mut body, &l.vars);
     simplify::fold_virtual_delete_checks(&mut body);
@@ -195,9 +208,12 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     debug::stage("reinline", &body, &l.vars);
     if let Some(db) = db {
         let is_temp = l.is_temp.clone();
-        aggregates::merge_copies(&mut body, &l.vars, &|v| is_temp.get(v).copied().unwrap_or(false), db);
+        aggregates::merge_copies_typing(&mut body, &mut l.vars, &|v| is_temp.get(v).copied().unwrap_or(false), db);
+        arrays::container_members(&mut body, &l.vars, db);
         bitfields::recover(&mut body, &l.vars, db);
         byval::forward(&mut body, &mut l.vars, db);
+        aggregates::literal_inits(&mut body, &l.vars, db, obj);
+        byval::forward_ptmf_args(&mut body, &l.vars, db);
         construct::fold(&mut body, &l.vars, db);
         arrays::recover(&mut body, &l.vars, Some(db));
         localtypes::refresh_access_types(&mut body, &l.vars, db);
@@ -209,6 +225,10 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     localtypes::global_types(&mut body, &l.vars, &l.ret_ty, db);
     localtypes::drop_redundant_masks(&mut body, &l.vars, db);
     debug::stage("aggregates/bitfields", &body, &l.vars);
+    ctrloop::recover(&mut body, &mut l.vars, &mut l.is_temp);
+    ctrloop::recover_shape_b(&mut body, &l.vars, &l.is_temp);
+    ctrloop::rematerialize_global_temps(&mut body, &l.is_temp);
+    debug::stage("ctrloop", &body, &l.vars);
     simplify::recover_ctr_loops(&mut body, &mut l.vars, &mut l.is_temp);
     unroll::reroll(&mut body);
     if opts.inline_temps {
@@ -216,6 +236,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     }
     indexing::undo_strength_reduction(&mut body, &l.vars);
     indexing::recover(&mut body, &l.vars, db);
+    arrays::type_indexed_globals(&mut body, &l.vars, db, &Default::default());
     simplify::form_incdec(&mut body, &l.vars, &l.is_temp, db);
     simplify::fold_ternary_constants(&mut body);
     simplify::inline_ternary_results(&mut body);
@@ -410,11 +431,12 @@ fn early_returns(l: &mut Lifter) {
                 _ => None,
             };
             match cont {
-                Some(c) => l.cfg.make_return(p, c),
+                Some(c) => make_return_at(l, p, c),
                 None => l.cfg.make_return_plain(p),
             }
         }
     }
+    loop_returns(l);
     let nb = l.cfg.blocks.len();
     for r in 0..nb {
         if !matches!(l.cfg.blocks[r].term, cfg::Term::Return) || !l.blocks_out[r].stmts.is_empty() {
@@ -447,7 +469,7 @@ fn early_returns(l: &mut Lifter) {
                 cfg::Term::Cond { taken, .. } => taken,
                 _ => r,
             };
-            l.cfg.make_return(p, cont);
+            make_return_at(l, p, cont);
         }
         // the tail that falls into the return block, shared by several paths
         let Some(tail) = l.cfg.blocks[r].preds.iter().copied().find(|&p| matches!(l.cfg.blocks[p].term, cfg::Term::Fall(t) if t == r)) else {
@@ -475,8 +497,106 @@ fn early_returns(l: &mut Lifter) {
                 },
                 _ => tail,
             };
-            l.cfg.make_return(p, cont);
+            make_return_at(l, p, cont);
         }
+    }
+}
+
+/// Does every path from `b` return within a small region (blocks already turned into returns,
+/// jumps to the epilogue, tests whose arms all return)?
+fn returns_only(l: &Lifter, b: usize) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut work = vec![b];
+    while let Some(x) = work.pop() {
+        if x >= l.cfg.blocks.len() {
+            continue;
+        }
+        if !seen.insert(x) || seen.len() > 12 {
+            return false;
+        }
+        match &l.cfg.blocks[x].term {
+            cfg::Term::Return | cfg::Term::TailCall => {}
+            cfg::Term::Fall(t) | cfg::Term::Jump(t) => work.push(*t),
+            cfg::Term::Cond { taken, fall } => {
+                work.push(*taken);
+                work.push(*fall);
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `make_return(p, cont)`, where a continuation that itself only returns (`if (c) { f(); return
+/// true; } else return false;`) moves up to the enclosing guard's other arm, so the code after
+/// the whole returning region (a loop latch, the rest of the function) stays the join.
+fn make_return_at(l: &mut Lifter, p: usize, cont: usize) {
+    let mut x = p;
+    let mut c = cont;
+    for _ in 0..8 {
+        if c == p || !returns_only(l, c) {
+            break;
+        }
+        let [g] = l.cfg.blocks[x].preds.as_slice() else { break };
+        let g = *g;
+        let arms_ok = matches!(l.cfg.blocks[g].term, cfg::Term::Cond { taken, fall } if (taken == x && fall == c) || (fall == x && taken == c));
+        if !arms_ok {
+            break;
+        }
+        let [gg] = l.cfg.blocks[g].preds.as_slice() else { break };
+        let gg = *gg;
+        let other = match l.cfg.blocks[gg].term {
+            cfg::Term::Cond { taken, fall } if fall == g && taken != g => taken,
+            cfg::Term::Cond { taken, fall } if taken == g && fall != g => fall,
+            _ => break,
+        };
+        x = g;
+        c = other;
+    }
+    if c != cont && returns_only(l, c) {
+        c = cont;
+    }
+    l.cfg.make_return(p, c);
+}
+
+/// A jump from inside a loop straight to the epilogue (`for (...) { if (f(x)) { ...; return; } }`)
+/// is a `return`, unless the loop's own tests also leave to the epilogue (then nothing follows
+/// the loop and it may be a `break`). As a return it continues (for post-dominance) at its
+/// guard's other arm, so the loop's latch stays one shared block instead of a copy per arm.
+fn loop_returns(l: &mut Lifter) {
+    let loops = l.cfg.loops();
+    let nb = l.cfg.blocks.len();
+    let mut todo: Vec<(usize, usize, usize)> = vec![];
+    for p in 0..nb {
+        let cfg::Term::Jump(r) = l.cfg.blocks[p].term else { continue };
+        if !matches!(l.cfg.blocks[r].term, cfg::Term::Return) || !l.blocks_out[r].stmts.is_empty() {
+            continue;
+        }
+        // the outermost loop holding p or its guard (an exit block of the loop)
+        let in_loop = |lp: &cfg::Loop| lp.body.contains(&p) || l.cfg.blocks[p].preds.iter().any(|q| lp.body.contains(q));
+        let Some(lp) = loops.iter().filter(|lp| in_loop(lp)).max_by_key(|lp| lp.body.len()) else { continue };
+        if lp.body.contains(&r) {
+            continue;
+        }
+        let tests_leave_to_r = lp.body.iter().any(|&b| matches!(l.cfg.blocks[b].term, cfg::Term::Cond { taken, fall } if taken == r || fall == r));
+        if tests_leave_to_r {
+            continue;
+        }
+        let cont = match l.cfg.blocks[p].preds.as_slice() {
+            // the loop test's own exit (header or latch) is the end of the loop, not a return
+            [c] if *c == lp.header || lp.latches.contains(c) => continue,
+            [c] => match l.cfg.blocks[*c].term {
+                cfg::Term::Cond { taken, fall } if fall == p && taken != p => taken,
+                cfg::Term::Cond { taken, fall } if taken == p && fall != p => fall,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        todo.push((p, r, cont));
+    }
+    for (p, r, cont) in todo {
+        l.blocks_out[p].ret = l.blocks_out[r].ret.clone();
+        make_return_at(l, p, cont);
     }
 }
 

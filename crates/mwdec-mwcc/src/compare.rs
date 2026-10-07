@@ -25,74 +25,123 @@ use std::sync::Arc;
 
 /// Global symbols defined by a set of objects (e.g. every target object of a module), for
 /// resolving the values of literals that a target object only references.
+///
+/// An index can be layered on a shared base ([`ExternIndex::layered`]): a REL module's index
+/// reuses the main module's (built once) instead of re-indexing every main object per module.
 #[derive(Default)]
 pub struct ExternIndex {
+    /// Every indexed object: the base's objects first, then this layer's.
     pub objs: Vec<Arc<ObjectFile>>,
-    by_name: HashMap<String, (usize, usize)>,
-    funcs: HashMap<String, (usize, usize)>,
+    /// name -> (object, symbol, weak); `None` = defined globally more than once (ambiguous).
+    by_name: HashMap<String, Option<(u32, u32, bool)>>,
+    /// name -> (object, function); `None` = ambiguous.
+    funcs: HashMap<String, Option<(u32, u32)>>,
+    base: Option<Arc<ExternIndex>>,
 }
 
 impl ExternIndex {
     /// Index the non-local symbols of `objs` (names defined in several objects are dropped as ambiguous).
     pub fn new(objs: Vec<Arc<ObjectFile>>) -> Self {
+        Self::build(objs, None)
+    }
+
+    /// `base`'s objects followed by `extra`, with the same lookups as `ExternIndex::new` over the
+    /// concatenation, without re-indexing `base`.
+    pub fn layered(base: Arc<ExternIndex>, extra: Vec<Arc<ObjectFile>>) -> Self {
+        Self::build(extra, Some(base))
+    }
+
+    fn build(extra: Vec<Arc<ObjectFile>>, base: Option<Arc<ExternIndex>>) -> Self {
+        let start = base.as_ref().map_or(0, |b| b.objs.len());
+        let mut objs: Vec<Arc<ObjectFile>> = base.as_ref().map(|b| b.objs.clone()).unwrap_or_default();
+        objs.extend(extra);
         // Weak duplicates (inline/template copies) are interchangeable: keep the first. A name
         // defined globally in several objects is ambiguous and dropped.
-        let mut by_name: HashMap<String, Option<(usize, usize, bool)>> = HashMap::new();
-        for (oi, o) in objs.iter().enumerate() {
+        let mut by_name: HashMap<String, Option<(u32, u32, bool)>> = HashMap::new();
+        let mut funcs: HashMap<String, Option<(u32, u32)>> = HashMap::new();
+        for (oi, o) in objs.iter().enumerate().skip(start) {
             for (si, s) in o.symbols.iter().enumerate() {
                 if s.binding == SymBinding::Local {
                     continue;
                 }
                 let weak = s.binding == SymBinding::Weak;
-                by_name
-                    .entry(s.name.clone())
-                    .and_modify(|v| match v {
-                        Some((_, _, true)) if weak => {}
-                        Some((_, _, true)) => *v = Some((oi, si, false)),
-                        _ if weak => {}
-                        _ => *v = None,
-                    })
-                    .or_insert(Some((oi, si, weak)));
+                let here = Some((oi as u32, si as u32, weak));
+                let prev = match by_name.get(&s.name) {
+                    Some(v) => Some(*v),
+                    None => base.as_ref().and_then(|b| b.raw_symbol(&s.name)),
+                };
+                let next = match prev {
+                    None => here,
+                    Some(Some((_, _, true))) if weak => continue,
+                    Some(Some((_, _, true))) => here,
+                    Some(_) if weak => continue,
+                    Some(_) => None,
+                };
+                by_name.insert(s.name.clone(), next);
             }
-        }
-        let by_name: HashMap<String, (usize, usize)> =
-            by_name.into_iter().filter_map(|(k, v)| v.map(|(a, b, _)| (k, (a, b)))).collect();
-        let mut funcs: HashMap<String, Option<(usize, usize)>> = HashMap::new();
-        for (oi, o) in objs.iter().enumerate() {
             for (fi, f) in o.functions.iter().enumerate() {
-                match f.binding {
-                    SymBinding::Local => {}
-                    SymBinding::Weak => {
-                        funcs.entry(f.name.clone()).or_insert(Some((oi, fi)));
-                    }
-                    SymBinding::Global => {
-                        funcs.entry(f.name.clone()).and_modify(|v| *v = None).or_insert(Some((oi, fi)));
-                    }
-                }
+                let here = Some((oi as u32, fi as u32));
+                let prev = match funcs.get(&f.name) {
+                    Some(v) => Some(*v),
+                    None => base.as_ref().and_then(|b| b.raw_func(&f.name)),
+                };
+                let next = match (f.binding, prev) {
+                    (SymBinding::Local, _) => continue,
+                    (SymBinding::Weak, Some(_)) => continue,
+                    (SymBinding::Weak, None) => here,
+                    (SymBinding::Global, Some(_)) => None,
+                    (SymBinding::Global, None) => here,
+                };
+                funcs.insert(f.name.clone(), next);
             }
         }
-        let funcs = funcs.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
-        ExternIndex { objs, by_name, funcs }
+        by_name.shrink_to_fit();
+        funcs.shrink_to_fit();
+        ExternIndex { objs, by_name, funcs, base }
+    }
+
+    fn raw_symbol(&self, name: &str) -> Option<Option<(u32, u32, bool)>> {
+        match self.by_name.get(name) {
+            Some(v) => Some(*v),
+            None => self.base.as_ref()?.raw_symbol(name),
+        }
+    }
+
+    fn raw_func(&self, name: &str) -> Option<Option<(u32, u32)>> {
+        match self.funcs.get(name) {
+            Some(v) => Some(*v),
+            None => self.base.as_ref()?.raw_func(name),
+        }
     }
 
     /// A non-local function defined in one of the indexed objects.
     pub fn function(&self, name: &str) -> Option<&Function> {
-        let &(oi, fi) = self.funcs.get(name)?;
-        Some(&self.objs[oi].functions[fi])
+        let (oi, fi) = self.raw_func(name)??;
+        Some(&self.objs[oi as usize].functions[fi as usize])
     }
 
+    /// Unambiguous names in this layer (plus the base's).
     pub fn len(&self) -> usize {
-        self.by_name.len()
+        self.by_name.values().filter(|v| v.is_some()).count() + self.base.as_ref().map_or(0, |b| b.len())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
+        self.len() == 0
+    }
+
+    /// A non-local symbol defined in one of the indexed objects: its symbol entry, containing
+    /// section, and the section bytes from the symbol on (at most `max`).
+    pub fn defined(&self, name: &str, max: usize) -> Option<(&SymbolDef, &Section, &[u8])> {
+        let (sec, addr, _, d) = self.locate(name)?;
+        let start = (addr as usize).min(sec.bytes.len());
+        let end = start.saturating_add(max).min(sec.bytes.len());
+        Some((d?, sec, &sec.bytes[start..end]))
     }
 
     fn locate(&self, name: &str) -> Option<(&Section, u32, u32, Option<&SymbolDef>)> {
-        let &(oi, si) = self.by_name.get(name)?;
-        let o = &self.objs[oi];
-        let d = &o.symbols[si];
+        let (oi, si, _) = self.raw_symbol(name)??;
+        let o = &self.objs[oi as usize];
+        let d = &o.symbols[si as usize];
         let sec = o.sections.iter().find(|s| s.name == d.section)?;
         Some((sec, d.address, d.size, Some(d)))
     }

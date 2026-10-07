@@ -150,8 +150,11 @@ impl<'a> Structurer<'a> {
                         }
                     }
                 }
-                out.push(Stmt::Goto(cur));
-                self.gotos.insert(cur);
+                // unreachable after a statement that always leaves (both arms returned)
+                if !diverges(out) {
+                    out.push(Stmt::Goto(cur));
+                    self.gotos.insert(cur);
+                }
                 return;
             }
             if self.loops.contains_key(&cur) && !self.in_loop_build.contains(&cur) {
@@ -220,6 +223,21 @@ impl<'a> Structurer<'a> {
                 Term::CondReturn { fall } => {
                     let c = self.cond_of(cur);
                     let r = self.blocks[cur].ret.clone();
+                    // `li r3,A ; b<c>lr ; li r3,B ; blr` is MWCC's select layout for `return !c ?
+                    // B : A` (the else value is loaded first); `if (c) return A; return B;`
+                    // would load B first
+                    let tail = (fall < self.cfg.blocks.len() && matches!(self.cfg.blocks[fall].term, Term::Return) && !self.has_stmts(fall) && !self.emitted[fall])
+                        .then(|| self.blocks[fall].ret.clone())
+                        .flatten();
+                    if let (Some(a), Some(b), false) = (r.clone(), tail, self.ret_void) {
+                        let nc = c.clone().negate(self.vars);
+                        if !matches!(nc, Expr::Unary { op: UnOp::Not, .. }) {
+                            self.emitted[fall] = true;
+                            let ty = mwdec_core::Type::Unknown { size: 4 };
+                            out.push(Stmt::Return(Some(Expr::Ternary { c: Box::new(nc), t: Box::new(b), f: Box::new(a), ty })));
+                            return;
+                        }
+                    }
                     out.push(Stmt::If { cond: c, then: vec![Stmt::Return(r)], els: vec![] });
                     cur = fall;
                 }
@@ -238,23 +256,29 @@ impl<'a> Structurer<'a> {
 
     /// Does every path from `b` return within a few straight-line blocks (`ctor(); return;`)?
     fn only_returns(&self, b: usize, body: &BTreeSet<usize>) -> bool {
-        let mut cur = b;
-        for _ in 0..4 {
-            if body.contains(&cur) {
+        // every path from b returns without coming back into the loop (`if (c) { f(); return
+        // true; } return false;` included), within a small region
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut work = vec![b];
+        while let Some(cur) = work.pop() {
+            if cur == self.exit_node() {
+                continue;
+            }
+            if body.contains(&cur) || !seen.insert(cur) || seen.len() > 12 {
                 return false;
             }
-            match self.cfg.blocks[cur].term {
-                Term::Return | Term::TailCall => return true,
-                Term::Fall(t) | Term::Jump(t) => {
-                    if t == self.exit_node() {
-                        return true;
-                    }
-                    cur = t;
+            match &self.cfg.blocks[cur].term {
+                Term::Return | Term::TailCall => {}
+                Term::Fall(t) | Term::Jump(t) => work.push(*t),
+                Term::Cond { taken, fall } => {
+                    work.push(*taken);
+                    work.push(*fall);
                 }
+                Term::CondReturn { fall } => work.push(*fall),
                 _ => return false,
             }
         }
-        false
+        true
     }
 
     /// A block that is just `return x;` (possibly with an epilogue) can be duplicated.
@@ -862,6 +886,11 @@ impl<'a> Structurer<'a> {
                     items.push((i.off, TItem::Bc(c, t)));
                 }
                 Opcode::B if i.is_jump() && i.reloc.is_none() => {
+                    // a second unconditional branch in a row is dead code after the tree (an
+                    // empty case body), not part of it
+                    if matches!(items.last(), Some((o, TItem::B(_))) if *o + 4 == i.off) {
+                        break;
+                    }
                     let Some(t) = i.target() else { return TreeCheck::Unknown };
                     items.push((i.off, TItem::B(t)))
                 }
@@ -898,6 +927,26 @@ impl<'a> Structurer<'a> {
             !switchtree::uses_table(&all) && switchtree::matches(&switchtree::simulate(&all, &addr), &items, &addr)
         };
         if try_set(&[]) {
+            // a dead `b join` right after the tree is the body of an empty case whose value
+            // doesn't change the tree (`case 2: break;` after cases 0 and 1): MWCC threads the tree's
+            // jumps past it but keeps the block
+            if let (Some(j), Some(&(last_off, _))) = (join_off, items.last()) {
+                let dead_b = self.cfg.blocks.iter().enumerate().any(|(bi, bb)| {
+                    self.cfg.idom[bi] == usize::MAX
+                        && bb.end == bb.start + 1
+                        && self.insns[bb.start].off == last_off + 4
+                        && self.insns[bb.start].is_jump()
+                        && self.insns[bb.start].reloc.is_none()
+                        && self.insns[bb.start].target() == Some(j)
+                });
+                if dead_b {
+                    // MWCC folds an empty case next to a default range into that range (checked:
+                    // `case 2: break;` after cases 0 and 1 leaves the tree as it is, `case 5:` or
+                    // `case -1:` don't), so the value is the one after the largest case
+                    let hi = base.iter().map(|c| c.0).max().unwrap_or(0);
+                    return TreeCheck::Match(vec![(vec![hi + 1], EXTRA_CASE)]);
+                }
+            }
             return TreeCheck::Match(vec![]);
         }
         if join_off.is_none() {
@@ -998,6 +1047,15 @@ fn switch_selector(e: Expr) -> (Expr, i64) {
         Expr::Binary { op: BinOp::Sub, l, r, .. } if r.as_int().is_some() => (strip_casts(*l), r.as_int().unwrap()),
         Expr::Binary { op: BinOp::Add, l, r, .. } if r.as_int().is_some() => (strip_casts(*l), -r.as_int().unwrap()),
         e => (strip_casts(e), 0),
+    }
+}
+
+/// Does control never fall out of the end of this statement list?
+fn diverges(b: &[Stmt]) -> bool {
+    match b.iter().rev().find(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))) {
+        Some(Stmt::Return(_) | Stmt::Goto(_) | Stmt::Break | Stmt::Continue) => true,
+        Some(Stmt::If { then, els, .. }) => !then.is_empty() && !els.is_empty() && diverges(then) && diverges(els),
+        _ => false,
     }
 }
 

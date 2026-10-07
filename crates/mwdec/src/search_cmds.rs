@@ -31,7 +31,7 @@ fn split_ops(s: &Option<String>) -> Vec<String> {
     s.as_deref().map(|x| x.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect()).unwrap_or_default()
 }
 
-fn sanitize(s: &str) -> String {
+pub fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
 }
 
@@ -94,6 +94,9 @@ impl Compilers {
 /// Per-unit inputs shared by every function of the unit.
 pub struct UnitInputs {
     pub target: ObjectFile,
+    /// What the lifter sees: `target` plus the values of literals it references that live in other
+    /// objects of the module ([`with_extern_literals`]). `None` = same as `target`.
+    pub lift_obj: Option<ObjectFile>,
     #[allow(dead_code)]
     pub context: String,
     /// Driver for the unit's compiler version.
@@ -120,17 +123,69 @@ pub enum NoDraft {
     Lift(String),
 }
 
+/// `target` plus copies of the literals (dtk `lbl_` / compiler-local names in `.sdata2`, `.rodata`,
+/// `.sdata`, `.data`) its code references but another target object of the module defines (shared
+/// literal pools split off by dtk). Without them the lifter emits `extern float lbl_<addr>;`
+/// instead of the value, which changes scheduling and register use. Each copied literal gets its
+/// own section (`<section>@<name>`) so its bytes can't be confused with the target's own pools.
+pub fn with_extern_literals(target: &ObjectFile, ext: &ExternIndex) -> Option<ObjectFile> {
+    let mut want: Vec<&str> = target
+        .functions
+        .iter()
+        .flat_map(|f| f.relocs.iter().map(|r| r.target.as_str()))
+        .filter(|n| (n.starts_with("lbl_") || n.starts_with('@') || n.starts_with("...")) && !target.data.contains_key(*n))
+        .filter(|n| !target.symbols.iter().any(|s| s.name == *n))
+        .collect();
+    want.sort();
+    want.dedup();
+    let mut out: Option<ObjectFile> = None;
+    for name in want {
+        let Some((def, sec, bytes)) = ext.defined(name, 4096) else { continue };
+        if !matches!(sec.name.as_str(), ".sdata2" | ".rodata" | ".sdata" | ".data") || sec.bytes.is_empty() {
+            continue;
+        }
+        let o = out.get_or_insert_with(|| target.clone());
+        let sname = format!("{}@{name}", sec.name);
+        o.sections.push(Section { name: sname.clone(), size: bytes.len() as u32, bytes: bytes.to_vec(), executable: false, relocs: vec![] });
+        o.symbols.push(SymbolDef { name: name.to_string(), section: sname, address: 0, size: def.size, binding: SymBinding::Local, is_func: false });
+        let n = (def.size as usize).min(bytes.len());
+        o.data.insert(
+            name.to_string(),
+            DataSymbol {
+                name: name.to_string(),
+                binding: SymBinding::Local,
+                section: sec.name.clone(),
+                size: def.size,
+                bytes: bytes[..n].to_vec(),
+                relocs: vec![],
+                address: 0,
+            },
+        );
+    }
+    out
+}
+
 /// Inputs for one unit. `module_objs`: the module's target objects (main + the unit's REL), used
-/// to recover vtables of every class the context knows.
-pub fn unit_inputs(p: &Project, u: &Unit, cc: &Compilers, module_objs: &[Arc<ObjectFile>], with_db: bool) -> Result<UnitInputs> {
+/// to recover vtables of every class the context knows. `lit_ext`: the module's target-side
+/// extern index, for literal values the target object only references.
+pub fn unit_inputs(p: &Project, u: &Unit, cc: &Compilers, module_objs: &[Arc<ObjectFile>], with_db: bool, lit_ext: Option<&ExternIndex>) -> Result<UnitInputs> {
+    if u.cflags.is_empty() {
+        bail!("unit {} has no compiler flags", u.name);
+    }
+    let context = harness::context_tu(p, u)?;
+    unit_inputs_with_context(p, u, cc, module_objs, with_db, context, lit_ext)
+}
+
+/// `unit_inputs` with an explicit context TU (include lines only), e.g. an automatic
+/// header-only context for a unit without a source file (`mwdec harvest`).
+pub fn unit_inputs_with_context(p: &Project, u: &Unit, cc: &Compilers, module_objs: &[Arc<ObjectFile>], with_db: bool, context: String, lit_ext: Option<&ExternIndex>) -> Result<UnitInputs> {
     if u.cflags.is_empty() {
         bail!("unit {} has no compiler flags", u.name);
     }
     let m = cc.for_unit(p, &u.name);
     let target = load_obj(p, &u.target_obj)?;
-    let context = harness::context_tu(p, u)?;
-    let plain = m.plain_context(&context, &u.cflags);
-    let ctx = if context.is_empty() { plain.clone() } else { m.precompile(&context, &u.cflags).unwrap_or_else(|_| plain.clone()) };
+    let plain = m.plain_context(&context, &u.cflags).named(&u.name);
+    let ctx = if context.is_empty() { plain.clone() } else { m.precompile(&context, &u.cflags).map(|c| c.named(&u.name)).unwrap_or_else(|_| plain.clone()) };
     let c_mode = u.cflags.iter().any(|f| f == "-lang=c" || f == "-lang=c99");
     let db = if with_db {
         match mwdec_ctx::build_typedb(&context, &u.cflags, &mwdec_ctx::default_work_dir()) {
@@ -146,6 +201,9 @@ pub fn unit_inputs(p: &Project, u: &Unit, cc: &Compilers, module_objs: &[Arc<Obj
                 }
                 let vt = mwdec_ctx::vtables_from_object(&target, &db);
                 mwdec_ctx::apply_vtables(&mut db, &vt);
+                if !c_mode && std::env::var("MWDEC_NO_INLINE").is_err() {
+                    mwdec_inline::complete::complete_in(&mut db, &context, &u.cflags, &m, &ctx, &plain);
+                }
                 Some(db)
             }
             Err(e) => {
@@ -162,7 +220,8 @@ pub fn unit_inputs(p: &Project, u: &Unit, cc: &Compilers, module_objs: &[Arc<Obj
         driver: cc.probe_driver(p, &u.name),
         lib: std::sync::OnceLock::new(),
     };
-    Ok(UnitInputs { target, context, mwcc: m, ctx, plain, db, c_mode, tracer, inlines })
+    let lift_obj = lit_ext.and_then(|e| with_extern_literals(&target, e));
+    Ok(UnitInputs { target, lift_obj, context, mwcc: m, ctx, plain, db, c_mode, tracer, inlines })
 }
 
 /// First draft from the lifter + emitter (implicit functions included: an explicit request).
@@ -215,10 +274,13 @@ pub fn choose_draft(ui: &UnitInputs, f: &Function, scorer: &Scorer, with_inlines
     if !ui.inlines.enabled {
         return with_inlines;
     }
-    let Ok(plain) = draft_variant(ui, f, false, true) else { return with_inlines };
-    if plain == with_inlines {
-        return with_inlines;
-    }
+    let plain = draft_variant(ui, f, false, true).ok();
+    choose_between(scorer, with_inlines, plain)
+}
+
+/// The better (by compile + compare) of the draft with folded inlines and the one without.
+pub fn choose_between(scorer: &Scorer, with_inlines: String, plain: Option<String>) -> String {
+    let Some(plain) = plain.filter(|p| *p != with_inlines) else { return with_inlines };
     let (a, _) = scorer.eval(&with_inlines);
     let (b, _) = scorer.eval(&plain);
     match (a.fitness(), b.fitness()) {
@@ -228,7 +290,17 @@ pub fn choose_draft(ui: &UnitInputs, f: &Function, scorer: &Scorer, with_inlines
     }
 }
 
-fn draft_variant(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool) -> std::result::Result<String, NoDraft> {
+pub fn draft_variant(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool) -> std::result::Result<String, NoDraft> {
+    draft_opts(ui, f, inlines, include_implicit, false)
+}
+
+/// Draft with member accesses as raw offsets (a fallback when field accesses don't compile,
+/// e.g. private members used from a free function).
+pub fn draft_raw(ui: &UnitInputs, f: &Function) -> std::result::Result<String, NoDraft> {
+    draft_opts(ui, f, true, false, true)
+}
+
+fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool, raw_offsets: bool) -> std::result::Result<String, NoDraft> {
     if let Some(db) = &ui.db {
         let sig = mwdec_lift::sig::sig_of(&f.name, Some(db));
         match mwdec_project::standalone::standalone(&sig, db) {
@@ -238,7 +310,7 @@ fn draft_variant(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit:
         }
     }
     let ir = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut ir = mwdec_lift::lift_function(&ui.target, f, ui.db.as_ref())?;
+        let mut ir = mwdec_lift::lift_function(ui.lift_obj.as_ref().unwrap_or(&ui.target), f, ui.db.as_ref())?;
         if let (Some(db), true) = (&ui.db, inlines && ui.inlines.enabled) {
             let lib = ui.inlines.get(ui, &format!("{}
 {}", ui.mwcc.compiler, ui.ctx.cflags.join(" ")));
@@ -250,16 +322,85 @@ fn draft_variant(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit:
         Ok(Err(e)) => return Err(NoDraft::Lift(e.to_string())),
         Err(_) => return Err(NoDraft::Lift("lifter panic".into())),
     };
-    let em = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_emit::emit_function(&ir, ui.db.as_ref(), &mwdec_emit::EmitOptions { c_mode: ui.c_mode, ..Default::default() }))) {
+    let em = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_emit::emit_function(&ir, ui.db.as_ref(), &mwdec_emit::EmitOptions { c_mode: ui.c_mode, raw_offsets, ..Default::default() }))) {
         Ok(em) => em,
         Err(_) => return Err(NoDraft::Lift("emitter panic".into())),
     };
-    Ok(format!("{}{}", em.preamble, em.body))
+    Ok(format!("{}{}", em.preamble, extern_c_definition(&em.body, &f.name, ui.c_mode)))
 }
 
-fn externs_for(p: &Project, unit: &str) -> (ExternIndex, ExternIndex) {
+/// A function whose symbol is not a mangled C++ name (a placeholder like `fn_<module>_<addr>`)
+/// needs C linkage in a C++ unit, or the compiler mangles the definition (`<name>__Fi`).
+pub fn extern_c_definition(body: &str, symbol: &str, c_mode: bool) -> String {
+    if c_mode || mwdec_lift::sig::demangle(symbol).is_some() || body.contains("extern \"C\"") {
+        return body.to_string();
+    }
+    let needle = format!("{symbol}(");
+    let mut out = String::with_capacity(body.len() + 12);
+    let mut done = false;
+    for line in body.split_inclusive('\n') {
+        let t = line.trim_start();
+        if !done && !t.starts_with("//") && !t.starts_with('#') && line.contains(&needle) {
+            let indent = &line[..line.len() - t.len()];
+            out.push_str(indent);
+            out.push_str("extern \"C\" ");
+            out.push_str(t);
+            done = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+pub fn externs_for(p: &Project, unit: &str) -> (ExternIndex, ExternIndex) {
     let mut m = module_externs(p, std::iter::once(unit));
     m.remove(Project::module_of(unit)).unwrap_or_else(|| (ExternIndex::new(vec![]), ExternIndex::new(vec![])))
+}
+
+type ExtPair = Arc<(ExternIndex, ExternIndex)>;
+
+/// Extern indexes per module (target side, our side), the main module's built once and shared
+/// as the base layer of every REL module's index.
+pub struct ModuleExterns<'p> {
+    p: &'p Project,
+    main: std::sync::OnceLock<(Arc<ExternIndex>, Arc<ExternIndex>, ExtPair)>,
+    mods: Mutex<HashMap<String, Arc<std::sync::OnceLock<ExtPair>>>>,
+}
+
+impl<'p> ModuleExterns<'p> {
+    pub fn new(p: &'p Project) -> Self {
+        ModuleExterns { p, main: Default::default(), mods: Default::default() }
+    }
+
+    fn main(&self) -> &(Arc<ExternIndex>, Arc<ExternIndex>, ExtPair) {
+        self.main.get_or_init(|| {
+            let t = Arc::new(ExternIndex::new(self.p.load_module_data("main")));
+            let o = Arc::new(ExternIndex::new(self.p.load_module_linked("main")));
+            let pair = Arc::new((ExternIndex::layered(t.clone(), vec![]), ExternIndex::layered(o.clone(), vec![])));
+            (t, o, pair)
+        })
+    }
+
+    pub fn get(&self, module: &str) -> ExtPair {
+        let (t, o, pair) = self.main();
+        if module == "main" {
+            return pair.clone();
+        }
+        let cell = self.mods.lock().unwrap().entry(module.to_string()).or_default().clone();
+        cell.get_or_init(|| {
+            Arc::new((
+                ExternIndex::layered(t.clone(), self.p.load_module_data(module)),
+                ExternIndex::layered(o.clone(), self.p.load_module_linked(module)),
+            ))
+        })
+        .clone()
+    }
+
+    /// Forget a module's index (in-flight users keep their `Arc`).
+    pub fn drop_module(&self, module: &str) {
+        self.mods.lock().unwrap().remove(module);
+    }
 }
 
 pub struct MatchArgs {
@@ -283,7 +424,7 @@ pub fn cmd_match(root: &Path, work: &Path, a: MatchArgs) -> Result<()> {
     let cc = Compilers::new(root, work, a.workers.clamp(1, 6));
     let t = Instant::now();
     let (t_ext, o_ext) = externs_for(&p, &u.name);
-    let ui = unit_inputs(&p, u, &cc, &t_ext.objs, !a.no_db && a.init.is_none())?;
+    let ui = unit_inputs(&p, u, &cc, &t_ext.objs, !a.no_db && a.init.is_none(), Some(&t_ext))?;
     let f = mwdec_obj::find_function(&ui.target, &a.symbol).ok_or_else(|| anyhow!("{} not in {}", a.symbol, u.target_obj))?;
     let init = match &a.init {
         Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
@@ -369,6 +510,8 @@ pub struct EvalArgs {
     pub include_implicit: bool,
     pub no_locate: bool,
     pub disable_ops: Option<String>,
+    pub mem_report: bool,
+    pub list: Option<PathBuf>,
 }
 
 #[derive(Default, Clone)]
@@ -398,6 +541,8 @@ struct Row {
     first_profile: Option<mwdec_search::score::DiffProfile>,
     best_profile: Option<mwdec_search::score::DiffProfile>,
     traces: u64,
+    /// Process commit (MB) when the row finished.
+    mem_mb: u64,
 }
 
 impl Row {
@@ -409,7 +554,7 @@ impl Row {
             "first_penalty": self.first_penalty, "best_penalty": self.best_penalty,
             "evals": self.evals, "compiles": self.compiles, "seconds": self.seconds, "error": self.error,
             "winning_ops": self.winning_ops, "ops": self.ops, "polished": self.polished, "implicit": self.implicit,
-            "first_profile": self.first_profile, "best_profile": self.best_profile, "traces": self.traces,
+            "first_profile": self.first_profile, "best_profile": self.best_profile, "traces": self.traces, "mem_mb": self.mem_mb,
         })
     }
 }
@@ -435,6 +580,15 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
         .filter(|e| e.split == a.split && a.max_size.map_or(true, |m| e.size <= m) && e.size >= a.min_size)
         .filter(|e| a.unit.as_deref().map_or(true, |u| e.unit.contains(u)))
         .collect();
+    if let Some(l) = &a.list {
+        let text = std::fs::read_to_string(l).with_context(|| format!("reading {}", l.display()))?;
+        let want: std::collections::HashSet<(String, String)> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| Some((v.get("unit")?.as_str()?.to_string(), v.get("symbol")?.as_str()?.to_string())))
+            .collect();
+        ds.retain(|e| want.contains(&(e.unit.clone(), e.symbol.clone())));
+    }
     shuffle(&mut ds, a.seed);
     if let Some(k) = a.limit {
         ds.truncate(k);
@@ -460,10 +614,27 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
         a.budget_secs,
         out_path.display()
     );
-    // Shared per-unit inputs and per-module extern indexes (built lazily, once).
+    // Shared per-unit inputs and per-module extern indexes, built lazily and dropped after the
+    // unit's (module's) last function: keeping every unit's TypeDb/inline library and a fresh
+    // index of all main objects per REL module made a 300-function eval grow past 3 GB.
+    // Functions are processed grouped by unit (in shuffled order of first appearance).
+    {
+        let mut first: HashMap<String, usize> = HashMap::new();
+        for (i, e) in ds.iter().enumerate() {
+            first.entry(e.unit.clone()).or_insert(i);
+        }
+        ds.sort_by_key(|e| first[&e.unit]);
+    }
+    let unit_left: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+    let module_left: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+    for e in &ds {
+        *unit_left.lock().unwrap().entry(e.unit.clone()).or_default() += 1;
+        *module_left.lock().unwrap().entry(Project::module_of(&e.unit).to_string()).or_default() += 1;
+    }
     let units: Mutex<HashMap<String, Arc<Mutex<Option<Arc<Result<UnitInputs, String>>>>>>> = Mutex::new(HashMap::new());
-    let externs: Mutex<HashMap<String, Arc<(ExternIndex, ExternIndex)>>> = Mutex::new(HashMap::new());
-    let ext_lock = Mutex::new(());
+    let externs = ModuleExterns::new(&p);
+    // Drafts in a child process (bounded memory; a pathological function becomes a row).
+    let drafter = if std::env::var_os("MWDEC_INPROC_DRAFT").is_some() { None } else { Some(crate::draft_server::DraftClient::new(root, work, a.no_db)) };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let rows: Mutex<Vec<Row>> = Mutex::new(Vec::new());
     std::thread::scope(|s| {
@@ -474,18 +645,7 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                 let t = Instant::now();
                 let mut row = Row { unit: e.unit.clone(), symbol: e.symbol.clone(), size: e.size, ..Default::default() };
                 let module = Project::module_of(&e.unit).to_string();
-                let ext = {
-                    let _g = ext_lock.lock().unwrap();
-                    let have = externs.lock().unwrap().get(&module).cloned();
-                    match have {
-                        Some(x) => x,
-                        None => {
-                            let x = Arc::new(externs_for(&p, &e.unit));
-                            externs.lock().unwrap().insert(module.clone(), x.clone());
-                            x
-                        }
-                    }
-                };
+                let ext = externs.get(&module);
                 let slot = units.lock().unwrap().entry(e.unit.clone()).or_default().clone();
                 let ui = {
                     let mut g = slot.lock().unwrap();
@@ -493,13 +653,33 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                         let r = p
                             .unit(&e.unit)
                             .ok_or_else(|| anyhow!("unknown unit"))
-                            .and_then(|u| unit_inputs(&p, u, &cc, &ext.0.objs, !a.no_db));
+                            .and_then(|u| unit_inputs(&p, u, &cc, &ext.0.objs, !a.no_db && drafter.is_none(), drafter.is_none().then_some(&ext.0)));
                         *g = Some(Arc::new(r.map_err(|e| e.to_string())));
                     }
                     g.clone().unwrap()
                 };
-                run_one(&ui, &ext, e, &a, workers, &runs_dir, &mut row);
+                drop(slot);
+                run_one(&ui, &ext, e, &a, workers, &runs_dir, drafter.as_ref(), &mut row);
+                drop(ui);
+                drop(ext);
+                {
+                    let mut l = unit_left.lock().unwrap();
+                    let n = l.get_mut(&e.unit).unwrap();
+                    *n -= 1;
+                    if *n == 0 {
+                        units.lock().unwrap().remove(&e.unit);
+                    }
+                }
+                {
+                    let mut l = module_left.lock().unwrap();
+                    let n = l.get_mut(&module).unwrap();
+                    *n -= 1;
+                    if *n == 0 {
+                        externs.drop_module(&module);
+                    }
+                }
                 row.seconds = t.elapsed().as_secs_f64();
+                row.mem_mb = mwdec_core::memcap::commit_mb();
                 let line = row.json().to_string();
                 {
                     let mut f = out_file.lock().unwrap();
@@ -507,7 +687,7 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                     let _ = f.flush();
                 }
                 eprintln!(
-                    "[{:>4}/{}] {:<9} {:<5} {} {} ({:.1}s, {} compiles){}",
+                    "[{:>4}/{}] {:<9} {:<5} {} {} ({:.1}s, {} compiles, {} MB){}",
                     i + 1,
                     ds.len(),
                     row.status,
@@ -516,6 +696,7 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                     e.symbol,
                     row.seconds,
                     row.compiles,
+                    row.mem_mb,
                     row.best_score.map(|s| format!(" best {s:.1}")).unwrap_or_default()
                 );
                 rows.lock().unwrap().push(row);
@@ -525,10 +706,23 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
     let rows = rows.into_inner().unwrap();
     print_table(&rows);
     println!("wrote {} ({:.0}s total)", out_path.display(), t0.elapsed().as_secs_f64());
+    if a.mem_report {
+        println!("{}", mwdec_core::memcap::report_line());
+    }
     Ok(())
 }
 
-fn run_one(ui: &Result<UnitInputs, String>, ext: &(ExternIndex, ExternIndex), e: &DatasetEntry, a: &EvalArgs, workers: usize, runs_dir: &Path, row: &mut Row) {
+#[allow(clippy::too_many_arguments)]
+fn run_one(
+    ui: &Result<UnitInputs, String>,
+    ext: &(ExternIndex, ExternIndex),
+    e: &DatasetEntry,
+    a: &EvalArgs,
+    workers: usize,
+    runs_dir: &Path,
+    drafter: Option<&crate::draft_server::DraftClient>,
+    row: &mut Row,
+) {
     let ui = match ui {
         Ok(u) => u,
         Err(err) => {
@@ -541,31 +735,23 @@ fn run_one(ui: &Result<UnitInputs, String>, ext: &(ExternIndex, ExternIndex), e:
         row.status = "missing".into();
         return;
     };
-    if let Some(db) = &ui.db {
-        if let mwdec_project::standalone::Standalone::Implicit(k) = mwdec_project::standalone::standalone(&mwdec_lift::sig::sig_of(&f.name, Some(db)), db) {
-            row.implicit = Some(k.to_string());
-        }
-    }
-    let src = match draft_with(ui, f, a.include_implicit) {
-        Ok(s) => s,
-        Err(NoDraft::HeaderInline) => {
-            row.status = "hdr-inline".into();
-            return;
-        }
-        Err(NoDraft::Implicit(_)) => {
-            row.status = "implicit".into();
-            return;
-        }
-        Err(NoDraft::Lift(err)) => {
-            row.status = "lift-err".into();
-            row.error = Some(err);
+    let d = match drafter {
+        Some(c) => c.draft(&e.unit, &e.symbol, a.include_implicit),
+        None => crate::draft_server::draft_local(ui, &e.symbol, a.include_implicit),
+    };
+    row.implicit = d.implicit.clone();
+    let (src, plain) = match (d.status.as_str(), d.src) {
+        ("ok", Some(s)) => (s, d.plain),
+        (st, _) => {
+            row.status = if st == "ok" { "lift-err".into() } else { st.to_string() };
+            row.error = d.error;
             return;
         }
     };
     row.drafted = true;
     let ti = ObjIndex::with_externs(&ui.target, &ext.0);
     let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &e.symbol);
-    let src = choose_draft(ui, f, &scorer, src);
+    let src = choose_between(&scorer, src, plain);
     let cfg = SearchConfig {
         budget: Duration::from_secs(a.budget_secs),
         max_compiles: a.max_compiles,

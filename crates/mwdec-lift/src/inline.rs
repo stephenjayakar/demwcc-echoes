@@ -388,6 +388,15 @@ pub fn inline_list(items: &mut Vec<Stmt>, uses: &mut HashMap<VarId, usize>, is_t
         let fx = effects(&src, is_temp, vars);
         if total == 1 && local == 1 {
             let mut ok = (i + 1..j).all(|k| !conflicts(&fx, &items[k], is_temp, vars));
+            // MWCC never moves code across a call: a value computed before a call statement and
+            // read after it was computed there in the source (a local), even when pure
+            if ok && !fx.calls && (i + 1..j).any(|k| stmt_has_call(&items[k])) {
+                ok = false;
+            }
+            // nor across a branch or loop: the value was computed in an earlier block
+            if ok && (i + 1..j).any(|k| matches!(items[k], Stmt::If { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::Switch { .. })) {
+                ok = false;
+            }
             if ok && (fx.calls || fx.reads_mem) {
                 // unspecified evaluation order among siblings inside the use statement
                 for e in stmt_exprs(&items[j]) {
@@ -414,7 +423,11 @@ pub fn inline_list(items: &mut Vec<Stmt>, uses: &mut HashMap<VarId, usize>, is_t
             }
             let mut move_after: Vec<usize> = vec![];
             if ok && fx.calls {
-                let blockers: Vec<usize> = (i + 1..j).filter(|&k| !is_temp_assign(&items[k], is_temp)).collect();
+                // temps the use doesn't read keep their place after the call too (`t = f(); p =
+                // this + 0x30; v = t > 0;`: p was computed after the call)
+                let blockers: Vec<usize> = (i + 1..j)
+                    .filter(|&k| !is_temp_assign(&items[k], is_temp) || matches!(&items[k], Stmt::Assign { dst: Expr::Var(x), .. } if uses_in_stmt(&items[j], *x) == 0))
+                    .collect();
                 if !blockers.is_empty() {
                     if movable_after(items, &blockers, j, fixed_tail, is_temp, vars) {
                         move_after = blockers;

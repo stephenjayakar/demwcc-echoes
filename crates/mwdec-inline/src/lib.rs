@@ -11,6 +11,7 @@
 
 pub mod addr;
 pub mod cflow;
+pub mod complete;
 pub mod groups;
 pub mod matcher;
 pub mod objlocals;
@@ -36,10 +37,13 @@ pub struct InlineLib {
     pub rejected: Vec<(String, String)>,
     pub probes_total: usize,
     pub probes_compiled: usize,
+    /// Names of inlines with side effects (statement and mutator templates); folded calls of
+    /// the others are pure values.
+    pub effectful: std::collections::HashSet<String>,
 }
 
 /// Version of the probe generator / template extraction (part of the cache key).
-pub const TEMPLATE_VERSION: &str = "mwdec-inline templates v3";
+pub const TEMPLATE_VERSION: &str = "mwdec-inline templates v4";
 
 /// Caches shared across units and runs: templates by probe text (+ compiler and flags), and
 /// probes that failed to compile in one context (+ context hash).
@@ -78,6 +82,7 @@ fn probe_key(p: &probe::Probe) -> String {
 }
 
 fn build_library_rel(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>, cache: Option<&ProbeCache>, compile: &(dyn Fn(&str) -> Result<ObjectFile, String> + Sync)) -> InlineLib {
+    let cache = if std::env::var("MWDI_NO_TCACHE").is_ok() { None } else { cache };
     let probes = probe::generate(db, rel);
     let total = probes.len();
     let t0 = std::time::Instant::now();
@@ -107,10 +112,15 @@ fn build_library_rel(db: &TypeDb, rel: Option<&std::collections::HashSet<String>
     };
     let chunks = if todo_probes.is_empty() { vec![] } else { probe::compile(todo_probes, &counted) };
     let t_compile = t0.elapsed().as_secs_f64();
-    let mut db2 = db.clone();
-    for (_, ps) in &chunks {
-        probe::inject_decls(&mut db2, ps);
-    }
+    // the lifter needs the probes' declarations: a copy of the TypeDb, only when something
+    // was compiled (everything from the cache: no copy)
+    let db2 = (!chunks.is_empty()).then(|| {
+        let mut d = db.clone();
+        for (_, ps) in &chunks {
+            probe::inject_decls(&mut d, ps);
+        }
+        d
+    });
     let compiled: std::collections::HashSet<String> = chunks.iter().flat_map(|c| c.1.iter().map(|p| p.name.clone())).collect();
     if let Some(c) = cache {
         for p in attempted.iter().filter(|p| !compiled.contains(&p.name)) {
@@ -123,7 +133,7 @@ fn build_library_rel(db: &TypeDb, rel: Option<&std::collections::HashSet<String>
             let prefix = format!("{}__", p.name);
             let r: Result<Template, String> = match obj.functions.iter().find(|f| f.name.starts_with(&prefix)) {
                 None => Err("no function".into()),
-                Some(f) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_lift::lift_function(obj, f, Some(&db2)))) {
+                Some(f) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_lift::lift_function(obj, f, db2.as_ref()))) {
                     Ok(Ok(ir)) => template::from_probe(p, &ir, db),
                     _ => Err("lift".into()),
                 },
@@ -142,6 +152,7 @@ fn build_library_rel(db: &TypeDb, rel: Option<&std::collections::HashSet<String>
             Err(e) => lib.rejected.push((e.split(':').next().unwrap_or("").to_string(), e)),
         }
     }
+    lib.effectful = lib.templates.iter().filter(|t| matches!(t.shape, template::Shape::Stmts { .. } | template::Shape::Mutate { .. })).map(|t| t.name.clone()).collect();
     if std::env::var("MWDI_DEBUG").is_ok() {
         eprintln!("probe library: {} probes, {} to compile, {} compiles {:.1}s, total {:.1}s", total, attempted.len(), ncomp.load(std::sync::atomic::Ordering::Relaxed), t_compile, t0.elapsed().as_secs_f64());
     }
@@ -165,5 +176,10 @@ pub fn library_for(s: &session::UnitSession) -> InlineLib {
 
 /// Rewrite recognised inline expansions in `ir`; returns the number of rewrites.
 pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
-    matcher::apply(ir, lib, db)
+    let t0 = std::time::Instant::now();
+    let n = matcher::apply(ir, lib, db);
+    if std::env::var("MWDI_DEBUG").is_ok() {
+        eprintln!("inline apply {}: {n} rewrites, {} templates, {:.2}s [{}]", ir.symbol, lib.templates.len(), t0.elapsed().as_secs_f64(), util::prof::report());
+    }
+    n
 }

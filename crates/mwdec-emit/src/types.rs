@@ -110,6 +110,7 @@ fn declarator(t: &Type, inner: String) -> (String, String) {
             let d = if matches!(**x, Type::Array(..)) { format!("({d})") } else { d };
             declarator(x, d)
         }
+        Type::Array(x, n) if *n == 0 => declarator(x, format!("{inner}[]")),
         Type::Array(x, n) => declarator(x, format!("{inner}[{n}]")),
         Type::FuncPtr(sig) => {
             let params: Vec<String> = sig.params.iter().map(|p| type_str(&p.ty)).collect();

@@ -176,9 +176,73 @@ pub struct UnitContext {
     pub mch: Option<PathBuf>,
     /// Identity of (compiler, flags, context) for cache keys.
     pub hash: u128,
+    /// File name candidate TUs are compiled as (`CFoo.cpp`): the compiler names the static
+    /// initializer (`__sinit_CFoo_cpp`) and the anonymous namespace (`@unnamed@CFoo_cpp@`)
+    /// after it. `None`: a unique scratch name.
+    pub tu_name: Option<String>,
+}
+
+impl UnitContext {
+    /// Candidates compiled as the unit's own source file name (`main/Dir/CFoo` ->
+    /// `CFoo.cpp`, `.c` for C units).
+    pub fn named(mut self, unit: &str) -> UnitContext {
+        let base = unit.rsplit('/').next().unwrap_or(unit);
+        let c = self.cflags.iter().any(|f| f == "-lang=c" || f == "-lang=c99");
+        if !base.is_empty() && base.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-') {
+            self.tu_name = Some(format!("{base}.{}", if c { "c" } else { "cpp" }));
+        }
+        self
+    }
 }
 
 type CacheEntry = Result<Arc<Vec<u8>>, MwccError>;
+
+/// Default byte budget of the in-memory candidate cache (`MWDEC_MEMCACHE_MB` overrides).
+pub const MEM_CACHE_MB: usize = 96;
+
+/// In-memory candidate cache bounded by total bytes (objects + messages); oldest entries are
+/// evicted first. Unbounded, it grew by every candidate of every function of an eval.
+struct MemCache {
+    map: HashMap<u128, CacheEntry>,
+    order: std::collections::VecDeque<u128>,
+    bytes: usize,
+    budget: usize,
+}
+
+fn entry_bytes(e: &CacheEntry) -> usize {
+    64 + match e {
+        Ok(o) => o.len(),
+        Err(e) => e.messages().len(),
+    }
+}
+
+impl MemCache {
+    fn new() -> MemCache {
+        let mb = std::env::var("MWDEC_MEMCACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(MEM_CACHE_MB);
+        MemCache { map: HashMap::new(), order: Default::default(), bytes: 0, budget: mb << 20 }
+    }
+    fn get(&self, k: &u128) -> Option<&CacheEntry> {
+        self.map.get(k)
+    }
+    fn insert(&mut self, k: u128, v: CacheEntry) {
+        let n = entry_bytes(&v);
+        if n > self.budget / 4 {
+            return;
+        }
+        if let Some(old) = self.map.insert(k, v) {
+            self.bytes -= entry_bytes(&old);
+        } else {
+            self.order.push_back(k);
+        }
+        self.bytes += n;
+        while self.bytes > self.budget {
+            let Some(o) = self.order.pop_front() else { break };
+            if let Some(e) = self.map.remove(&o) {
+                self.bytes -= entry_bytes(&e);
+            }
+        }
+    }
+}
 
 /// Compiler driver bound to a project root.
 pub struct Mwcc {
@@ -193,7 +257,7 @@ pub struct Mwcc {
     pub timeout: Duration,
     pool: Pool,
     counter: AtomicU64,
-    mem_cache: Mutex<HashMap<u128, CacheEntry>>,
+    mem_cache: Mutex<MemCache>,
     pch_locks: Mutex<HashMap<u128, Arc<Mutex<()>>>>,
 }
 
@@ -209,7 +273,7 @@ impl Mwcc {
             timeout: Duration::from_secs(120),
             pool: Pool::new(jobs),
             counter: AtomicU64::new(0),
-            mem_cache: Mutex::new(HashMap::new()),
+            mem_cache: Mutex::new(MemCache::new()),
             pch_locks: Mutex::new(HashMap::new()),
         }
     }
@@ -283,11 +347,38 @@ impl Mwcc {
         prefix: Option<&Path>,
         work_dir: &Path,
     ) -> Result<Compiled, MwccError> {
+        self.compile_tu_as(source, cflags, prefix, work_dir, None)
+    }
+
+    /// `compile_tu` with the source file named `tu_name` (in a private directory).
+    pub fn compile_tu_as(
+        &self,
+        source: &str,
+        cflags: &[String],
+        prefix: Option<&Path>,
+        work_dir: &Path,
+        tu_name: Option<&str>,
+    ) -> Result<Compiled, MwccError> {
         std::fs::create_dir_all(work_dir).map_err(io("creating work dir"))?;
         let stem = work_dir.join(self.unique("tu"));
-        let src = stem.with_extension("cpp");
+        let (src, own_dir) = match tu_name {
+            Some(n) => {
+                std::fs::create_dir_all(&stem).map_err(io("creating TU dir"))?;
+                (stem.join(n), true)
+            }
+            None => (stem.with_extension("cpp"), false),
+        };
         let obj = stem.with_extension("o");
         std::fs::write(&src, source).map_err(io("writing TU"))?;
+        let res = self.compile_src(&src, &obj, &stem, cflags, prefix);
+        if own_dir {
+            let _ = std::fs::remove_dir_all(&stem);
+        }
+        res
+    }
+
+    fn compile_src(&self, src: &Path, obj: &Path, stem: &Path, cflags: &[String], prefix: Option<&Path>) -> Result<Compiled, MwccError> {
+        let (src, obj, stem) = (src.to_path_buf(), obj.to_path_buf(), stem.to_path_buf());
         let mut args: Vec<String> = cflags.to_vec();
         if let Some(p) = prefix {
             args.push("-prefix".into());
@@ -350,20 +441,23 @@ impl Mwcc {
                 let _ = std::fs::remove_file(&tmp_mch);
             }
         }
-        Ok(UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: Some(mch), hash })
+        Ok(UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: Some(mch), hash, tu_name: None })
     }
 
     /// A context without PCH: the context text is prepended to every candidate (slow path,
     /// and the reference for verifying that PCH does not change codegen).
     pub fn plain_context(&self, context: &str, cflags: &[String]) -> UnitContext {
         let hash = content_hash(&[CACHE_SALT.as_bytes(), b"plain", self.compiler.as_bytes(), &flags_bytes(cflags), context.as_bytes()]);
-        UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: None, hash }
+        UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: None, hash, tu_name: None }
     }
 
     /// Compile candidate code (function definitions etc.) in a unit context. Results (objects and
     /// compile errors) are cached by content hash in memory and on disk.
     pub fn compile_in(&self, ctx: &UnitContext, code: &str) -> Result<Compiled, MwccError> {
-        let key = content_hash(&[&ctx.hash.to_le_bytes(), code.as_bytes()]);
+        let key = match &ctx.tu_name {
+            Some(n) => content_hash(&[&ctx.hash.to_le_bytes(), b"tu:", n.as_bytes(), code.as_bytes()]),
+            None => content_hash(&[&ctx.hash.to_le_bytes(), code.as_bytes()]),
+        };
         if let Some(hit) = self.mem_cache.lock().unwrap().get(&key).cloned() {
             return hit.map(|obj| Compiled {
                 obj,
@@ -390,12 +484,17 @@ impl Mwcc {
                 tu.push('\n');
             }
             tu.push_str(code);
-            self.compile_tu(&tu, &ctx.cflags, None, &tmp)
+            self.compile_tu_as(&tu, &ctx.cflags, None, &tmp, ctx.tu_name.as_deref())
         };
         let mut res = match &ctx.mch {
-            Some(m) => match self.compile_tu(code, &ctx.cflags, Some(m), &tmp) {
+            Some(m) => match self.compile_tu_as(code, &ctx.cflags, Some(m), &tmp, ctx.tu_name.as_deref()) {
                 // MWCC sometimes crashes with a PCH; the plain context gives the same codegen.
-                Err(MwccError::Crash { .. }) => plain(),
+                Err(MwccError::Crash { status, messages }) => {
+                    if std::env::var_os("MWDEC_MWCC_LOG").is_some() {
+                        eprintln!("mwcc: PCH compile crashed (status {status:?}); plain retry. {}", messages.lines().take(6).collect::<Vec<_>>().join(" | "));
+                    }
+                    plain()
+                }
                 r => r,
             },
             None => plain(),

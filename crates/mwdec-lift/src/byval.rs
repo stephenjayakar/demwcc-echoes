@@ -245,6 +245,7 @@ fn stable(x: &Expr, vars: &[Var]) -> bool {
 }
 
 pub fn forward(body: &mut Vec<Stmt>, vars: &mut [Var], db: &TypeDb) {
+    type_copy_sources(body, vars, db);
     // total mentions of every stack var
     let mut total: HashMap<VarId, usize> = HashMap::new();
     Stmt::walk_exprs(body, &mut |x| {
@@ -435,6 +436,181 @@ fn retype_args(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
             }
             let t = strip_cv(pt).clone();
             *a = Expr::Load { base: Box::new(Expr::AddrOf(Box::new(Expr::Var(v)))), offset: 0, ty: t };
+        }
+    });
+}
+
+/// Calls through a pointer to member function (`__ptmf_scall(this, pmf, args...)`) forwarding a
+/// by-value class parameter: the compiler's copy of it (`S = p; __ptmf_scall(.., &S)`) is the
+/// parameter itself in the source (`(this->*pmf)(p)` makes the copy).
+pub fn forward_ptmf_args(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
+    let mut uses: HashMap<VarId, usize> = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            // `S.@0 = p.@0` / `S = p` covering all of p's class
+            let pair = match &b[i] {
+                Stmt::Assign { dst, src } => {
+                    let s = match dst {
+                        Expr::Var(s) => Some((*s, 0)),
+                        Expr::Member { base, offset, .. } => match **base {
+                            Expr::Var(s) => Some((s, *offset)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let p = match strip_casts(src) {
+                        Expr::Var(p) => Some((*p, 0)),
+                        Expr::Member { base, offset, .. } => match **base {
+                            Expr::Var(p) => Some((p, *offset)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    match (s, p) {
+                        (Some((s, 0)), Some((p, 0))) if matches!(vars[s].kind, VarKind::Stack { .. }) && matches!(vars[p].kind, VarKind::Param { .. }) => {
+                            let pt = types::resolve(Some(db), &vars[p].ty).into_owned();
+                            let whole = types::size_of(Some(db), &pt).zip(scalar_size(&types::ty_of(src, vars))).map_or(false, |(a, b)| a == b && a > 0);
+                            if is_byval(db, &pt) && whole {
+                                Some((s, p))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some((s, p)) = pair else {
+                i += 1;
+                continue;
+            };
+            // the next statement passes &S to __ptmf_scall and S has no other use
+            let mut hit = 0;
+            let mut other = false;
+            let mut next = b[i + 1].clone();
+            Stmt::rewrite_exprs(std::slice::from_mut(&mut next), &mut |e| {
+                if let Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } = e {
+                    if symbol == "__ptmf_scall" || symbol == "__ptmf_scall4" {
+                        for a in args.iter_mut().skip(2) {
+                            if matches!(a, Expr::AddrOf(x) if matches!(**x, Expr::Var(v) if v == s)) {
+                                *a = Expr::AddrOf(Box::new(Expr::Var(p)));
+                                hit += 1;
+                            }
+                        }
+                    }
+                }
+            });
+            Stmt::walk_exprs(std::slice::from_ref(&next), &mut |e| {
+                if matches!(e, Expr::Var(v) if *v == s) {
+                    other = true;
+                }
+            });
+            // the store itself reads/writes S once
+            if hit == 1 && !other && uses.get(&s).copied().unwrap_or(0) <= 2 {
+                b[i + 1] = next;
+                b.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+    });
+}
+
+/// An untyped stack slot copied whole into a typed stack object (`S.@0 = L.@0`, a word copy of a
+/// 4-byte union) is an object of that type itself; its scalar stores are member stores
+/// (`L.m_bool = v`), so the copy can be forwarded like any by-value argument copy.
+fn type_copy_sources(body: &mut Vec<Stmt>, vars: &mut [Var], db: &TypeDb) {
+    let stack_of = |e: &Expr| -> Option<(VarId, Option<Type>)> {
+        match e {
+            Expr::Var(v) => Some((*v, None)),
+            Expr::Member { base, offset: 0, ty } => match **base {
+                Expr::Var(v) => Some((v, Some(ty.clone()))),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut assigns: Vec<(Expr, Expr)> = vec![];
+    {
+        let mut snap = body.clone();
+        Stmt::for_each_block_mut(&mut snap, &mut |b| {
+            for s in b.iter() {
+                if let Stmt::Assign { dst, src } = s {
+                    assigns.push((dst.clone(), src.clone()));
+                }
+            }
+        });
+    }
+    let mut retype: HashMap<VarId, Type> = HashMap::new();
+    for (dst, src) in &assigns {
+        let (Some((sv, _)), Some((lv, at))) = (stack_of(dst), stack_of(strip_casts(src))) else { continue };
+        if sv == lv || !matches!(vars[sv].kind, VarKind::Stack { .. }) {
+            continue;
+        }
+        let VarKind::Stack { size: lsize, .. } = vars[lv].kind else { continue };
+        let t = types::resolve(Some(db), &vars[sv].ty).into_owned();
+        if !is_byval(db, &t) || !matches!(vars[lv].ty, Type::Unknown { .. } | Type::Int { .. } | Type::Bool | Type::Float { .. }) {
+            continue;
+        }
+        let n = types::size_of(Some(db), &t).unwrap_or(0);
+        let whole = at.as_ref().map_or(true, |a| scalar_size(a) == Some(n));
+        // (a slot only written narrower than the word read back is that word)
+        if n > 0 && (n == lsize || (lsize < n && at.is_some())) && whole {
+            retype.insert(lv, vars[sv].ty.clone());
+        }
+    }
+    if retype.is_empty() {
+        return;
+    }
+    // the slot used as a scalar value anywhere (an operand): leave it
+    let mut bad: Vec<VarId> = vec![];
+    Stmt::walk_exprs(body, &mut |e| match e {
+        Expr::Binary { l, r, .. } => {
+            for x in [l, r] {
+                if let Expr::Var(v) = **x {
+                    bad.push(v);
+                }
+            }
+        }
+        Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } => {
+            if let Expr::Var(v) = **x {
+                bad.push(v);
+            }
+        }
+        _ => {}
+    });
+    retype.retain(|v, _| !bad.contains(v));
+    for (v, t) in &retype {
+        vars[*v].ty = t.clone();
+        let n = types::size_of(Some(db), t).unwrap_or(0);
+        if let VarKind::Stack { size, .. } = &mut vars[*v].kind {
+            *size = (*size).max(n);
+        }
+    }
+    let vars_ro: Vec<Var> = vars.to_vec();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            // the whole-object copy itself: `S = L`
+            if let Stmt::Assign { dst, src } = s {
+                if let (Some((sv, _)), Some((lv, _))) = (stack_of(dst), stack_of(strip_casts(src))) {
+                    if retype.contains_key(&lv) && sv != lv && type_key(db, &vars_ro[sv].ty) == type_key(db, &vars_ro[lv].ty) {
+                        *s = Stmt::Assign { dst: Expr::Var(sv), src: Expr::Var(lv) };
+                        continue;
+                    }
+                }
+            }
+            if let Stmt::Assign { dst: dst @ Expr::Var(_), src } = s {
+                let Expr::Var(v) = *dst else { continue };
+                if retype.contains_key(&v) {
+                    let st = types::ty_of(src, &vars_ro);
+                    if !types::is_aggregate(Some(db), &st) {
+                        *dst = Expr::Member { base: Box::new(Expr::Var(v)), offset: 0, ty: st };
+                    }
+                }
+            }
         }
     });
 }

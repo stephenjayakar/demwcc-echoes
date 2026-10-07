@@ -106,7 +106,7 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
 }
 
 /// Scalar leaf members of a class in layout order: (offset, type).
-fn flat_fields(db: &TypeDb, cls: &str, base: i32, out: &mut Vec<(i32, Type)>, depth: u32) -> bool {
+pub(crate) fn flat_fields(db: &TypeDb, cls: &str, base: i32, out: &mut Vec<(i32, Type)>, depth: u32) -> bool {
     let Some(c) = sig::find_class(db, cls) else { return false };
     if depth > 8 {
         return false;
@@ -237,6 +237,8 @@ fn fold_struct_return(body: &mut Vec<Stmt>, sret: VarId, ret: &Type, db: Option<
     if !matches!(body.last(), Some(Stmt::Return(_))) {
         body.push(Stmt::Return(None));
     }
+    // `if (a) { R = x; } else { R = y; } return;`: each branch returns its own object
+    Stmt::for_each_block_mut(body, &mut |b| distribute_sret_return(b, sret));
     Stmt::for_each_block_mut(body, &mut |b| {
         // constructor call on the return slot
         let mut i = 0;
@@ -267,7 +269,9 @@ fn fold_struct_return(body: &mut Vec<Stmt>, sret: VarId, ret: &Type, db: Option<
                     _ => break,
                 }
             }
-            if !stores.is_empty() {
+            // a whole object stored (a call returning it) is no member-wise construction
+            let whole = stores.iter().any(|(_, e)| matches!(e, Expr::Call { ret: r, .. } if types::is_aggregate(db, r)));
+            if !stores.is_empty() && !whole {
                 if let Some(e) = construct_from_stores(&stores, ret, db).or_else(|| copy_from_stores(&stores, ret, db)) {
                     b.splice(k..=rp, [Stmt::Return(Some(e))]);
                 }
@@ -292,6 +296,35 @@ fn fold_struct_return(body: &mut Vec<Stmt>, sret: VarId, ret: &Type, db: Option<
             i += 1;
         }
     });
+}
+
+/// Does the statement (list) end by defining the whole returned object on every path?
+fn ends_with_sret_def(b: &[Stmt], sret: VarId) -> bool {
+    match b.last() {
+        // (member-wise stores into it count: folded into a construction per branch)
+        Some(Stmt::Assign { dst: Expr::Load { base, .. }, src }) => matches!(**base, Expr::Var(v) if v == sret) && !src.uses_var(sret),
+        Some(Stmt::Expr(Expr::Call { callee: Callee::Method { sig: s, this, .. }, .. })) => sig::is_ctor(s) && matches!(&**this, Expr::Var(v) if *v == sret),
+        Some(Stmt::If { then, els, .. }) => ends_with_sret_def(then, sret) && ends_with_sret_def(els, sret),
+        _ => false,
+    }
+}
+
+fn push_return(b: &mut Vec<Stmt>) {
+    match b.last_mut() {
+        Some(Stmt::If { then, els, .. }) => {
+            push_return(then);
+            push_return(els);
+        }
+        _ => b.push(Stmt::Return(None)),
+    }
+}
+
+fn distribute_sret_return(b: &mut Vec<Stmt>, sret: VarId) {
+    let n = b.len();
+    if n >= 2 && matches!(b[n - 1], Stmt::Return(None)) && matches!(b[n - 2], Stmt::If { .. }) && ends_with_sret_def(&b[n - 2..n - 1], sret) {
+        b.pop();
+        push_return(b);
+    }
 }
 
 fn is_vtable_addr(e: &Expr) -> bool {
@@ -453,7 +486,103 @@ fn ctor_init_list(ir: &mut IrFunction, this: VarId, db: Option<&TypeDb>) {
         }
     }
     late_ctor_inits(ir, this, &own, db, &mut inits);
+    memberwise_inits(ir, this, &own, db, &mut inits);
     ir.init_list = inits;
+}
+
+/// Members (and bases) without default constructors whose inline constructor the compiler
+/// expanded into stores in the body can only be built in the initializer list: `m(args)` from
+/// the stores of the members that constructor sets from its parameters (its other stores are
+/// its own constants and go with it).
+fn memberwise_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&TypeDb>, inits: &mut Vec<Init>) {
+    let Some(db) = db else { return };
+    let Some(c) = sig::find_class(db, own).cloned() else { return };
+    let vars = ir.vars.clone();
+    let mut targets: Vec<(InitTarget, Type, i32)> = vec![];
+    for b in &c.bases {
+        targets.push((InitTarget::Base(b.name.clone()), Type::Named(b.name.clone()), b.offset as i32));
+    }
+    for f in &c.fields {
+        if f.bitfield.is_none() {
+            targets.push((InitTarget::Member(f.name.clone()), f.ty.clone(), f.offset as i32));
+        }
+    }
+    fn nested_write(s: &Stmt, hit: &dyn Fn(&Expr) -> bool) -> bool {
+        let mut found = false;
+        let mut visit = |b: &[Stmt]| {
+            for x in b {
+                if let Stmt::Assign { dst, .. } = x {
+                    if hit(dst) {
+                        found = true;
+                    }
+                }
+                if nested_write(x, hit) {
+                    found = true;
+                }
+            }
+        };
+        match s {
+            Stmt::If { then, els, .. } => {
+                visit(then);
+                visit(els);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => visit(body),
+            Stmt::Switch { cases, .. } => {
+                for cs in cases {
+                    visit(&cs.body);
+                }
+            }
+            _ => {}
+        }
+        found
+    }
+    for (target, ty, off) in targets {
+        let ft = types::resolve(Some(db), strip_cv(&ty)).into_owned();
+        let Some(fc) = named(&ft).map(|s| s.to_string()) else { continue };
+        if !types::is_aggregate(Some(db), &ft) || default_constructible(Some(db), &ft) || inits.iter().any(|i| i.target == target) {
+            continue;
+        }
+        let Some(size) = types::size_of(Some(db), &ft) else { continue };
+        let (lo, hi) = (off, off + size as i32);
+        let hit = |e: &Expr| matches!(e, Expr::Load { base, offset, .. } if is_this(base, this) && *offset >= lo && *offset < hi);
+        if ir.body.iter().any(|s| nested_write(s, &hit)) {
+            continue;
+        }
+        let stores: Vec<(usize, i32, Expr)> = ir
+            .body
+            .iter()
+            .enumerate()
+            .filter_map(|(k, s)| match s {
+                Stmt::Assign { dst: Expr::Load { base, offset, .. }, src } if is_this(base, this) && *offset >= lo && *offset < hi => Some((k, offset - lo, src.clone())),
+                _ => None,
+            })
+            .collect();
+        if stores.is_empty() {
+            continue;
+        }
+        for (cs, offs) in crate::construct::member_ctors(db, &fc) {
+            let mut args = vec![];
+            for (i, o) in offs.iter().enumerate() {
+                let Some((k, _, v)) = stores.iter().find(|(_, so, _)| so == o) else { break };
+                let pty = cs.params.get(i).map(|p| match strip_cv(&p.ty) {
+                    Type::Ref(x) => strip_cv(x).clone(),
+                    t => t.clone(),
+                });
+                match spellable_in_init(v, false, pty.as_ref(), &ir.body[..*k], &vars, this, Some(db)) {
+                    Some(e) => args.push(e),
+                    None => break,
+                }
+            }
+            if args.len() != offs.len() {
+                continue;
+            }
+            for (k, _, _) in stores.iter().rev() {
+                ir.body.remove(*k);
+            }
+            inits.push(Init { target: target.clone(), ctor: Some(cs), args, member_ty: None });
+            break;
+        }
+    }
 }
 
 /// Base/member constructor calls left in the body after other statements (their arguments are
@@ -470,11 +599,18 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
             continue;
         };
         let mut ok = true;
+        let orig_args = init.args.clone();
         let refs: Vec<bool> = (0..init.args.len())
             .map(|i| init.ctor.as_ref().and_then(|s| s.params.get(i)).map_or(init.ctor.is_none(), |p| matches!(p.ty.unqualified(), Type::Ref(_))))
             .collect();
-        for (a, by_ref) in init.args.iter_mut().zip(refs) {
-            match spellable_in_init(a, by_ref, &ir.body[..k], &vars, this, db) {
+        let ptys: Vec<Option<Type>> = (0..init.args.len())
+            .map(|i| init.ctor.as_ref().and_then(|s| s.params.get(i)).map(|p| match strip_cv(&p.ty) {
+                Type::Ref(x) => strip_cv(x).clone(),
+                t => t.clone(),
+            }))
+            .collect();
+        for ((a, by_ref), pty) in init.args.iter_mut().zip(refs).zip(ptys) {
+            match spellable_in_init(a, by_ref, pty.as_ref(), &ir.body[..k], &vars, this, db) {
                 Some(e) => *a = e,
                 None => {
                     ok = false;
@@ -487,10 +623,63 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
             continue;
         }
         ir.body.remove(k);
+        k -= drop_consumed_temps(&mut ir.body, k, &orig_args, &vars);
         if !init.args.is_empty() {
             inits.push(init);
         }
     }
+}
+
+/// The temporaries an initializer-list entry now spells inline (`T(args)`, `f(x)`): their
+/// definitions, in-place constructions and destructions before `end` go when nothing else
+/// mentions them. Returns how many statements before `end` were removed.
+fn drop_consumed_temps(body: &mut Vec<Stmt>, end: usize, args: &[Expr], vars: &[Var]) -> usize {
+    let mut cand: Vec<VarId> = vec![];
+    for a in args {
+        a.walk(&mut |x| {
+            if let Expr::Var(v) = x {
+                if matches!(vars[*v].kind, VarKind::Stack { .. } | VarKind::Local) && !cand.contains(v) {
+                    cand.push(*v);
+                }
+            }
+        });
+    }
+    let on_var = |s: &Stmt, v: VarId| -> bool {
+        match s {
+            Stmt::Assign { dst: Expr::Var(x), src } => *x == v && !src.uses_var(v),
+            Stmt::Assign { dst: Expr::Member { base, .. }, src } => matches!(&**base, Expr::Var(x) if *x == v) && !src.uses_var(v),
+            Stmt::Expr(Expr::Call { callee: Callee::Method { this, .. }, args, .. }) => {
+                matches!(&**this, Expr::AddrOf(x) if matches!(&**x, Expr::Var(y) if *y == v)) && !args.iter().any(|a| a.uses_var(v))
+            }
+            _ => false,
+        }
+    };
+    let mut removed = 0;
+    let mut i = 0;
+    while i < cand.len() {
+        let v = cand[i];
+        i += 1;
+        let own: Vec<usize> = (0..body.len()).filter(|&j| on_var(&body[j], v)).collect();
+        let others = (0..body.len()).any(|j| !own.contains(&j) && stmt_mentions(&body[j], v));
+        if others || own.is_empty() || own.iter().any(|&j| j >= end - removed && !matches!(body[j], Stmt::Expr(_))) {
+            continue;
+        }
+        for &j in own.iter().rev() {
+            // what the removed statement read may now be dead too
+            Stmt::walk_exprs(std::slice::from_ref(&body[j]), &mut |x| {
+                if let Expr::Var(w) = x {
+                    if *w != v && matches!(vars[*w].kind, VarKind::Stack { .. } | VarKind::Local) && !cand.contains(w) {
+                        cand.push(*w);
+                    }
+                }
+            });
+            body.remove(j);
+            if j < end - removed {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// `this->m = v` for a member whose class has no default constructor: it can only be
@@ -532,7 +721,7 @@ fn no_default_member_store(st: &Stmt, this: VarId, own: &str, db: Option<&TypeDb
 
 /// The only store into stack object `v` is one whole-object-sized store at offset 0 from a
 /// member at offset 0 of another object (`*(u16*)&tmp = kInvalidUniqueId.value`): that object.
-fn single_store(before: &[Stmt], vs: &[VarId]) -> Option<Expr> {
+fn single_store(before: &[Stmt], vs: &[VarId], vars: &[Var], db: Option<&TypeDb>) -> Option<Expr> {
     let mut found = None;
     for s in before {
         if let Stmt::Assign { dst, src } = s {
@@ -552,8 +741,15 @@ fn single_store(before: &[Stmt], vs: &[VarId]) -> Option<Expr> {
             return None;
         }
     }
-    match found? {
+    // (through a register local holding the value)
+    let src = match found? {
+        x @ Expr::Var(_) => inline_locals(&x, before, vars, db, 0)?,
+        x => x,
+    };
+    match src {
         Expr::Member { base, offset: 0, .. } if matches!(&*base, Expr::Global { .. }) => Some(*base),
+        // a copy of an object parameter (`TId owner` passed on)
+        Expr::Member { base, offset: 0, .. } if matches!(&*base, Expr::Var(p) if matches!(vars[*p].kind, VarKind::Param { .. }) && named(&types::resolve(db, strip_cv(&vars[*p].ty))).is_some()) => Some(*base),
         _ => None,
     }
 }
@@ -580,7 +776,7 @@ fn default_constructible(db: Option<&TypeDb>, t: &Type) -> bool {
 }
 
 /// `e` rewritten for an initializer list (see `late_ctor_inits`), or None.
-fn spellable_in_init(e: &Expr, by_ref: bool, before: &[Stmt], vars: &[Var], this: VarId, db: Option<&TypeDb>) -> Option<Expr> {
+fn spellable_in_init(e: &Expr, by_ref: bool, pty: Option<&Type>, before: &[Stmt], vars: &[Var], this: VarId, db: Option<&TypeDb>) -> Option<Expr> {
     let stack_var = |e: &Expr| -> Option<VarId> {
         match e {
             Expr::Var(v) if matches!(vars[*v].kind, VarKind::Stack { .. }) => Some(*v),
@@ -609,9 +805,14 @@ fn spellable_in_init(e: &Expr, by_ref: bool, before: &[Stmt], vars: &[Var], this
         });
         ok
     };
-    // a temporary object (by value or by address)
+    // a temporary object (by value or by address; `*(const T*)&tmp` reads it as its declared
+    // class through a typedef'd spelling)
     let inner = match e {
         Expr::AddrOf(x) => stack_var(x),
+        Expr::Load { base, offset: 0, .. } if matches!(&**base, Expr::AddrOf(x) if stack_var(x).is_some()) => match &**base {
+            Expr::AddrOf(x) => stack_var(x),
+            _ => None,
+        },
         x => stack_var(x),
     };
     if let Some(v) = inner {
@@ -629,15 +830,17 @@ fn spellable_in_init(e: &Expr, by_ref: bool, before: &[Stmt], vars: &[Var], this
             // (a temporary binds to a reference parameter)
             ([src], None) if pure(src) && (by_ref || !matches!(e, Expr::AddrOf(_))) => Some((*src).clone()),
             ([src], None) if by_ref || !matches!(e, Expr::AddrOf(_)) => inline_locals(src, before, vars, db, 0).filter(|x| pure(x)),
-            ([], Some((cs, args))) if (by_ref || !matches!(e, Expr::AddrOf(_))) && args.iter().all(pure) => {
-                Some(Expr::Construct { class: Type::Named(cs.this_class.clone().unwrap_or_default()), ctor: Some(cs), args })
+            ([], Some((cs, args))) if by_ref || !matches!(e, Expr::AddrOf(_)) => {
+                // (its arguments may be temporaries themselves: copies of globals, nested objects)
+                let args: Option<Vec<Expr>> = args.iter().map(|a| if pure(a) { Some(a.clone()) } else { inline_locals(a, before, vars, db, 0).filter(|x| pure(x)) }).collect();
+                Some(Expr::Construct { class: Type::Named(cs.this_class.clone().unwrap_or_default()), ctor: Some(cs), args: args? })
             }
             // a single-member object set by one store: a copy of the object the value came
             // from, or the member's value
-            ([], None) if single_store(before, &slot_aliases(vars, v)).is_some() => single_store(before, &slot_aliases(vars, v)),
+            ([], None) if single_store(before, &slot_aliases(vars, v), vars, db).is_some() => single_store(before, &slot_aliases(vars, v), vars, db),
             // never assigned as a whole: a default-constructed temporary (member-wise setup
-            // stays in the body)
-            ([], None) if default_constructible(db, &vars[v].ty) => Some(e.clone()),
+            // stays in the body); an untyped one is spelled as the parameter's class
+            ([], None) if default_constructible(db, &vars[v].ty) && (named(&vars[v].ty).is_some() || pty.map_or(true, |t| default_constructible(db, t))) => Some(e.clone()),
             _ => None,
         };
     }
@@ -958,8 +1161,21 @@ pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) {
                 Stmt::Assign { dst: Expr::Var(v), src } if counts.get(v) == Some(&2) && !src.uses_var(*v) && !matches!(src, Expr::Var(w) if matches!(vars[*w].kind, VarKind::Stack { .. })) => Some((*v, src.clone())),
                 _ => None,
             };
+            // a narrower value stored than read back (`u8` written, the word read): no forwarding
+            let wider_read = |v: VarId, src: &Expr, s: &Stmt| -> bool {
+                let Some(have) = scalar_size(&types::ty_of(src, vars)).filter(|n| *n > 0) else { return false };
+                let mut wide = false;
+                Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+                    if let Expr::Member { base, offset, ty } = e {
+                        if matches!(**base, Expr::Var(x) if x == v) && scalar_size(ty).map_or(false, |n| *offset as i64 + n as i64 > have as i64) {
+                            wide = true;
+                        }
+                    }
+                });
+                wide
+            };
             if let Some((v, src)) = cand {
-                if mentions(&b[i + 1], v) == 1 && !matches!(b[i + 1], Stmt::If { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::Switch { .. }) {
+                if mentions(&b[i + 1], v) == 1 && !wider_read(v, &src, &b[i + 1]) && !matches!(b[i + 1], Stmt::If { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::Switch { .. }) {
                     let mut s = b[i + 1].clone();
                     let mut ok = true;
                     match &mut s {
@@ -1139,12 +1355,54 @@ pub fn drop_dead_stack_stores(body: &mut Vec<Stmt>, vars: &[Var]) {
 
 /// A class-typed stack object without a default constructor that is not defined whole at its
 /// first use can't be declared: keep it an untyped byte buffer (accesses stay raw).
+/// Does class `cls` (or a base) declare a pure virtual method that no class on the way down
+/// overrides?
+pub fn is_abstract(db: &TypeDb, cls: &str) -> bool {
+    fn walk(db: &TypeDb, cls: &str, depth: u32, concrete: &mut HashSet<(String, usize)>) -> bool {
+        if depth > 12 {
+            return false;
+        }
+        let key = strip_tmpl(cls);
+        let prefix = format!("{key}::");
+        let mut pure = vec![];
+        for (name, ds) in db.decls.range(prefix.clone()..) {
+            if !name.starts_with(&prefix) {
+                break;
+            }
+            let m = &name[prefix.len()..];
+            if m.contains("::") {
+                continue;
+            }
+            for d in ds {
+                if d.is_pure {
+                    pure.push((m.to_string(), d.params.len()));
+                } else if d.is_virtual || !d.is_static {
+                    concrete.insert((m.to_string(), d.params.len()));
+                }
+            }
+        }
+        if pure.iter().any(|p| !concrete.contains(p)) {
+            return true;
+        }
+        let Some(c) = sig::find_class(db, cls) else { return false };
+        let bases: Vec<String> = c.bases.iter().map(|b| b.name.clone()).collect();
+        bases.iter().any(|b| walk(db, b, depth + 1, concrete))
+    }
+    walk(db, cls, 0, &mut HashSet::new())
+}
+
 pub fn untype_undeclarable(body: &[Stmt], vars: &mut [Var], db: Option<&TypeDb>) {
     let Some(db) = db else { return };
     let at_def = decl_at_first_def(body, vars);
     for (v, var) in vars.iter_mut().enumerate() {
         let VarKind::Stack { size, .. } = var.kind else { continue };
         let Some(cls) = named(&var.ty).map(|s| s.to_string()) else { continue };
+        // an object of an abstract class can't be declared at all (the real object is of a
+        // derived class whose constructor was inlined)
+        if is_abstract(db, &cls) {
+            var.ty = Type::Unknown { size };
+            continue;
+        }
         if at_def.contains(&v) {
             continue;
         }

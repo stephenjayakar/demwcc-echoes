@@ -362,10 +362,21 @@ impl<'a> Resolver<'a> {
             }
             parts.push(comp);
             if toks.get(i) == Some(&"::") && toks.get(i + 1).is_some_and(|t| is_ident(t)) {
-                if templated_last.is_some() {
-                    // member of a template instantiation (rstl::vector<T>::iterator): unsupported
+                if let Some(args) = &templated_last {
+                    // member of a template instantiation (`rstl::list<T>::iterator`): the
+                    // instance's name, then the nested names
                     let written = parts.join("::");
-                    return Some((Type::Named(written), i));
+                    let q = self.lookup(&written, scope).unwrap_or(written.clone());
+                    let mut name = self.instantiation(&q, args);
+                    while toks.get(i) == Some(&"::") && toks.get(i + 1).is_some_and(|t| is_ident(t)) {
+                        if toks.get(i + 2) == Some(&"<") {
+                            return Some((Type::Named(written), i));
+                        }
+                        name.push_str("::");
+                        name.push_str(toks[i + 1]);
+                        i += 2;
+                    }
+                    return Some((Type::Named(name), i));
                 }
                 i += 1;
                 continue;
@@ -605,6 +616,34 @@ pub fn patch_void_pointers(db: &mut TypeDb, fields: &[(String, String, Vec<Strin
             if let Some(c) = db.classes.get_mut(&cn) {
                 for f in c.fields.iter_mut().filter(|f| &f.name == name && is_void_ptr(&f.ty)) {
                     f.ty = Type::Ptr(Box::new(f.ty.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// `const T* m` in a header where DWARF says `T*` (the pointee's `const` is lost for some
+/// types, e.g. `const void*`): the member's declared type.
+pub fn patch_const_pointees(db: &mut TypeDb, fields: &[(String, String, Vec<String>, Access)]) {
+    for (scope, name, toks, _) in fields {
+        // `const T *` / `T const *` with a single pointer level, no arrays or function pointers
+        if toks.iter().filter(|t| *t == "*").count() != 1 || toks.last().map(|s| s.as_str()) != Some("*") || toks.iter().any(|t| t == "(" || t == "[" || t == "<") {
+            continue;
+        }
+        let star = toks.len() - 1;
+        if !toks[..star].iter().any(|t| t == "const") {
+            continue;
+        }
+        if let Some(c) = db.classes.get_mut(scope) {
+            for f in c.fields.iter_mut().filter(|f| &f.name == name) {
+                let cv_outer = matches!(f.ty, Type::Const(_));
+                let inner = match f.ty.unqualified() {
+                    Type::Ptr(x) if !matches!(**x, Type::Const(_)) => Some((**x).clone()),
+                    _ => None,
+                };
+                if let Some(x) = inner {
+                    let p = Type::Ptr(Box::new(Type::Const(Box::new(x))));
+                    f.ty = if cv_outer { Type::Const(Box::new(p)) } else { p };
                 }
             }
         }

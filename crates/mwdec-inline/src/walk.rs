@@ -102,23 +102,23 @@ pub fn walk(b: &mut Vec<Stmt>, reach: &mut Defs, cx: &Ctx) -> usize {
         kill(&mut r2, &asg);
         let defs = merged(cx.global, &r2);
         let env = Env { db: cx.db, vars: cx.vars, defs: &defs, lib: cx.lib, objects: &cx.idx.objects };
-        n += crate::groups::rewrite_groups(b, &env, cx.idx);
+        n += crate::util::prof::time(2, || crate::groups::rewrite_groups(b, &env, cx.idx));
     }
     let mut i = 0;
     while i < b.len() {
         {
             let defs = merged(cx.global, reach);
             let env = Env { db: cx.db, vars: cx.vars, defs: &defs, lib: cx.lib, objects: &cx.idx.objects };
-            if crate::stmts::try_stmts_at(b, i, cx.whole, &env, cx.idx) {
+            if crate::util::prof::time(3, || crate::stmts::try_stmts_at(b, i, cx.whole, &env, cx.idx)) {
                 n += 1;
             }
-            if i < b.len() && crate::cflow::try_region_at(b, i, cx.whole, &env, cx.idx) {
+            if i < b.len() && crate::util::prof::time(4, || crate::cflow::try_region_at(b, i, cx.whole, &env, cx.idx)) {
                 n += 1;
             }
             if i >= b.len() {
                 break;
             }
-            n += scalar_shallow(&mut b[i], &env, cx.idx);
+            n += crate::util::prof::time(5, || scalar_shallow(&mut b[i], &env, cx.idx));
         }
         match &mut b[i] {
             Stmt::If { then, els, .. } => {
@@ -151,7 +151,7 @@ pub fn walk(b: &mut Vec<Stmt>, reach: &mut Defs, cx: &Ctx) -> usize {
             _ => {}
         }
         let s = b[i].clone();
-        update(reach, &s, cx);
+        crate::util::prof::time(6, || update(reach, &s, cx));
         i += 1;
     }
     n

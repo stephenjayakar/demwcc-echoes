@@ -995,3 +995,152 @@ pub fn fold_return_values(body: &mut Vec<Stmt>, vars: &[Var]) {
         }
     });
 }
+
+/// MWCC's value-context `&&`/`||` (`li d,0 ; tests ; li d,1`, `gen_LOGICAL`), structured as
+/// `v = 0; ...; if (a && b) v = 1;`, back to `v = a && b;`. A single comparison is never
+/// materialised with branches (it would be branchless), so only logical chains are folded; the
+/// zero may also arrive as a copy of another zeroed local (`li r5,0 ; mr r0,r5`). A folded
+/// value read once, at the start of the next statement, is substituted there (`a && b && c`).
+pub fn fold_logical_values(body: &mut Vec<Stmt>, vars: &[Var]) {
+    let mut changed = false;
+    Stmt::for_each_block_mut(body, &mut |b| changed |= fold_logical_list(b, vars));
+    if !changed {
+        return;
+    }
+    let mut uses: HashMap<VarId, usize> = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    Stmt::for_each_block_mut(body, &mut |b| subst_logical_list(b, vars, &uses));
+}
+
+fn is_logical(e: &Expr) -> bool {
+    matches!(e, Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, .. })
+}
+
+fn mentions(s: &Stmt, v: VarId) -> bool {
+    let mut found = false;
+    Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+        if matches!(e, Expr::Var(x) if *x == v) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn fold_logical_list(b: &mut Vec<Stmt>, vars: &[Var]) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < b.len() {
+        let hit = match &b[i] {
+            Stmt::If { cond, then, els } if els.is_empty() && is_logical(cond) => {
+                let t: Vec<&Stmt> = then.iter().filter(|s| !matches!(s, Stmt::Label(_))).collect();
+                match t.as_slice() {
+                    [Stmt::Assign { dst: Expr::Var(v), src: Expr::Int { value: 1, .. } }]
+                        if matches!(vars[*v].kind, VarKind::Local) && !cond.uses_var(*v) =>
+                    {
+                        Some(*v)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(v) = hit else {
+            i += 1;
+            continue;
+        };
+        // the zeroing store: the last statement before that mentions v
+        let Some(j) = (0..i).rev().find(|&j| mentions(&b[j], v)) else {
+            i += 1;
+            continue;
+        };
+        let zero = |e: &Expr, upto: usize, b: &Vec<Stmt>| -> bool {
+            match e {
+                Expr::Int { value: 0, .. } => true,
+                Expr::Var(w) => match (0..upto).rev().find(|&k| mentions(&b[k], *w)) {
+                    Some(k) => matches!(&b[k], Stmt::Assign { dst: Expr::Var(x), src: Expr::Int { value: 0, .. } } if x == w),
+                    None => false,
+                },
+                _ => false,
+            }
+        };
+        let ok = matches!(&b[j], Stmt::Assign { dst: Expr::Var(x), src } if *x == v && zero(src, j, b));
+        if !ok {
+            i += 1;
+            continue;
+        }
+        let Stmt::If { cond, .. } = b[i].clone() else { unreachable!() };
+        b[i] = Stmt::Assign { dst: Expr::Var(v), src: cond };
+        b.remove(j);
+        i -= 1;
+        changed = true;
+        // a zeroed local whose zero is now overwritten before any read (`r = 0; x = r;` became
+        // `r = 0; x = a && b; r = x && c;`) loses the dead store
+        let mut k = 0;
+        while k < b.len() {
+            let dead = match &b[k] {
+                Stmt::Assign { dst: Expr::Var(w), src: Expr::Int { value: 0, .. } } if matches!(vars[*w].kind, VarKind::Local) => {
+                    let w = *w;
+                    match (k + 1..b.len()).find(|&n| mentions(&b[n], w)) {
+                        Some(n) => matches!(&b[n], Stmt::Assign { dst: Expr::Var(x), src } if *x == w && !src.uses_var(w)) && n <= i,
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if dead {
+                b.remove(k);
+                if k < i {
+                    i -= 1;
+                }
+            } else {
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// The operand at the far left of a `&&`/`||` chain (evaluated first).
+fn leftmost_logical_operand(e: &mut Expr) -> &mut Expr {
+    match e {
+        Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, l, .. } => leftmost_logical_operand(l),
+        other => other,
+    }
+}
+
+fn is_var_test(e: &Expr, v: VarId) -> bool {
+    match e {
+        Expr::Var(x) => *x == v,
+        Expr::Cast { e, .. } => is_var_test(e, v),
+        Expr::Binary { op: BinOp::Ne, l, r, .. } => r.as_int() == Some(0) && is_var_test(l, v),
+        _ => false,
+    }
+}
+
+fn subst_logical_list(b: &mut Vec<Stmt>, vars: &[Var], uses: &HashMap<VarId, usize>) {
+    let mut i = 0;
+    while i + 1 < b.len() {
+        let v = match &b[i] {
+            Stmt::Assign { dst: Expr::Var(v), src } if is_logical(src) && matches!(vars[*v].kind, VarKind::Local) && uses.get(v) == Some(&1) => *v,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let Stmt::Assign { src: val, .. } = b[i].clone() else { unreachable!() };
+        let target: Option<&mut Expr> = match &mut b[i + 1] {
+            Stmt::Assign { dst: Expr::Var(_), src } if is_logical(src) => Some(leftmost_logical_operand(src)),
+            Stmt::If { cond, .. } if is_logical(cond) => Some(leftmost_logical_operand(cond)),
+            Stmt::Return(Some(e)) if is_logical(e) => Some(leftmost_logical_operand(e)),
+            _ => None,
+        };
+        match target {
+            Some(t) if is_var_test(t, v) => {
+                *t = val;
+                b.remove(i);
+            }
+            _ => i += 1,
+        }
+    }
+}

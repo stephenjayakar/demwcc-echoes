@@ -12,6 +12,8 @@ fn strip_ptr_casts(mut e: Expr, env: &Env) -> Expr {
         match e {
             Expr::Cast { ty, e: inner } if matches!(strip(&ty), Type::Ptr(_)) && matches!(strip(&ty_of(&inner, env.vars)), Type::Ptr(_) | Type::Ref(_)) => e = *inner,
             Expr::Cast { ty, e: inner } if matches!(strip(&ty), Type::Ptr(_)) && matches!(&*inner, Expr::AddrOf(_)) => e = *inner,
+            // the hidden return-slot pointer (typed as the returned object)
+            Expr::Cast { ty, e: inner } if matches!(strip(&ty), Type::Ptr(_)) && matches!(&*inner, Expr::Var(v) if env.vars[*v].kind == VarKind::StructRet) => e = *inner,
             other => return other,
         }
     }

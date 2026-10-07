@@ -243,6 +243,11 @@ impl<'a, 'e> M<'a, 'e> {
             }
         }
         if let Some((h, off, ty)) = comp_of(p, &self.t.holes) {
+            // a pointer component read as a word (`(unsigned int)it.mNode == 0`)
+            let t = match res(t, defs) {
+                Expr::Cast { ty: ct, e: inner } if matches!(strip(ct), Type::Int { size: 4, .. }) && vclass(ty, self.env.db) == 2 && vclass(&ty_of(res(inner, defs), self.env.vars), self.env.db) == 2 => &**inner,
+                _ => t,
+            };
             let rt = res(t, defs);
             if !compat(ty, &ty_of(rt, self.env.vars), self.env.db) {
                 return false;
@@ -298,6 +303,12 @@ impl<'a, 'e> M<'a, 'e> {
             if let Expr::Cast { ty, e: inner } = p {
                 if matches!(strip(ty), Type::Ptr(_)) && !matches!(t, Expr::Cast { .. }) {
                     return self.m(inner, t);
+                }
+            }
+            // a pointer read as a word (`(unsigned int)p == 0`: the lifter's view of `cmplwi`)
+            if let Expr::Cast { ty, e: inner } = t {
+                if matches!(strip(ty), Type::Int { size: 4, .. }) && !matches!(p, Expr::Cast { .. }) && vclass(&ty_of(res(inner, defs), self.env.vars), self.env.db) == 2 {
+                    return self.m(p, inner);
                 }
             }
             match (p, t) {
@@ -468,8 +479,35 @@ fn class_depth(db: &TypeDb, p: &Expr, off: i32, cls: &str, env: &Env) -> Option<
     go(db, &outer, off, cls, 0)
 }
 
+thread_local! {
+    /// Memo of [`class_at_pub`] (big classes make it a scan of hundreds of fields, asked again
+    /// for every template of a class). Keyed by the TypeDb's address; bounded.
+    static CLASS_AT: std::cell::RefCell<(usize, HashMap<(String, i32, String), bool>)> = std::cell::RefCell::new((0, HashMap::new()));
+}
+
 pub fn class_at_pub(db: &TypeDb, outer: &str, off: i32, cls: &str) -> bool {
-    class_at(db, outer, off, cls, 0)
+    let id = db as *const TypeDb as usize;
+    let key = (outer.to_string(), off, cls.to_string());
+    if let Some(r) = CLASS_AT.with(|c| {
+        let c = c.borrow();
+        if c.0 == id {
+            c.1.get(&key).copied()
+        } else {
+            None
+        }
+    }) {
+        return r;
+    }
+    let r = class_at(db, outer, off, cls, 0);
+    CLASS_AT.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != id || c.1.len() > 100_000 {
+            c.0 = id;
+            c.1.clear();
+        }
+        c.1.insert(key, r);
+    });
+    r
 }
 
 /// The class (or a class derived from `cls` at offset 0) at `off` inside `outer`.
@@ -491,6 +529,9 @@ fn class_at(db: &TypeDb, outer: &str, off: i32, cls: &str, depth: u32) -> bool {
     }
     for f in &c.fields {
         let fo = f.offset as i32;
+        if fo > off {
+            continue;
+        }
         let r = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
         match strip(&r) {
             Type::Array(e, n) => {
@@ -535,6 +576,30 @@ pub fn lvalue_addr(env: &Env, m: &BTreeMap<i32, Expr>, cls: &str) -> Option<Expr
 }
 
 /// Explain the virtual object `m` (components of a `cls` value) as an object template call.
+/// Is the object at address `a` const (reached from a pointer/reference to const)?
+fn const_object(a: &Expr, env: &Env) -> bool {
+    let mut e = a;
+    loop {
+        match e {
+            Expr::AddrOf(x) => e = x,
+            Expr::Member { base, .. } | Expr::Load { base, .. } => {
+                if let Some(Type::Const(_)) = mwdec_lift::pointee(&ty_of(base, env.vars)).map(|t| t.clone()) {
+                    return true;
+                }
+                e = base;
+            }
+            Expr::Cast { e: x, .. } => e = x,
+            Expr::Var(v) => {
+                return match strip(&env.vars[*v].ty) {
+                    Type::Ptr(x) | Type::Ref(x) => matches!(&**x, Type::Const(_)),
+                    _ => false,
+                };
+            }
+            _ => return false,
+        }
+    }
+}
+
 pub fn explain_object(env: &Env, cls: &str, m: &BTreeMap<i32, Expr>, depth: u32) -> Option<(Expr, i32)> {
     let list = env.objects.get(&mwdec_lift::sig::norm_name(cls))?;
     let mut best: Option<(Expr, i32)> = None;
@@ -721,14 +786,14 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         return 0;
     }
     let idx = index(lib);
-    let mut total = crate::objlocals::group(ir, lib, &idx, db);
+    let mut total = crate::util::prof::time(0, || crate::objlocals::group(ir, lib, &idx, db));
     for _round in 0..4 {
         let raw = build_defs(&ir.body, &ir.vars);
         let vars = ir.vars.clone();
-        let defs = {
+        let defs = crate::util::prof::time(1, || {
             let env0 = Env { db, vars: &vars, defs: &raw, lib, objects: &idx.objects };
             crate::safety::safe_defs(&ir.body, &env0)
-        };
+        });
         let whole = ir.body.clone();
         let cx = crate::walk::Ctx { db, vars: &vars, global: &defs, lib, idx: &idx, whole: &whole };
         let n = crate::walk::walk(&mut ir.body, &mut Defs::new(), &cx);
@@ -743,6 +808,8 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
         crate::post::name_shared_objects(&mut ir.body, &mut ir.vars);
         dce(&mut ir.body, &ir.vars);
+        crate::post::forward_cond_temps(&mut ir.body, &ir.vars);
+        crate::post::return_values(&mut ir.body, &ir.vars);
     }
     total
 }
@@ -866,6 +933,46 @@ fn root_ok(p: &Expr, t: &Expr) -> bool {
 }
 
 fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
+    // a one-member object rebuilt from the member of another one (`TUniqueId(ids[i].value)`,
+    // a by-value argument in a register): that object
+    if let Expr::Construct { class, args, .. } = &*e {
+        if let (Some(cn), [a]) = (class_name(class, env.db), args.as_slice()) {
+            if crate::template::flat_fields(env.db, &cn).is_some_and(|f| f.len() == 1 && f[0].0 == 0) {
+                let mut a = a;
+                while let Expr::Cast { e: inner, .. } = a {
+                    a = inner;
+                }
+                let obj = match a {
+                    Expr::Member { base, offset: 0, .. } if class_name(&ty_of(base, env.vars), env.db).as_deref() == Some(cn.as_str()) => Some((**base).clone()),
+                    Expr::Load { base, offset: 0, .. } if mwdec_lift::pointee(&ty_of(base, env.vars)).and_then(|t| class_name(t, env.db)).as_deref() == Some(cn.as_str()) => {
+                        Some(Expr::Load { base: base.clone(), offset: 0, ty: Type::Named(cn.clone()) })
+                    }
+                    _ => None,
+                };
+                if let Some(o) = obj {
+                    *e = o;
+                    return 1;
+                }
+            }
+        }
+    }
+    // an object built member-wise (`CVector3f(a.x * s + b.x, ...)`): the value of object-valued
+    // inlines (`a * s + b`)
+    if let Expr::Construct { class, args, .. } = &*e {
+        if let Some(cn) = class_name(class, env.db) {
+            if let Some(fields) = crate::template::flat_fields(env.db, &cn) {
+                if fields.len() == args.len() && args.len() > 1 && args.iter().any(|a| !matches!(a, Expr::Int { .. } | Expr::Float { .. })) {
+                    let m: BTreeMap<i32, Expr> = fields.iter().zip(args.iter()).map(|((o, _), a)| (*o, a.clone())).collect();
+                    if let Some((call, sc)) = explain_object(env, &cn, &m, 0) {
+                        if sc >= MIN_SCORE && !matches!(call, Expr::Construct { .. }) {
+                            *e = call;
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // try at this node (the node itself, not through a temp: the temp's def is visited where it
     // is defined)
     if !matches!(e, Expr::Var(_)) {
@@ -901,6 +1008,9 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
                 let t = &env.lib.templates[ti];
                 let Shape::Scalar(p @ Expr::AddrOf(inner)) = &t.shape else { continue };
                 let (pat, addr) = match e {
+                    // the address of a const element (`&cvec[i]` is `const T*`) can't stand where
+                    // the lifter typed a plain pointer
+                    Expr::AddrOf(_) if matches!(strip(&t.sig.ret), Type::Ref(inner) if matches!(&**inner, Type::Const(_))) => continue,
                     Expr::AddrOf(_) => (p, true),
                     Expr::Index { .. } => (&**inner, false),
                     _ => continue,
@@ -910,6 +1020,10 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
                     continue;
                 }
                 let Some((args, _)) = m.finalize(0) else { continue };
+                // an element address of a const container is a `const T*` (the const overload)
+                if addr && args.first().is_some_and(|a| const_object(a, env)) {
+                    continue;
+                }
                 // the class's own members use its fields directly
                 if args.first().is_some_and(|a| matches!(res(a, env.defs), Expr::Var(v) if env.vars[*v].kind == VarKind::This)) {
                     continue;
@@ -918,6 +1032,12 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
                 // the referenced object itself (an lvalue of the element type)
                 if let (Expr::Call { ret, .. }, Type::Ref(inner)) = (&mut call, strip(&t.sig.ret)) {
                     *ret = (**inner).clone();
+                }
+                // a scalar read of a class element is its first member (`ids[i].value`)
+                if let (false, Expr::Index { ty: ity, .. }, Type::Ref(inner)) = (addr, &*e, strip(&t.sig.ret)) {
+                    if class_name(inner, env.db).is_some() && class_name(ity, env.db).is_none() {
+                        call = Expr::Member { base: Box::new(call), offset: 0, ty: ity.clone() };
+                    }
                 }
                 best = Some((if addr { Expr::AddrOf(Box::new(call)) } else { call }, MIN_SCORE));
                 break;
@@ -944,6 +1064,14 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
     }
     let mut n = 0;
     match e {
+        // `&v[i]` was tried as a whole above (an element address); its Index alone would give
+        // `&call` with the wrong constness
+        Expr::AddrOf(x) if matches!(&**x, Expr::Index { .. }) => {
+            if let Expr::Index { base, index, .. } = &mut **x {
+                n += scalar_expr(base, env, idx);
+                n += scalar_expr(index, env, idx);
+            }
+        }
         Expr::AddrOf(x) | Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } => n += scalar_expr(x, env, idx),
         Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } => n += scalar_expr(base, env, idx),
         Expr::Index { base, index, .. } => {

@@ -9,6 +9,7 @@ pub mod cst;
 pub mod func;
 pub mod hints;
 pub mod locate;
+pub mod near;
 pub mod ops;
 pub mod rng;
 pub mod score;

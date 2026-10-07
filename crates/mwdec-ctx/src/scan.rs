@@ -491,8 +491,29 @@ impl<'t> Scanner<'t> {
         let is_typedef = words.first() == Some(&"typedef");
         let kw = words.iter().position(|w| matches!(*w, "class" | "struct" | "union" | "enum"));
         let has_paren_before_kw = kw.is_some_and(|k| words[..k].contains(&"("));
-        if let (Some(_), false, false) = (kw, has_paren_before_kw, self.tparams.is_empty()) {
-            // nested type inside a class template: not a concrete type
+        if let (Some(k), false, false) = (kw, has_paren_before_kw, self.tparams.is_empty()) {
+            // nested type inside a class template: not a concrete type, but its member functions
+            // are recorded (`red_black_tree::const_iterator::operator==`, with the enclosing
+            // template's parameters) for tools that instantiate them
+            let simple = matches!(words[k], "class" | "struct") && k == 0 && words.len() >= 2 && (words.len() == 2 || words[2] == ":") && decl[1].ident() && self.peek(0).is_some_and(|t| t.is("{"));
+            if simple && !self.c_mode {
+                let name = words[k + 1].to_string();
+                self.i += 1; // '{'
+                let mut sub = Scanner {
+                    t: self.t,
+                    i: self.i,
+                    out: ScanResult::default(),
+                    tparams: self.tparams.clone(),
+                    c_mode: self.c_mode,
+                    access: mwdec_core::Access::Public,
+                    next_default: if words[k] == "class" { mwdec_core::Access::Private } else { mwdec_core::Access::Public },
+                };
+                sub.scope(&qual(scope, &name), true);
+                self.i = sub.i;
+                self.out.decls.extend(sub.out.decls);
+                self.skip_to_semicolon();
+                return;
+            }
             self.skip_balanced();
             self.skip_to_semicolon();
             return;
@@ -933,5 +954,6 @@ fn parse_fn_decl(scope: &str, in_class: bool, decl: &[&Tok], body: Option<String
         init_list,
     })
 }
+
 
 

@@ -106,6 +106,72 @@ fn array_field(db: &TypeDb, cls: &str, off: i32, esz: u32, depth: u32) -> Option
     None
 }
 
+/// Element type of an indexable class template instance: the class declares `operator[]`
+/// returning a reference to one of its template parameters (`T& operator[](int)`), whose
+/// argument in `cls` is the element type.
+fn container_elem(db: &TypeDb, cls: &str) -> Option<Type> {
+    let lt = cls.find('<')?;
+    let base = &cls[..lt];
+    let ds = db.decls.get(&format!("{base}::operator[]"))?;
+    let args = crate::sig::split_top(&cls[lt + 1..cls.len().checked_sub(1)?], ',');
+    for d in ds {
+        let Type::Ref(inner) = strip_cv(&d.ret) else { continue };
+        let Some(p) = named(inner) else { continue };
+        if let Some(k) = d.template_params.iter().position(|x| x == p) {
+            return Some(crate::sig::parse_type(args.get(k)?));
+        }
+    }
+    None
+}
+
+/// A member container (`rstl::reserved_vector<T, N>`: indexable, elements stored inline in an
+/// array member) of `cls` holding byte `off`, with elements of size `esz`: (container offset,
+/// container type, offset of element 0, element type), offsets relative to `cls`.
+fn container_field(db: &TypeDb, cls: &str, off: i32, esz: u32, depth: u32) -> Option<(i32, Type, i32, Type)> {
+    if depth > 8 {
+        return None;
+    }
+    let c = crate::sig::find_class(db, cls)?;
+    for f in &c.fields {
+        if f.bitfield.is_some() {
+            continue;
+        }
+        let fo = f.offset as i32;
+        let rt = types::resolve(Some(db), &f.ty).into_owned();
+        let fs = types::size_of(Some(db), &rt).unwrap_or(0) as i32;
+        if off < fo || off >= fo + fs.max(1) {
+            continue;
+        }
+        let Type::Named(n) = strip_cv(&rt) else { continue };
+        if let Some(et) = container_elem(db, n) {
+            if types::size_of(Some(db), &et) == Some(esz) {
+                // the inline storage: an array member covering the offset
+                if let Some(cc) = crate::sig::find_class(db, n) {
+                    for g in &cc.fields {
+                        let go = fo + g.offset as i32;
+                        let gt = types::resolve(Some(db), &g.ty).into_owned();
+                        let gs = types::size_of(Some(db), &gt).unwrap_or(0) as i32;
+                        if matches!(strip_cv(&gt), Type::Array(..)) && gs > 0 && gs as u32 % esz == 0 && off >= go && off < go + gs {
+                            return Some((fo, f.ty.clone(), go, et));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some((a, t, d, e)) = container_field(db, n, off - fo, esz, depth + 1) {
+            return Some((fo + a, t, fo + d, e));
+        }
+    }
+    for b in &c.bases {
+        let bo = b.offset as i32;
+        if let Some((a, t, d, e)) = container_field(db, &b.name, off - bo, esz, depth + 1) {
+            return Some((bo + a, t, bo + d, e));
+        }
+    }
+    None
+}
+
 fn add_index(x: Expr, j: i64) -> Expr {
     if j == 0 {
         x
@@ -120,6 +186,15 @@ fn finish(elem: Expr, et: &Type, inner: i32, ty: &Type, db: Option<&TypeDb>) -> 
     let es = types::size_of(db, et)?;
     if inner == 0 && matches!(ty, Type::Unknown { size: 0 }) {
         return Some(elem);
+    }
+    if let Type::Array(e2, _) = strip_cv(et) {
+        // an element that is itself an array (`g[i][k]`): the access is one of its elements
+        let s2 = types::size_of(db, e2)?;
+        let ts = scalar_size(ty)?;
+        if s2 == 0 || inner < 0 || inner as u32 % s2 != 0 || ts != s2 || is_float(e2) != is_float(ty) || types::is_aggregate(db, e2) {
+            return None;
+        }
+        return Some(Expr::Index { base: Box::new(elem), index: Box::new(Expr::int((inner as u32 / s2) as i64)), ty: (**e2).clone() });
     }
     if !types::is_aggregate(db, et) {
         // scalar element: the access must be the whole element
@@ -179,7 +254,12 @@ fn try_array(e: &Expr, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, 
         Expr::Var(v) if defs.contains_key(v) => &defs[v],
         i => i,
     };
-    let (x, esz, k) = split_index(index, vars, db)?;
+    let (x, esz, k) = match split_index(index, vars, db) {
+        Some(r) => r,
+        // a byte element indexed by a plain integer (`p->mFlags[i]`)
+        None if scalar_size(ty) == Some(1) && !is_ptr(&types::ty_of(index, vars)) && index.as_int().is_none() => (index.clone(), 1, 0),
+        None => return None,
+    };
     let off = *offset as i64 + k;
     if off < 0 || off > 0x100000 {
         return None;
@@ -201,6 +281,23 @@ fn try_array(e: &Expr, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, 
         }
     };
     let otr = types::resolve(db, &ot).into_owned();
+    // element of a member container (`p->mList[i].f` through its `operator[]`)
+    if let (Some(db), Some(cls)) = (db, named(&otr)) {
+        if let Some((co, ct, d0, et)) = container_field(db, cls, off, esz, 0) {
+            let rel = off - d0;
+            let j = (rel as u32 / esz) as i64;
+            let inner = rel - (j as i32) * esz as i32;
+            let cont = if ptr {
+                Expr::Load { base: Box::new(obj.clone()), offset: co, ty: ct }
+            } else {
+                Expr::Member { base: Box::new(obj.clone()), offset: co, ty: ct }
+            };
+            let elem = Expr::Index { base: Box::new(cont), index: Box::new(add_index(x.clone(), j)), ty: et.clone() };
+            if let Some(r) = finish(elem, &et, inner, ty, Some(db)) {
+                return Some(r);
+            }
+        }
+    }
     // array member of a class
     if let (Some(db), Some(cls)) = (db, named(&otr)) {
         if let Some((a, et, n)) = array_field(db, cls, off, esz, 0) {
@@ -257,6 +354,8 @@ pub fn recover(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) {
         });
         defs.retain(|v, _| n.get(v) == Some(&1));
     }
+    forward_address_temps(body, vars, db, &defs);
+    type_indexed_globals(body, vars, db, &defs);
     recover_with(body, vars, db, &defs);
     if defs.is_empty() {
         return;
@@ -300,4 +399,524 @@ fn recover_with(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>, defs: &
             }
         }
     });
+}
+
+/// An element address computed once into a temp and used as the base of the next statement's
+/// accesses (`t = (u8*)&a[i] + (j << 2); *(t + 0x24) |= 64`): forward it into each access when
+/// every one of them then becomes an array element (`a[i].f[j] |= 64`; MWCC computes the shared
+/// address once either way).
+fn forward_address_temps(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, Expr>) {
+    let mut uses: HashMap<VarId, usize> = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let mut ndefs: HashMap<VarId, usize> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), .. } = s {
+                *ndefs.entry(*v).or_default() += 1;
+            }
+        }
+    });
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let (t, def) = match &b[i] {
+                Stmt::Assign { dst: Expr::Var(t), src } if matches!(vars[*t].kind, VarKind::Local) && ndefs.get(t) == Some(&1) && byte_sum(src, vars).is_some() && !src.has_call() => (*t, src.clone()),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let total = uses.get(&t).copied().unwrap_or(0);
+            // uses in the next statement (plus a second one when the first has no call)
+            let mut span = 0;
+            let mut seen = 0;
+            for j in i + 1..(i + 3).min(b.len()) {
+                if !matches!(b[j], Stmt::Assign { .. } | Stmt::Expr(_)) {
+                    break;
+                }
+                let mut n = HashMap::new();
+                crate::inline::count_uses(std::slice::from_ref(&b[j]), &mut n);
+                seen += n.get(&t).copied().unwrap_or(0);
+                span = j;
+                if seen >= total || stmt_has_call(&b[j]) {
+                    break;
+                }
+            }
+            if total == 0 || seen != total {
+                i += 1;
+                continue;
+            }
+            let mut cand: Vec<Stmt> = b[i + 1..=span].to_vec();
+            let mut ok = true;
+            let mut converted = 0;
+            // one location read and written back (`x = x | 64`): every access is the same
+            let mut accesses: Vec<(i32, Type)> = vec![];
+            Stmt::walk_exprs(&cand, &mut |e| {
+                if let Expr::Load { base, offset, ty } = e {
+                    if matches!(**base, Expr::Var(v) if v == t) && !accesses.contains(&(*offset, ty.clone())) {
+                        accesses.push((*offset, ty.clone()));
+                    }
+                }
+            });
+            if accesses.len() != 1 {
+                i += 1;
+                continue;
+            }
+            Stmt::rewrite_exprs(&mut cand, &mut |e| {
+                if let Expr::Load { base, offset, ty } = e {
+                    if matches!(**base, Expr::Var(v) if v == t) {
+                        let fwd = Expr::Load { base: Box::new(def.clone()), offset: *offset, ty: ty.clone() };
+                        match try_array(&fwd, vars, db, defs) {
+                            Some(n) => {
+                                *e = n;
+                                converted += 1;
+                            }
+                            None => ok = false,
+                        }
+                    }
+                }
+            });
+            if ok && converted == total && !cand.iter().any(|s| stmt_uses(s, t)) {
+                b.splice(i..=span, cand);
+                continue;
+            }
+            i += 1;
+        }
+    });
+}
+
+fn stmt_has_call(s: &Stmt) -> bool {
+    let mut c = false;
+    Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+        if matches!(e, Expr::Call { .. } | Expr::New { .. }) {
+            c = true;
+        }
+    });
+    c
+}
+
+fn stmt_uses(s: &Stmt, v: VarId) -> bool {
+    let mut n = HashMap::new();
+    crate::inline::count_uses(std::slice::from_ref(s), &mut n);
+    n.contains_key(&v)
+}
+
+/// Globals the context doesn't declare (unit statics, other units' tables) are typed by their
+/// access width only. When every indexed access of one agrees on the element shape (`lhzx` of
+/// `(i << 1)` -> `u16`, `lbz` at `+1` of `(i << 2)` -> `u8[4]`) and its plain accesses fit it, it
+/// becomes an array of that element (`static u16 sTable[N]`, size from the symbol), so the
+/// accesses index it and the declaration has the right size class (no small-data for big
+/// objects).
+pub(crate) fn type_indexed_globals(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, Expr>) {
+    #[derive(Default)]
+    struct Acc {
+        // (element size, byte offset within the global, access type)
+        indexed: Vec<(u32, i64, Type)>,
+        plain: Vec<(i64, Type)>,
+        bad: bool,
+        size: u32,
+    }
+    fn global_of(p: &Expr) -> Option<(String, u32, i64)> {
+        match p {
+            Expr::AddrOf(g) => match &**g {
+                Expr::Global { symbol, ty: Type::Unknown { size } } => Some((symbol.clone(), *size, 0)),
+                Expr::Member { base, offset, ty: Type::Unknown { size: 0 } } => match &**base {
+                    Expr::Global { symbol, ty: Type::Unknown { size } } => Some((symbol.clone(), *size, *offset as i64)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Expr::Cast { e, .. } => global_of(e),
+            _ => None,
+        }
+    }
+    let declared = |sym: &str| db.map_or(false, |d| d.globals.contains_key(sym));
+    let mut acc: HashMap<String, Acc> = HashMap::new();
+    // indexed accesses first (their bases are skipped by the scan below)
+    let mut handled: Vec<*const Expr> = vec![];
+    Stmt::walk_exprs(body, &mut |e| {
+        // an element-indexed untyped global (`g[i]` from scaled indexed loads)
+        if let Expr::Index { base, ty, .. } = e {
+            // (the address of the global: a bare global base is its pointer value)
+            let g = match &**base {
+                Expr::AddrOf(g) => Some(&**g),
+                Expr::Cast { e: x, .. } => match &**x {
+                    Expr::AddrOf(g) => Some(&**g),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(g @ Expr::Global { symbol, ty: Type::Unknown { size } }) = g {
+                if let Some(s) = scalar_size(ty).filter(|s| *s > 0) {
+                    let a = acc.entry(symbol.clone()).or_default();
+                    a.size = *size;
+                    a.indexed.push((s, 0, ty.clone()));
+                    handled.push(&**base as *const Expr);
+                    handled.push(g as *const Expr);
+                }
+            }
+            return;
+        }
+        let Expr::Load { base, offset, ty } = e else { return };
+        let Some((p, idx)) = byte_sum(base, vars) else { return };
+        let Some((sym, size, addend)) = global_of(&p) else { return };
+        let idx = match &idx {
+            Expr::Var(v) if defs.contains_key(v) => defs[v].clone(),
+            i => i.clone(),
+        };
+        let a = acc.entry(sym).or_default();
+        a.size = size;
+        match split_index(&idx, vars, db) {
+            Some((_, esz, k)) if scalar_size(ty).map_or(false, |s| s > 0) => a.indexed.push((esz, addend + *offset as i64 + k, ty.clone())),
+            _ => a.bad = true,
+        }
+        handled.push(&**base as *const Expr);
+    });
+    if acc.is_empty() {
+        return;
+    }
+    // every other mention of those globals
+    fn scan(e: &Expr, vars: &[Var], handled: &[*const Expr], acc: &mut HashMap<String, Acc>) {
+        if handled.contains(&(e as *const Expr)) {
+            return;
+        }
+        // an element address that escapes (into a temp, an argument): its uses are unknown
+        if let Some((sym, ..)) = byte_sum(e, vars).and_then(|(p, _)| global_of(&p)) {
+            if let Some(a) = acc.get_mut(&sym) {
+                a.bad = true;
+            }
+            return;
+        }
+        match e {
+            Expr::Global { symbol, .. } => {
+                if let Some(a) = acc.get_mut(symbol) {
+                    a.bad = true;
+                }
+            }
+            Expr::Member { base, offset, ty } if matches!(**base, Expr::Global { .. }) => {
+                let Expr::Global { symbol, .. } = &**base else { return };
+                if let Some(a) = acc.get_mut(symbol) {
+                    if matches!(ty, Type::Unknown { size: 0 }) {
+                        a.bad = true;
+                    } else {
+                        a.plain.push((*offset as i64, ty.clone()));
+                    }
+                }
+            }
+            // the address itself (array decay, passed along)
+            Expr::AddrOf(g) if matches!(**g, Expr::Global { .. }) => {}
+            _ => {
+                for k in direct_children(e) {
+                    scan(k, vars, handled, acc);
+                }
+            }
+        }
+    }
+    let mut roots: Vec<&Expr> = vec![];
+    collect_roots(body, &mut roots);
+    for r in roots {
+        scan(r, vars, &handled, &mut acc);
+    }
+    let mut types_for: HashMap<String, Type> = HashMap::new();
+    for (sym, a) in &acc {
+        if a.bad || a.indexed.is_empty() || declared(sym) || sym.starts_with('@') || sym.starts_with("lbl_") {
+            continue;
+        }
+        let (esz, _, t0) = a.indexed[0].clone();
+        let s0 = scalar_size(&t0).unwrap_or(0);
+        let same = |t: &Type| scalar_size(t) == Some(s0) && is_float(t) == is_float(&t0);
+        if s0 == 0 || esz % s0 != 0 || !a.indexed.iter().all(|(e, o, t)| *e == esz && same(t) && *o >= 0 && *o % s0 as i64 == 0) {
+            continue;
+        }
+        if !a.plain.iter().all(|(o, t)| same(t) && *o >= 0 && *o % s0 as i64 == 0) {
+            continue;
+        }
+        let elem = if esz == s0 { t0.clone() } else { Type::Array(Box::new(t0.clone()), esz / s0) };
+        let n = if a.size > 0 && a.size % esz == 0 {
+            a.size / esz
+        } else if a.size > 0 {
+            continue;
+        } else {
+            0
+        };
+        types_for.insert(sym.clone(), Type::Array(Box::new(elem), n));
+    }
+    if types_for.is_empty() {
+        return;
+    }
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if let Expr::Global { symbol, ty } = e {
+            if let Some(t) = types_for.get(symbol) {
+                *ty = t.clone();
+            }
+        }
+        // `(&g)[i]` -> `g[i]` (the array itself)
+        if let Expr::Index { base, .. } = e {
+            let inner = match &**base {
+                Expr::AddrOf(g) => Some((**g).clone()),
+                Expr::Cast { e: x, .. } => match &**x {
+                    Expr::AddrOf(g) => Some((**g).clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(g @ Expr::Global { .. }) = inner {
+                if let Expr::Global { symbol, .. } = &g {
+                    if let Some(t) = types_for.get(symbol) {
+                        **base = Expr::Global { symbol: symbol.clone(), ty: t.clone() };
+                    }
+                }
+            }
+        }
+    });
+    // plain accesses become constant-index elements
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if let Expr::Member { base, offset, ty } = e {
+            if let Expr::Global { ty: Type::Array(et, _), .. } = &**base {
+                let et = (**et).clone();
+                let es = types::size_of(db, &et).unwrap_or(0) as i32;
+                if es > 0 {
+                    let j = *offset / es;
+                    let inner = *offset - j * es;
+                    let elem = Expr::Index { base: base.clone(), index: Box::new(Expr::int(j as i64)), ty: et.clone() };
+                    if let Some(n) = finish(elem, &et, inner, ty, db) {
+                        *e = n;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn direct_children(e: &Expr) -> Vec<&Expr> {
+    let mut v: Vec<&Expr> = vec![];
+    match e {
+        Expr::AddrOf(x) | Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } | Expr::IncDec { e: x, .. } => v.push(x),
+        Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } => v.push(base),
+        Expr::Index { base, index, .. } => {
+            v.push(base);
+            v.push(index);
+        }
+        Expr::Binary { l, r, .. } => {
+            v.push(l);
+            v.push(r);
+        }
+        Expr::Ternary { c, t, f, .. } => {
+            v.push(c);
+            v.push(t);
+            v.push(f);
+        }
+        Expr::Call { callee, args, .. } => {
+            match callee {
+                Callee::Method { this, .. } | Callee::Virtual { this, .. } => v.push(this),
+                Callee::Indirect(x) => v.push(x),
+                Callee::Direct { .. } => {}
+            }
+            v.extend(args.iter());
+        }
+        Expr::New { placement, args, .. } => v.extend(placement.iter().chain(args.iter())),
+        Expr::Construct { args, .. } => v.extend(args.iter()),
+        _ => {}
+    }
+    v
+}
+
+fn collect_roots<'a>(b: &'a [Stmt], out: &mut Vec<&'a Expr>) {
+    for s in b {
+        match s {
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => out.push(e),
+            Stmt::Assign { dst, src } => {
+                out.push(dst);
+                out.push(src);
+            }
+            Stmt::If { cond, then, els } => {
+                out.push(cond);
+                collect_roots(then, out);
+                collect_roots(els, out);
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                out.push(cond);
+                collect_roots(body, out);
+            }
+            Stmt::For { init, cond, step, body } => {
+                collect_roots(init, out);
+                out.push(cond);
+                collect_roots(step, out);
+                collect_roots(body, out);
+            }
+            Stmt::Switch { e, cases } => {
+                out.push(e);
+                for c in cases {
+                    collect_roots(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The member container of `cls` whose inline storage holds byte `off`, whatever its element
+/// size: (container offset, container type, offset of element 0, element type).
+fn container_at(db: &TypeDb, cls: &str, off: i32, depth: u32) -> Option<(i32, Type, i32, Type)> {
+    if depth > 8 {
+        return None;
+    }
+    let c = crate::sig::find_class(db, cls)?;
+    for f in &c.fields {
+        if f.bitfield.is_some() {
+            continue;
+        }
+        let fo = f.offset as i32;
+        let rt = types::resolve(Some(db), &f.ty).into_owned();
+        let fs = types::size_of(Some(db), &rt).unwrap_or(0) as i32;
+        if off < fo || off >= fo + fs.max(1) {
+            continue;
+        }
+        let Type::Named(n) = strip_cv(&rt) else { continue };
+        if let Some(et) = container_elem(db, n) {
+            let esz = types::size_of(Some(db), &et)?;
+            if esz > 0 {
+                return container_field(db, cls, off, esz, depth);
+            }
+            return None;
+        }
+        if let Some((a, t, d, e)) = container_at(db, n, off - fo, depth + 1) {
+            return Some((fo + a, t, fo + d, e));
+        }
+    }
+    for b in &c.bases {
+        let bo = b.offset as i32;
+        if let Some((a, t, d, e)) = container_at(db, &b.name, off - bo, depth + 1) {
+            return Some((bo + a, t, bo + d, e));
+        }
+    }
+    None
+}
+
+/// Constant-offset accesses into a member container's inline storage (`*(u8*)(this + 0x40)`
+/// inside a `reserved_vector<S, 4> mList`) are element accesses: `this->mList[1].f`
+/// (then bitfields and members resolve inside the element type).
+pub fn container_members(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            match s {
+                // writes go through the non-const operator[]: not for const containers
+                Stmt::Assign { dst, src } => {
+                    dst.rewrite(&mut |e| container_rewrite(e, vars, db, false));
+                    src.rewrite(&mut |e| container_rewrite(e, vars, db, true));
+                }
+                Stmt::Expr(e) | Stmt::Return(Some(e)) => e.rewrite(&mut |x| container_rewrite(x, vars, db, true)),
+                Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } | Stmt::For { cond, .. } => cond.rewrite(&mut |x| container_rewrite(x, vars, db, true)),
+                Stmt::Switch { e, .. } => e.rewrite(&mut |x| container_rewrite(x, vars, db, true)),
+                _ => {}
+            }
+        }
+    });
+}
+
+fn container_rewrite(e: &mut Expr, vars: &[Var], db: &TypeDb, allow_const: bool) {
+    {
+        let (base, offset, ty, ptr) = match e {
+            Expr::Load { base, offset, ty } => (base.clone(), *offset, ty.clone(), true),
+            Expr::Member { base, offset, ty } => (base.clone(), *offset, ty.clone(), false),
+            _ => return,
+        };
+        if matches!(ty, Type::Unknown { size: 0 }) {
+            return;
+        }
+        let bt = types::ty_of(&base, vars);
+        let ot = if ptr {
+            pointee(&bt).cloned()
+        } else {
+            match strip_cv(&bt) {
+                Type::Ref(t) => Some((**t).clone()),
+                t => Some(t.clone()),
+            }
+        };
+        let Some(ot) = ot else { return };
+        let is_const = matches!(ot, Type::Const(_)) || (!ptr && matches!(bt, Type::Const(_)));
+        if !allow_const && is_const {
+            return;
+        }
+        let otr = types::resolve(Some(db), &ot).into_owned();
+        let Some(cls) = named(&otr).map(|s| s.to_string()) else { return };
+        // the object is a container itself, or holds one
+        let own = container_elem(db, &cls).and_then(|et| {
+            let esz = types::size_of(Some(db), &et)?;
+            let c = crate::sig::find_class(db, &cls)?;
+            if c.fields.is_empty() {
+                // an instance without members in the context: the storage offset from another
+                // instance of the template (inline byte storage, same place for every T)
+                let go = template_storage_offset(db, &cls)?;
+                let n = template_count(&cls)?;
+                return (offset >= go && offset < go + (n * esz) as i32).then(|| (go, et.clone()));
+            }
+            c.fields.iter().find_map(|g| {
+                let go = g.offset as i32;
+                let gt = types::resolve(Some(db), &g.ty).into_owned();
+                let gs = types::size_of(Some(db), &gt).unwrap_or(0) as i32;
+                (matches!(strip_cv(&gt), Type::Array(..)) && gs > 0 && esz > 0 && gs as u32 % esz == 0 && offset >= go && offset < go + gs).then(|| (go, et.clone()))
+            })
+        });
+        let whole_obj = own.is_some();
+        let (co, ct, d0, et) = match own {
+            Some((go, et)) => (0, ot.clone(), go, et),
+            None => match container_at(db, &cls, offset, 0) {
+                Some(x) => x,
+                None => return,
+            },
+        };
+        let Some(esz) = types::size_of(Some(db), &et).filter(|s| *s > 0) else { return };
+        let rel = offset - d0;
+        if rel < 0 {
+            return;
+        }
+        let j = rel / esz as i32;
+        let inner = rel - j * esz as i32;
+        let cont = if whole_obj && !ptr {
+            (*base).clone()
+        } else if ptr {
+            Expr::Load { base: base.clone(), offset: co, ty: ct }
+        } else {
+            Expr::Member { base: base.clone(), offset: co, ty: ct }
+        };
+        let elem = Expr::Index { base: Box::new(cont), index: Box::new(Expr::int(j as i64)), ty: et.clone() };
+        if !types::is_aggregate(Some(db), &et) {
+            if let Some(n) = finish(elem, &et, inner, &ty, Some(db)) {
+                *e = n;
+            }
+            return;
+        }
+        // an aggregate element: the member at `inner` (bitfield units stay raw members of it)
+        *e = Expr::Member { base: Box::new(elem), offset: inner, ty };
+    }
+}
+
+/// Offset of the inline byte storage (`uchar mData[N * sizeof(T)]`) in the instances of
+/// `cls`'s class template that the context does lay out.
+fn template_storage_offset(db: &TypeDb, cls: &str) -> Option<i32> {
+    let base = &cls[..cls.find('<')?];
+    let prefix = format!("{base}<");
+    let mut found: Option<i32> = None;
+    for (name, c) in db.classes.range(prefix.clone()..) {
+        if !name.starts_with(&prefix) {
+            break;
+        }
+        let arr = c.fields.iter().find(|f| matches!(strip_cv(&f.ty), Type::Array(e, _) if scalar_size(e) == Some(1)));
+        if let Some(f) = arr {
+            match found {
+                None => found = Some(f.offset as i32),
+                Some(o) if o == f.offset as i32 => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
+}
+
+/// The last integer template argument of `cls` (`reserved_vector<T, 16>` -> 16).
+fn template_count(cls: &str) -> Option<u32> {
+    let lt = cls.find('<')?;
+    let args = crate::sig::split_top(&cls[lt + 1..cls.len().checked_sub(1)?], ',');
+    args.last()?.trim().parse().ok()
 }

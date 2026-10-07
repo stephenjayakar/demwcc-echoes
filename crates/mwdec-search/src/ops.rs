@@ -133,6 +133,10 @@ pub const OPS: &[OpDef] = &[
     OpDef { name: "dtor_delete", cat: Cat::Expr, weight: 3.0, aff: C, f: crate::structural::op_dtor_delete },
     OpDef { name: "vec_op", cat: Cat::Expr, weight: 3.0, aff: C | S | R, f: crate::structural::op_vec_op },
     OpDef { name: "split_update", cat: Cat::Temp, weight: 2.5, aff: R | C | S, f: crate::structural::op_split_update },
+    // Near-miss forms (crate::near).
+    OpDef { name: "swap_args", cat: Cat::Expr, weight: 2.0, aff: S | R | L | C, f: crate::near::op_swap_args },
+    OpDef { name: "ret_var", cat: Cat::Control, weight: 2.0, aff: L | C, f: crate::near::op_ret_var },
+    OpDef { name: "delete_stmt", cat: Cat::Expr, weight: 1.0, aff: C, f: crate::near::op_delete_stmt },
     // Verified no codegen effect: near-zero weight (cleanup / stepping stones only).
     OpDef { name: "unwrap_block", cat: Cat::Order, weight: 0.46, aff: 0, f: op_unwrap_block },
     OpDef { name: "wrap_block", cat: Cat::Order, weight: 0.1, aff: 0, f: op_wrap_block },

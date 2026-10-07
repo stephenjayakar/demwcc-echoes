@@ -535,7 +535,31 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
-        let lay = layout(&s, has_this, sret, self.db);
+        let mut lay = layout(&s, has_this, sret, self.db);
+        if s.variadic {
+            // the variadic part: argument registers set up for this call after the named ones
+            // (marked `...`; dropped from the callee's signature once the arguments are read)
+            let g = lay.params.iter().fold(2u8, |m, l| match l {
+                ArgLoc::Gpr(r) => m.max(*r),
+                ArgLoc::GprPair(r) => m.max(*r + 1),
+                _ => m,
+            });
+            let g = g.max(lay.this.unwrap_or(0)).max(lay.sret.unwrap_or(0));
+            let f = lay.params.iter().fold(0u8, |m, l| if let ArgLoc::Fpr(r) = l { m.max(*r) } else { m });
+            let extra = |p: &mut Vec<mwdec_core::Param>| p.push(mwdec_core::Param { name: Some("...".into()), ty: Type::Unknown { size: 0 } });
+            if let Some(top) = (g + 1..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q))) {
+                for r in g + 1..=top {
+                    lay.params.push(ArgLoc::Gpr(r));
+                    extra(&mut s.params);
+                }
+            }
+            if let Some(top) = (f + 1..=8u8).rev().find(|q| self.reg_set_for_call(k, fpr(*q))) {
+                for r in f + 1..=top {
+                    lay.params.push(ArgLoc::Fpr(r));
+                    extra(&mut s.params);
+                }
+            }
+        }
         Some((s, lay, has_this))
     }
 
@@ -963,6 +987,79 @@ impl<'a> Lifter<'a> {
                     let root = find(&mut parent, *s);
                     root_var.insert(root, *v);
                 }
+            }
+        }
+        // a reassigned parameter (`result = f(); ... use(result)`): a web one of whose defs
+        // copies a param register that holds only its entry value and has no other use
+        // (`mr. r29, r4`) is the parameter itself, not a local copied from it
+        {
+            let mut copy_src: HashMap<u32, (Reg, bool)> = HashMap::new();
+            let mut entry_users: HashMap<Reg, HashSet<usize>> = HashMap::new();
+            self.for_each_use(|k, r, defs| {
+                let e = copy_src.entry(k as u32).or_insert((r, true));
+                if e.0 != r || defs != [ENTRY] {
+                    e.1 = false;
+                }
+                if defs.contains(&ENTRY) {
+                    entry_users.entry(r).or_default().insert(k);
+                }
+            });
+            // params are coloured last (regalloc.md): they take the lowest callee-saved
+            // registers, so a copy living above some local's register is a named local
+            let copy_of_entry = |k: usize| -> bool {
+                let i = &self.insns[k];
+                let src = match i.op() {
+                    Opcode::Or if i.rs() == i.rb() => gpr(i.rs()),
+                    Opcode::Addi if i.simm() == 0 && i.ra() != 0 => gpr(i.ra()),
+                    Opcode::Fmr => fpr(i.rb()),
+                    _ => return false,
+                };
+                copy_src.get(&(k as u32)) == Some(&(src, true)) && self.entry_vals.contains_key(&src)
+            };
+            let mut low_local = [99u8; 2];
+            for k in 0..self.insns.len() {
+                if self.frame.skip.contains(&k) || copy_of_entry(k) {
+                    continue;
+                }
+                for r in self.defs_of(k) {
+                    let (cls, n) = if r < 32 { (0, r) } else if r < 64 { (1, r - 32) } else { continue };
+                    if n >= 14 {
+                        low_local[cls] = low_local[cls].min(n);
+                    }
+                }
+            }
+            let used_params: HashSet<VarId> = root_var.values().copied().collect();
+            let mut taken: HashSet<VarId> = used_params;
+            let mut sorted = sites.clone();
+            sorted.sort();
+            for s in &sorted {
+                let root = find(&mut parent, *s);
+                if root_var.contains_key(&root) || s.0 == ENTRY || s.1 >= 64 {
+                    continue;
+                }
+                let i = &self.insns[s.0 as usize];
+                let src = match i.op() {
+                    Opcode::Or if i.rs() == i.rb() => gpr(i.rs()),
+                    Opcode::Addi if i.simm() == 0 && i.ra() != 0 => gpr(i.ra()),
+                    Opcode::Fmr => fpr(i.rb()),
+                    _ => continue,
+                };
+                if src == s.1 || copy_src.get(&s.0) != Some(&(src, true)) {
+                    continue;
+                }
+                let Some(Expr::Var(v)) = self.entry_vals.get(&src).cloned() else { continue };
+                if !matches!(self.vars[v].kind, VarKind::Param { .. }) || taken.contains(&v) {
+                    continue;
+                }
+                let (cls, n) = if s.1 < 32 { (0, s.1) } else { (1, s.1 - 32) };
+                if n >= 14 && n > low_local[cls] {
+                    continue;
+                }
+                if entry_users.get(&src).map_or(0, |u| u.len()) != 1 {
+                    continue;
+                }
+                taken.insert(v);
+                root_var.insert(root, v);
             }
         }
         let mut sorted = sites.clone();
@@ -1521,7 +1618,13 @@ impl<'a> Lifter<'a> {
         }
         let uses = self.use_count.get(&site).copied().unwrap_or(0);
         let cross = self.use_blocks.get(&site).map_or(false, |s| s.iter().any(|&b| b != self.cfg.block_of[k]));
-        if is_trivial(&e) && !(cross && self.refs_mutable(&e)) {
+        // a member address kept in a callee-saved register (`addi r31, r30, 4` read after
+        // calls) was a local in the source (`T& m = obj.GetMember();`):
+        // re-evaluated at each use it would be recomputed in a volatile register
+        let kept_address = (14..32).contains(&reg)
+            && uses > 0
+            && matches!(&e, Expr::AddrOf(inner) if matches!(&**inner, Expr::Member { base, .. } | Expr::Load { base, .. } if !matches!(&**base, Expr::Var(v) if matches!(self.vars[*v].kind, VarKind::Stack { .. }))));
+        if is_trivial(&e) && !(cross && self.refs_mutable(&e)) && !kept_address {
             st.regs[reg as usize] = Some(e.clone());
             self.def_value.insert(site, e);
             return;
@@ -1695,6 +1798,20 @@ impl<'a> Lifter<'a> {
             let site = (defs[0], r as Reg);
             if defs.len() > 1 || self.web_var.contains_key(&site) {
                 if let Some(&v) = self.web_var.get(&site) {
+                    // a web holding an incoming value that isn't the parameter variable itself
+                    // (a reference parameter stepped as a pointer: `p = &ref; ... p += 16`)
+                    // starts from it
+                    if b == 0 && self.cfg.blocks[0].preds.is_empty() && defs == [ENTRY] {
+                        if let Some(e) = self.entry_vals.get(&(r as Reg)) {
+                            if *e != Expr::Var(v) {
+                                let et = ty_of(e, &self.vars);
+                                if matches!(self.vars[v].ty, Type::Unknown { .. }) && !matches!(et, Type::Unknown { .. }) {
+                                    self.vars[v].ty = et;
+                                }
+                                st.out.push(Stmt::Assign { dst: Expr::Var(v), src: e.clone() });
+                            }
+                        }
+                    }
                     st.regs[r] = Some(Expr::Var(v));
                 }
                 continue;
@@ -1899,6 +2016,8 @@ impl<'a> Lifter<'a> {
             }
         }
         self.type_scalar_out_args(&args, &sig);
+        let mut sig = sig;
+        sig.params.retain(|p| p.name.as_deref() != Some("..."));
         let callee = if has_this {
             let this = self.get(st, gpr(lay.this.unwrap()));
             // deleting destructor call (flag 1 in the next register): `delete p`
@@ -2037,6 +2156,23 @@ impl<'a> Lifter<'a> {
         v
     }
 
+    /// Argument values at a call for the parameter locations of `lay`.
+    fn layout_args(&mut self, st: &mut St, lay: &Layout) -> Vec<Expr> {
+        let mut a2 = vec![];
+        for p in &lay.params {
+            match p {
+                ArgLoc::Gpr(r) => a2.push(self.get(st, gpr(*r))),
+                ArgLoc::Fpr(r) => a2.push(self.get(st, fpr(*r))),
+                ArgLoc::GprPair(r) => {
+                    let p = crate::wide::pair(self.get(st, gpr(*r)), self.get(st, gpr(*r + 1)), true, &self.vars);
+                    a2.push(p)
+                }
+                ArgLoc::Stack => a2.push(Expr::Unknown { text: "stack arg".into(), ty: t_unk(4) }),
+            }
+        }
+        a2
+    }
+
     fn do_vcall(&mut self, st: &mut St, k: usize) {
         let ctr = self.get(st, CTR);
         // look through temps: ctr = Load(Load(obj, vptr_off), slot)
@@ -2132,6 +2268,12 @@ impl<'a> Lifter<'a> {
                 if obj != this && !args.is_empty() && args[0] == obj {
                     // sret: r3 is the destination
                     args.remove(0);
+                    if let Some(s) = &vsig {
+                        // the parameters follow the result and `this` (r5..), whether or not
+                        // this function set them up (forwarded incoming parameters)
+                        args = self.layout_args(st, &layout(s, true, true, self.db));
+                        self.type_scalar_out_args(&args, s);
+                    }
                     let call = Expr::Call { callee, args, ret: ret.clone() };
                     let lv = match this {
                         Expr::AddrOf(inner) => *inner,
@@ -2143,20 +2285,7 @@ impl<'a> Lifter<'a> {
                 }
                 if let Some(s) = &vsig {
                     // trim args to the signature's arity
-                    let lay = layout(s, true, false, self.db);
-                    let mut a2 = vec![];
-                    for p in &lay.params {
-                        match p {
-                            ArgLoc::Gpr(r) => a2.push(self.get(st, gpr(*r))),
-                            ArgLoc::Fpr(r) => a2.push(self.get(st, fpr(*r))),
-                            ArgLoc::GprPair(r) => {
-                                let p = crate::wide::pair(self.get(st, gpr(*r)), self.get(st, gpr(*r + 1)), true, &self.vars);
-                                a2.push(p)
-                            }
-                            ArgLoc::Stack => a2.push(Expr::Unknown { text: "stack arg".into(), ty: t_unk(4) }),
-                        }
-                    }
-                    args = a2;
+                    args = self.layout_args(st, &layout(s, true, false, self.db));
                     self.type_scalar_out_args(&args, s);
                     if self.deleting_dtor_call(st, k, s) {
                         args.push(Expr::int(1));
@@ -2694,10 +2823,10 @@ impl<'a> Lifter<'a> {
                         Nand => bitnot(arith(BinOp::And, s, b, &self.vars), &self.vars),
                         Eqv => bitnot(arith(BinOp::Xor, s, b, &self.vars), &self.vars),
                         Slw => arith(BinOp::Shl, s, b, &self.vars),
-                        Srw => arith(BinOp::Shr, as_unsigned(s, &self.vars), b, &self.vars),
+                        Srw => shr_kind(arith(BinOp::Shr, as_unsigned(s, &self.vars), b, &self.vars), false),
                         _ => {
                             st.ca = Ca::Unknown;
-                            arith(BinOp::Shr, as_signed(s, &self.vars), b, &self.vars)
+                            shr_kind(arith(BinOp::Shr, as_signed(s, &self.vars), b, &self.vars), true)
                         }
                     }
                 };
@@ -2730,7 +2859,7 @@ impl<'a> Lifter<'a> {
                 let s = self.get(st, gpr(i.rs()));
                 let n = ins.field_sh();
                 st.ca = Ca::Srawi(s.clone(), n);
-                let v = arith(BinOp::Shr, as_signed(s, &self.vars), Expr::int(n as i64), &self.vars);
+                let v = shr_kind(arith(BinOp::Shr, as_signed(s, &self.vars), Expr::int(n as i64), &self.vars), true);
                 self.def(st, k, gpr(i.ra()), v);
                 if i.rc() {
                     self.record(st, k, gpr(i.ra()));
@@ -3233,6 +3362,15 @@ fn int_ty(e: &Expr, vars: &[Var]) -> Type {
         Type::Unknown { .. } | Type::Ptr(_) | Type::Ref(_) => t_s32(),
         Type::Int { signed, .. } => t_int(4, *signed),
         _ => t_s32(),
+    }
+}
+
+/// The shift kind is the type of a right shift (`srw` unsigned, `sraw`/`srawi` signed); a narrow
+/// operand promotes to `int`, so the emitter converts it when that disagrees.
+fn shr_kind(e: Expr, signed: bool) -> Expr {
+    match e {
+        Expr::Binary { op: BinOp::Shr, l, r, .. } => Expr::Binary { op: BinOp::Shr, l, r, ty: t_int(4, signed) },
+        e => e,
     }
 }
 

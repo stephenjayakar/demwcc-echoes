@@ -153,6 +153,111 @@ fn write_value(l: &Expr, y: &Expr, shift: u8, width: u8, vars: &[Var], db: &Type
 }
 
 pub fn recover(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
+    forward_unit_temps(body, vars, db);
+    recover_in(body, vars, db);
+}
+
+/// A storage unit loaded once into a temp, tested and written back (`if (mDirty) { mDirty =
+/// false; ...}`: MWCC keeps the loaded byte for the read-modify-write): the temp's uses in the
+/// following test and the statements before any call or other store read the unit itself, when
+/// every one of them then is a bitfield access.
+fn forward_unit_temps(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
+    let mut ndefs: std::collections::HashMap<VarId, usize> = Default::default();
+    let mut uses: std::collections::HashMap<VarId, usize> = Default::default();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), .. } = s {
+                *ndefs.entry(*v).or_default() += 1;
+            }
+        }
+    });
+    crate::inline::count_uses(body, &mut uses);
+    fn subst(e: &mut Expr, t: VarId, unit: &Expr, n: &mut usize) {
+        e.rewrite(&mut |x| {
+            if matches!(x, Expr::Var(v) if *v == t) {
+                *x = unit.clone();
+                *n += 1;
+            }
+        });
+    }
+    fn has_call(s: &Stmt) -> bool {
+        let mut c = false;
+        Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+            if matches!(e, Expr::Call { .. } | Expr::New { .. }) {
+                c = true;
+            }
+        });
+        c
+    }
+    // statements of a block evaluated before anything could change the unit: plain variable
+    // assignments, then at most the unit's own write-back
+    fn prefix(b: &mut [Stmt], t: VarId, unit: &Expr, n: &mut usize) {
+        for s in b.iter_mut() {
+            if has_call(s) {
+                return;
+            }
+            match s {
+                Stmt::Assign { dst: Expr::Var(_), src } => subst(src, t, unit, n),
+                Stmt::Assign { dst, src } if dst == unit => {
+                    subst(src, t, unit, n);
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+    let raw_left = |s: &Stmt, unit: &Expr| -> bool {
+        let mut all = 0;
+        let mut ok = 0;
+        Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+            if e == unit {
+                all += 1;
+            }
+            if let Expr::BitField { base, .. } = e {
+                if **base == *unit {
+                    ok += 1;
+                }
+            }
+        });
+        all != ok
+    };
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let (t, unit) = match &b[i] {
+                Stmt::Assign { dst: Expr::Var(t), src } if matches!(vars[*t].kind, VarKind::Local) && ndefs.get(t) == Some(&1) && unit_of(src, vars, db).is_some() && !src.has_call() => (*t, src.clone()),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let mut next = b[i + 1].clone();
+            let mut n = 0;
+            match &mut next {
+                Stmt::If { cond, then, els } => {
+                    subst(cond, t, &unit, &mut n);
+                    prefix(then, t, &unit, &mut n);
+                    prefix(els, t, &unit, &mut n);
+                }
+                _ => {}
+            }
+            if n == 0 || n != uses.get(&t).copied().unwrap_or(0) {
+                i += 1;
+                continue;
+            }
+            let mut v = vec![next];
+            recover_in(&mut v, vars, db);
+            if raw_left(&v[0], &unit) {
+                i += 1;
+                continue;
+            }
+            b[i + 1] = v.pop().unwrap();
+            b.remove(i);
+        }
+    });
+}
+
+fn recover_in(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
     // writes
     Stmt::for_each_block_mut(body, &mut |b| {
         for s in b.iter_mut() {
