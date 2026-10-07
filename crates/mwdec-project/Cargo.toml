@@ -1,0 +1,12 @@
+[package]
+name = "mwdec-project"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mwdec-core.workspace = true
+mwdec-obj.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true

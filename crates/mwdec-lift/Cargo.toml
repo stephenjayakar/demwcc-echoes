@@ -1,0 +1,12 @@
+[package]
+name = "mwdec-lift"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mwdec-core.workspace = true
+mwdec-obj.workspace = true
+anyhow.workspace = true
+ppc750cl.workspace = true
+cwdemangle.workspace = true
+mwdec-ctx.workspace = true

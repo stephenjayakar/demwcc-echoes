@@ -1,0 +1,14 @@
+[package]
+name = "mwdec-oracle"
+version.workspace = true
+edition.workspace = true
+description = "MWCC experiment harness: compile snippets with project flags, disassemble, diff variants; regalloc predictor prototype"
+
+[dependencies]
+mwdec-core.workspace = true
+anyhow.workspace = true
+object.workspace = true
+ppc750cl.workspace = true
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true

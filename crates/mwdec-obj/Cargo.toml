@@ -1,0 +1,10 @@
+[package]
+name = "mwdec-obj"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mwdec-core.workspace = true
+anyhow.workspace = true
+object.workspace = true
+ppc750cl.workspace = true

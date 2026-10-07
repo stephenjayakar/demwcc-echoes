@@ -1,0 +1,17 @@
+[package]
+name = "mwdec-search"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mwdec-core.workspace = true
+mwdec-mwcc.workspace = true
+mwdec-obj.workspace = true
+mwdec-project.workspace = true
+mwdec-oracle = { path = "../mwdec-oracle" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ppc750cl.workspace = true
+tree-sitter = "0.25"
+tree-sitter-cpp = "0.23"

@@ -1,0 +1,322 @@
+//! Object-valued templates on groups of member-wise stores: `d.x = a.x - b.x; d.y = ...;`
+//! becomes `d = a - b;`, `p->x += v.x; ...` becomes `*p += v;`.
+
+use crate::addr::{access, lvalue_addr, object_at};
+use crate::matcher::{res, teq, Bind, Env, Index, M};
+use crate::template::{flat_fields, HoleKind, Shape};
+use crate::util::*;
+use mwdec_core::Type;
+use mwdec_lift::types::ty_of;
+use mwdec_lift::{Expr, Stmt};
+
+#[derive(Clone, Debug)]
+struct CStore {
+    stmt: usize,
+    /// canonical pointer to the stored object and byte offset
+    addr: Expr,
+    off: i32,
+    ty: Type,
+    src: Expr,
+}
+
+fn scalar_vc(t: &Type) -> bool {
+    matches!(strip(t), Type::Float { .. } | Type::Int { .. } | Type::Long { .. } | Type::Char | Type::Bool | Type::WChar | Type::Ptr(_) | Type::Unknown { size: 1 | 2 | 4 | 8 })
+}
+
+fn store_size(t: &Type) -> u32 {
+    mwdec_lift::scalar_size(t).unwrap_or(4)
+}
+
+/// Word-wise copies of a whole object (`lwz/stw` block moves of a class with class members or
+/// arrays, POD copy-construction) become one assignment `dst = src`.
+fn try_copy(b: &[Stmt], start: usize, end: usize, stores: &[CStore], env: &Env) -> Option<(Vec<Stmt>, usize)> {
+    for anchor in stores {
+        let Some((sp, so)) = access(res(&anchor.src, env.defs), env) else { continue };
+        let dsrc = so - anchor.off;
+        for (fo, cls, size) in crate::addr::aggregates_containing(&anchor.addr, anchor.off, env) {
+            if size < 8 {
+                continue;
+            }
+            let lo = fo;
+            let hi = fo + size as i32;
+            let mut pick: Vec<&CStore> = stores.iter().filter(|s| s.off >= lo && s.off < hi && teq(&s.addr, &anchor.addr, env.defs)).collect();
+            pick.sort_by_key(|s| s.off);
+            // exact tiling of the object, every piece copied from the same source layout
+            let mut cur = lo;
+            let mut ok = true;
+            for s in &pick {
+                if s.off != cur {
+                    ok = false;
+                    break;
+                }
+                cur += store_size(&s.ty) as i32;
+                match access(res(&s.src, env.defs), env) {
+                    Some((p2, o2)) if o2 - s.off == dsrc && teq(&p2, &sp, env.defs) && store_size(&s.ty) == mwdec_lift::scalar_size(&mwdec_lift::types::ty_of(res(&s.src, env.defs), env.vars)).unwrap_or(store_size(&s.ty)) => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || cur != hi || pick.len() < 2 {
+                continue;
+            }
+            // already member-wise float copies of a small class are handled by the lifter
+            let Some((_, dlv)) = object_at(&anchor.addr, lo, &cls, env) else { continue };
+            let Some((_, slv)) = object_at(&sp, lo + dsrc, &cls, env) else { continue };
+            let mut stmts: Vec<usize> = pick.iter().map(|s| s.stmt).collect();
+            stmts.sort_unstable();
+            stmts.dedup();
+            let covered = stmts.iter().all(|&si| stores.iter().filter(|s| s.stmt == si).all(|s| pick.iter().any(|p| p.stmt == s.stmt && p.off == s.off)));
+            if !covered || stmts.len() < 2 {
+                // (a single statement is already an object assignment)
+                continue;
+            }
+            let first = *stmts.first().unwrap();
+            let last = *stmts.last().unwrap();
+            let bad = (first..=last).filter(|k| !stmts.contains(k)).any(|k| {
+                let pure_local = matches!(&b[k], Stmt::Assign { dst: Expr::Var(_), src } if !src.has_call());
+                touches(&b[k], &anchor.addr, lo, hi, env) || (!pure_local && touches(&b[k], &sp, lo + dsrc, hi + dsrc, env))
+            });
+            if bad {
+                continue;
+            }
+            let new_stmt = Stmt::Assign { dst: dlv, src: slv };
+            let mut out = vec![];
+            for k in start..end {
+                if k == first {
+                    out.push(new_stmt.clone());
+                }
+                if !stmts.contains(&k) {
+                    out.push(b[k].clone());
+                }
+            }
+            return Some((out, first));
+        }
+    }
+    None
+}
+
+/// Component stores of one statement.
+fn stores_of(i: usize, s: &Stmt, env: &Env) -> Vec<CStore> {
+    let Stmt::Assign { dst, src } = s else { return vec![] };
+    if src.has_call() {
+        return vec![];
+    }
+    let dty = ty_of(dst, env.vars);
+    if scalar_vc(&dty) || mwdec_lift::types::is_enum(Some(env.db), &dty) {
+        if matches!(dst, Expr::Var(_)) {
+            return vec![];
+        }
+        if let Some((p, o)) = access(dst, env) {
+            return vec![CStore { stmt: i, addr: p, off: o, ty: dty, src: src.clone() }];
+        }
+        return vec![];
+    }
+    // object copy: expand into components
+    let Some(cls) = class_name(&dty, env.db) else { return vec![] };
+    let Some(fields) = flat_fields(env.db, &cls) else { return vec![] };
+    let Some((dp, doff)) = lvalue_addr(dst, env) else { return vec![] };
+    let Some((sp, soff)) = lvalue_addr(res(src, env.defs), env) else { return vec![] };
+    fields
+        .iter()
+        .map(|(o, t)| CStore { stmt: i, addr: dp.clone(), off: doff + o, ty: t.clone(), src: Expr::Load { base: Box::new(sp.clone()), offset: soff + o, ty: t.clone() } })
+        .collect()
+}
+
+fn is_barrier(s: &Stmt) -> bool {
+    match s {
+        Stmt::Assign { src, dst } => src.has_call() || dst.has_call(),
+        Stmt::Comment(_) => false,
+        _ => true,
+    }
+}
+
+/// Does `s` access (read or write) `[lo, hi)` of the object at `addr`?
+fn touches(s: &Stmt, addr: &Expr, lo: i32, hi: i32, env: &Env) -> bool {
+    let mut hit = false;
+    Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+        if hit {
+            return;
+        }
+        if let Some((p, o)) = access(e, env) {
+            if o < hi && o + 4 > lo && teq(&p, addr, env.defs) {
+                hit = true;
+            }
+        }
+        if let (Expr::Var(v), Expr::AddrOf(x)) = (e, addr) {
+            if matches!(&**x, Expr::Var(w) if w == v) {
+                // the whole object read/written as a value
+                hit = true;
+            }
+        }
+    });
+    hit
+}
+
+pub fn rewrite_groups(b: &mut Vec<Stmt>, env: &Env, idx: &Index) -> usize {
+    let mut n = 0;
+    let mut start = 0;
+    while start < b.len() {
+        // segment [start, end)
+        let mut end = start;
+        while end < b.len() && !is_barrier(&b[end]) {
+            end += 1;
+        }
+        if end > start {
+            if let Some((new, rm_lo)) = try_segment(b, start, end, env, idx) {
+                // replace: new statement list for the segment
+                let tail: Vec<Stmt> = b.drain(start..end).collect();
+                let _ = tail;
+                for (k, s) in new.into_iter().enumerate() {
+                    b.insert(start + k, s);
+                }
+                let _ = rm_lo;
+                n += 1;
+                continue; // retry the same segment
+            }
+        }
+        start = end + 1;
+    }
+    n
+}
+
+/// Find one rewritable group in `b[start..end]`; returns the rewritten segment.
+fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> Option<(Vec<Stmt>, usize)> {
+    let mut stores: Vec<CStore> = vec![];
+    for i in start..end {
+        stores.extend(stores_of(i, &b[i], env));
+    }
+    if stores.is_empty() {
+        return None;
+    }
+    if let Some(r) = try_copy(b, start, end, &stores, env) {
+        return Some(r);
+    }
+    let mut best: Option<(i32, Vec<Stmt>, usize)> = None;
+    for &ti in &idx.groups {
+        let t = &env.lib.templates[ti];
+        let (comps, mutate, cls) = match &t.shape {
+            Shape::Object { class, comps } => (comps, None, class.clone()),
+            Shape::Mutate { hole, comps } => match &t.holes[*hole] {
+                HoleKind::Obj { class, .. } => (comps, Some(*hole), class.clone()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let min_off = comps.iter().map(|c| c.off).min()?;
+        let max_end = comps.iter().map(|c| c.off + 4).max()?;
+        let first = comps.iter().find(|c| c.off == min_off)?;
+        for anchor in stores.iter().filter(|s| scalar_compat(&s.ty, &first.ty)) {
+            let delta = anchor.off - first.off;
+            // window: between the neighbouring stores to the anchor's own location
+            let same_loc = |s: &CStore| s.off == anchor.off && teq(&s.addr, &anchor.addr, env.defs);
+            let wlo = stores.iter().filter(|s| s.stmt < anchor.stmt && same_loc(s)).map(|s| s.stmt + 1).max().unwrap_or(0);
+            let whi = stores.iter().filter(|s| s.stmt > anchor.stmt && same_loc(s)).map(|s| s.stmt).min().unwrap_or(usize::MAX);
+            // every component stored exactly once in the segment, same base
+            let mut pick: Vec<&CStore> = vec![];
+            let mut ok = true;
+            for c in comps {
+                let cands: Vec<&CStore> = stores.iter().filter(|s| s.stmt >= wlo && s.stmt < whi && s.off == delta + c.off && scalar_compat(&s.ty, &c.ty) && teq(&s.addr, &anchor.addr, env.defs)).collect();
+                if cands.len() != 1 {
+                    ok = false;
+                    break;
+                }
+                pick.push(cands[0]);
+            }
+            if !ok {
+                continue;
+            }
+            // statements covered must be covered entirely (object copies expand to several)
+            let mut stmts: Vec<usize> = pick.iter().map(|s| s.stmt).collect();
+            stmts.sort_unstable();
+            stmts.dedup();
+            let covered = stmts.iter().all(|&si| stores.iter().filter(|s| s.stmt == si).all(|s| pick.iter().any(|p| p.stmt == s.stmt && p.off == s.off)));
+            if !covered {
+                continue;
+            }
+            if t.ops == 0 && is_copy(&pick, env) {
+                // a plain member-wise copy stays an assignment
+                continue;
+            }
+            if matches!(t.kind, crate::probe::CallKind::Ctor) && t.ops == 0 {
+                // constructor fallback: only for consecutive stores of a class whose members
+                // the function couldn't name anyway (or a stack temporary)
+                let mut ss: Vec<usize> = pick.iter().map(|s| s.stmt).collect();
+                ss.sort_unstable();
+                ss.dedup();
+                let consecutive = ss.windows(2).all(|w| w[1] == w[0] + 1);
+                let stack_dst = matches!(&anchor.addr, Expr::AddrOf(x) if matches!(&**x, Expr::Var(_)));
+                let hidden = mwdec_lift::sig::find_class(env.db, &cls).map_or(false, |c| c.fields.iter().any(|f| f.access != mwdec_core::Access::Public));
+                if !consecutive || !(stack_dst || hidden) {
+                    continue;
+                }
+            }
+            let Some((addr, lv)) = object_at(&anchor.addr, delta, &cls, env) else { continue };
+            let mut m = M::new(env, t);
+            if let Some(h) = mutate {
+                m.b[h] = Some(Bind::Val(addr.clone()));
+            }
+            let mut ok = true;
+            for (c, s) in comps.iter().zip(&pick) {
+                if !m.m(&c.pat, &s.src) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let Some((args, extra)) = m.finalize(0) else { continue };
+            let score = crate::matcher::use_score(t, extra, false, &args);
+            // intervening statements must not touch the destination
+            let lo = *stmts.first().unwrap();
+            let hi = *stmts.last().unwrap();
+            let bad = (lo..=hi).filter(|k| !stmts.contains(k)).any(|k| touches(&b[k], &anchor.addr, delta + min_off, delta + max_end, env));
+            if bad {
+                continue;
+            }
+            // the sources must not read the destination before all stores are done (aliasing
+            // reads of the object being written are fine only for mutators)
+            let call = crate::matcher::make_call(t, args);
+            let new_stmt = if mutate.is_some() { Stmt::Expr(call) } else { Stmt::Assign { dst: lv, src: call } };
+            let mut out = vec![];
+            for k in start..end {
+                if k == lo {
+                    out.push(new_stmt.clone());
+                }
+                if !stmts.contains(&k) {
+                    out.push(b[k].clone());
+                }
+            }
+            if best.as_ref().map_or(true, |(b, _, _)| score > *b) {
+                best = Some((score, out, lo));
+            }
+        }
+    }
+    best.map(|(_, o, l)| (o, l))
+}
+
+/// Are the stored values the same-layout components of one other object (a copy)?
+fn is_copy(pick: &[&CStore], env: &Env) -> bool {
+    let mut base: Option<(Expr, i32)> = None;
+    for s in pick {
+        let Some((p, o)) = access(res(&s.src, env.defs), env) else { return false };
+        let d = o - s.off;
+        match &base {
+            None => base = Some((p, d)),
+            Some((p0, d0)) => {
+                if *d0 != d || !teq(p0, &p, env.defs) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn scalar_compat(a: &Type, b: &Type) -> bool {
+    let fa = matches!(strip(a), Type::Float { .. });
+    let fb = matches!(strip(b), Type::Float { .. });
+    fa == fb && mwdec_lift::scalar_size(a).unwrap_or(4) == mwdec_lift::scalar_size(b).unwrap_or(4)
+}

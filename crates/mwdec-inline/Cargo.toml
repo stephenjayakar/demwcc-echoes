@@ -1,0 +1,18 @@
+[package]
+name = "mwdec-inline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mwdec-core.workspace = true
+mwdec-obj.workspace = true
+mwdec-lift.workspace = true
+mwdec-mwcc.workspace = true
+mwdec-ctx.workspace = true
+mwdec-project.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+mwdec-emit.workspace = true

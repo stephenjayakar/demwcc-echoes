@@ -1,0 +1,9 @@
+[package]
+name = "mwdec-mwcc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mwdec-core.workspace = true
+mwdec-obj.workspace = true
+anyhow.workspace = true
