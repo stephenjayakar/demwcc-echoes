@@ -26,6 +26,10 @@ fn mentions(s: &Stmt, v: VarId) -> usize {
     n
 }
 
+pub fn is_folded_value(e: &Expr) -> bool {
+    folded_value(e)
+}
+
 /// A value our pass produced: a folded inline call or constructor (no side effects).
 fn folded_value(e: &Expr) -> bool {
     match e {
@@ -54,17 +58,27 @@ fn replace_arg(e: &mut Expr, v: VarId, with: &Expr, only_folded: bool) -> usize 
         _ => false,
     };
     e.rewrite(&mut |x| {
-        let (args, sig) = match x {
-            Expr::Call { args, callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } => (args, Some(sig.clone())),
-            Expr::Construct { args, ctor, .. } => (args, ctor.clone()),
-            Expr::New { args, ctor, .. } => (args, ctor.clone()),
-            Expr::Call { args, .. } => (args, None),
+        let sig = match &*x {
+            Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } => Some(sig.clone()),
+            Expr::Construct { ctor, .. } | Expr::New { ctor, .. } => ctor.clone(),
+            Expr::Call { .. } => None,
             _ => return,
         };
         // (a stack object built by a real constructor call moves only into folded inlines)
         if only_folded && !sig.as_ref().is_some_and(|s| s.mangled.is_none()) {
             return;
         }
+        // the object of a const member function call: `(a - b).MagSquared()`
+        if let (false, Expr::Call { callee: Callee::Method { this, sig: msig, .. }, .. }) = (only_folded, &mut *x) {
+            if msig.is_const && matches!(&**this, Expr::AddrOf(y) if matches!(&**y, Expr::Var(w) if *w == v)) {
+                *this = Box::new(Expr::AddrOf(Box::new(with.clone())));
+                n += 1;
+            }
+        }
+        let args = match x {
+            Expr::Call { args, .. } | Expr::Construct { args, .. } | Expr::New { args, .. } => args,
+            _ => return,
+        };
         for (k, a) in args.iter_mut().enumerate() {
             // only where the parameter takes the object itself (reference or by value), not
             // its address
@@ -94,9 +108,16 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
         while i < b.len() {
             let (v, val, only_folded) = match &b[i] {
                 Stmt::Assign { dst: Expr::Var(v), src }
-                    if matches!(vars[*v].kind, VarKind::Stack { .. }) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && folded_value(src) && counts.get(v) == Some(&2) =>
+                    if matches!(vars[*v].kind, VarKind::Stack { .. } | VarKind::Local) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && folded_value(src) && counts.get(v) == Some(&2) =>
                 {
                     (*v, src.clone(), false)
+                }
+                // a stack object holding a real call's by-value result, passed on once into a
+                // folded inline (`Deltas(Lerp(..), Slerp(..))`)
+                Stmt::Assign { dst: Expr::Var(v), src: src @ Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. } | Callee::Virtual { sig: Some(sig), .. }, .. } }
+                    if sig.mangled.is_some() && matches!(vars[*v].kind, VarKind::Stack { .. }) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && counts.get(v) == Some(&2) =>
+                {
+                    (*v, src.clone(), true)
                 }
                 // a stack object built by a constructor call, passed on once (`X(CAABox(a, b))`)
                 Stmt::Expr(Expr::Call { callee: Callee::Method { symbol, sig, this, .. }, args, .. })

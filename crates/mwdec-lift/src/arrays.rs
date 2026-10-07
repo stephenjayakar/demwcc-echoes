@@ -353,6 +353,42 @@ pub fn recover(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) {
             }
         });
         defs.retain(|v, _| n.get(v) == Some(&1));
+        // an index computed before one of its variables is reassigned (`t = i * 36; i++;
+        // a[t]`) can't be re-read at its use
+        let mut stale: Vec<VarId> = vec![];
+        Stmt::for_each_block_mut(body, &mut |b| {
+            for (k, s) in b.iter().enumerate() {
+                let Stmt::Assign { dst: Expr::Var(t), src } = s else { continue };
+                if !defs.contains_key(t) {
+                    continue;
+                }
+                let reassigned = b[k + 1..].iter().any(|x| {
+                    let mut hit = false;
+                    fn walk(x: &Stmt, src: &Expr, hit: &mut bool) {
+                        match x {
+                            Stmt::Assign { dst: Expr::Var(w), .. } if src.uses_var(*w) => *hit = true,
+                            Stmt::If { then, els, .. } => {
+                                then.iter().for_each(|y| walk(y, src, hit));
+                                els.iter().for_each(|y| walk(y, src, hit));
+                            }
+                            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => body.iter().for_each(|y| walk(y, src, hit)),
+                            _ => {}
+                        }
+                    }
+                    walk(x, src, &mut hit);
+                    if let Stmt::Expr(e) | Stmt::Assign { src: e, .. } = x {
+                        e.walk(&mut |y| if let Expr::IncDec { e: z, .. } = y { if let Expr::Var(w) = &**z { if src.uses_var(*w) { hit = true; } } });
+                    }
+                    hit
+                });
+                if reassigned {
+                    stale.push(*t);
+                }
+            }
+        });
+        for t in stale {
+            defs.remove(&t);
+        }
     }
     forward_address_temps(body, vars, db, &defs);
     type_indexed_globals(body, vars, db, &defs);
@@ -537,13 +573,10 @@ pub(crate) fn type_indexed_globals(body: &mut Vec<Stmt>, vars: &[Var], db: Optio
     Stmt::walk_exprs(body, &mut |e| {
         // an element-indexed untyped global (`g[i]` from scaled indexed loads)
         if let Expr::Index { base, ty, .. } = e {
-            // (the address of the global: a bare global base is its pointer value)
+            // (the address of the global: a bare global base is its pointer value; a cast one
+            // is the byte arithmetic of an address computation)
             let g = match &**base {
                 Expr::AddrOf(g) => Some(&**g),
-                Expr::Cast { e: x, .. } => match &**x {
-                    Expr::AddrOf(g) => Some(&**g),
-                    _ => None,
-                },
                 _ => None,
             };
             if let Some(g @ Expr::Global { symbol, ty: Type::Unknown { size } }) = g {
@@ -568,10 +601,56 @@ pub(crate) fn type_indexed_globals(body: &mut Vec<Stmt>, vars: &[Var], db: Optio
         a.size = size;
         match split_index(&idx, vars, db) {
             Some((_, esz, k)) if scalar_size(ty).map_or(false, |s| s > 0) => a.indexed.push((esz, addend + *offset as i64 + k, ty.clone())),
+            // a byte element indexed by a plain integer
+            None if scalar_size(ty) == Some(1) && idx.as_int().is_none() && !is_ptr(&types::ty_of(&idx, vars)) => a.indexed.push((1, addend + *offset as i64, ty.clone())),
             _ => a.bad = true,
         }
         handled.push(&**base as *const Expr);
     });
+    // an element address kept in a temp that is only dereferenced whole (`t = &g[i]; .. *t ..
+    // *t`: the compiler's shared address of two `g[i]` reads)
+    {
+        let mut uses: HashMap<VarId, Vec<(i32, Type)>> = HashMap::new();
+        let mut mentions: HashMap<VarId, usize> = HashMap::new();
+        let mut ndefs: HashMap<VarId, usize> = HashMap::new();
+        Stmt::walk_exprs(body, &mut |e| {
+            if let Expr::Var(v) = e {
+                *mentions.entry(*v).or_default() += 1;
+            }
+            if let Expr::Load { base, offset, ty } = e {
+                if let Expr::Var(v) = **base {
+                    uses.entry(v).or_default().push((*offset, ty.clone()));
+                }
+            }
+        });
+        let mut pairs: Vec<(&Expr, &Expr)> = vec![];
+        assigns(body, &mut pairs);
+        for (d, _) in &pairs {
+            if let Expr::Var(v) = d {
+                *ndefs.entry(*v).or_default() += 1;
+            }
+        }
+        for (d, src) in &pairs {
+            let Expr::Var(t) = d else { continue };
+            if !matches!(vars[*t].kind, VarKind::Local) || ndefs.get(t) != Some(&1) {
+                continue;
+            }
+            let Some((p, idx)) = byte_sum(src, vars) else { continue };
+            let Some((sym, size, addend)) = global_of(&p) else { continue };
+            let Some((_, esz, k)) = split_index(&idx, vars, db) else { continue };
+            let us = uses.get(t).cloned().unwrap_or_default();
+            // (the def itself mentions the temp once as its destination)
+            if us.is_empty() || us.len() + 1 != mentions.get(t).copied().unwrap_or(0) || !us.iter().all(|(o, ty)| *o == 0 && scalar_size(ty) == Some(esz)) {
+                continue;
+            }
+            let a = acc.entry(sym).or_default();
+            a.size = size;
+            for (_, ty) in &us {
+                a.indexed.push((esz, addend + k, ty.clone()));
+            }
+            handled.push(*src as *const Expr);
+        }
+    }
     if acc.is_empty() {
         return;
     }
@@ -650,14 +729,11 @@ pub(crate) fn type_indexed_globals(body: &mut Vec<Stmt>, vars: &[Var], db: Optio
                 *ty = t.clone();
             }
         }
-        // `(&g)[i]` -> `g[i]` (the array itself)
+        // `(&g)[i]` -> `g[i]` (the array itself; a cast base is byte arithmetic, left to the
+        // element recovery)
         if let Expr::Index { base, .. } = e {
             let inner = match &**base {
                 Expr::AddrOf(g) => Some((**g).clone()),
-                Expr::Cast { e: x, .. } => match &**x {
-                    Expr::AddrOf(g) => Some((**g).clone()),
-                    _ => None,
-                },
                 _ => None,
             };
             if let Some(g @ Expr::Global { .. }) = inner {
@@ -919,4 +995,83 @@ fn template_count(cls: &str) -> Option<u32> {
     let lt = cls.find('<')?;
     let args = crate::sig::split_top(&cls[lt + 1..cls.len().checked_sub(1)?], ',');
     args.last()?.trim().parse().ok()
+}
+
+fn assigns<'a>(b: &'a [Stmt], out: &mut Vec<(&'a Expr, &'a Expr)>) {
+    for s in b {
+        match s {
+            Stmt::Assign { dst, src } => out.push((dst, src)),
+            Stmt::If { then, els, .. } => {
+                assigns(then, out);
+                assigns(els, out);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => assigns(body, out),
+            Stmt::For { init, step, body, .. } => {
+                assigns(init, out);
+                assigns(step, out);
+                assigns(body, out);
+            }
+            Stmt::Switch { cases, .. } => {
+                for c in cases {
+                    assigns(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Accesses at constant addresses inside a variable the context declares at an absolute address
+/// (hardware register arrays, `vu16 __DSPRegs[32] : 0xCC005000;`) are elements of it:
+/// `__DSPRegs[3]` (the compiler then materializes the array's base and indexes from it).
+pub fn absolute_globals(body: &mut Vec<Stmt>, db: &TypeDb) {
+    if db.abs_addrs.is_empty() {
+        return;
+    }
+    // (name, start, element type, element size, count)
+    let mut regions: Vec<(String, u32, Type, u32, u32)> = vec![];
+    // (name, start, type, size) of aggregates (`PPCWGPipe GXWGFifo : 0xCC008000;`)
+    let mut objects: Vec<(String, u32, Type, u32)> = vec![];
+    for (n, a) in &db.abs_addrs {
+        let Some((_, t)) = db.globals.get(n).or_else(|| db.globals.values().find(|(q, _)| q == n)) else { continue };
+        let r = types::resolve(Some(db), t).into_owned();
+        if let Type::Array(e, cnt) = strip_cv(&r) {
+            if let Some(es) = types::size_of(Some(db), e).filter(|s| matches!(s, 1 | 2 | 4)) {
+                regions.push((n.clone(), *a, (**e).clone(), es, *cnt));
+            }
+        } else if types::is_aggregate(Some(db), &r) {
+            if let Some(s) = types::size_of(Some(db), &r).filter(|s| *s > 0) {
+                objects.push((n.clone(), *a, t.clone(), s));
+            }
+        }
+    }
+    if regions.is_empty() && objects.is_empty() {
+        return;
+    }
+    fn konst(e: &Expr) -> Option<u32> {
+        match e {
+            Expr::Int { value, .. } => Some(*value as u32),
+            Expr::Cast { e, .. } => konst(e),
+            _ => None,
+        }
+    }
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Load { base, offset, ty } = e else { return };
+        let Some(k) = konst(base) else { return };
+        let a = k.wrapping_add(*offset as u32);
+        for (n, start, et, es, cnt) in &regions {
+            let end = start.wrapping_add(es * cnt);
+            if a >= *start && a < end && (a - start) % es == 0 && scalar_size(ty) == Some(*es) {
+                let arr = Type::Array(Box::new(et.clone()), *cnt);
+                *e = Expr::Index { base: Box::new(Expr::Global { symbol: n.clone(), ty: arr }), index: Box::new(Expr::int(((a - start) / es) as i64)), ty: et.clone() };
+                return;
+            }
+        }
+        for (n, start, t, s) in &objects {
+            if a >= *start && a < start.wrapping_add(*s) && scalar_size(ty).is_some() {
+                *e = Expr::Member { base: Box::new(Expr::Global { symbol: n.clone(), ty: t.clone() }), offset: (a - start) as i32, ty: ty.clone() };
+                return;
+            }
+        }
+    });
 }

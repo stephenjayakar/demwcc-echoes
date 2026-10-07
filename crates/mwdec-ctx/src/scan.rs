@@ -176,6 +176,8 @@ pub struct ScanResult {
     pub friends: Vec<(String, String)>,
     /// (class template, field name, declared type tokens, access) for data members of templates
     pub template_fields: Vec<(String, String, Vec<String>, mwdec_core::Access)>,
+    /// namespace-scope variables declared at an absolute address (`T name[N] : 0xCC005000;`)
+    pub abs_addrs: Vec<(String, u32)>,
 }
 
 const SPECIFIERS: &[&str] = &["virtual", "static", "inline", "explicit", "extern", "friend", "mutable", "register", "__inline", "__declspec"];
@@ -687,6 +689,17 @@ impl<'t> Scanner<'t> {
                 }
             } else if scope != "@anon" && !decl.iter().any(|t| t.is("operator")) {
                 self.out.globals.push(qual(scope, &name));
+                // `T name[N] : 0xADDR` (CodeWarrior absolute-address variable)
+                if let Some(c) = toks.iter().position(|w| w == ":") {
+                    let lit = toks.get(c + 1).map(|s| s.trim_end_matches(|ch: char| matches!(ch, 'u' | 'U' | 'l' | 'L')));
+                    let addr = lit.and_then(|s| match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                        Some(h) => u32::from_str_radix(h, 16).ok(),
+                        None => s.parse::<u32>().ok(),
+                    });
+                    if let (Some(a), true) = (addr, toks.len() == c + 2) {
+                        self.out.abs_addrs.push((qual(scope, &name), a));
+                    }
+                }
             }
         }
     }

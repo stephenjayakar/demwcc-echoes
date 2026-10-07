@@ -100,6 +100,12 @@ fn names_class(t: &Type, cls: &str) -> bool {
 pub fn standalone(sig: &FuncSig, db: &TypeDb) -> Standalone {
     let q = &sig.qualified_name;
     let np = sig.params.len();
+    // `this`-adjusting thunks of virtual overrides reached through a secondary base
+    // (`@4@Method__5CFooFv`): generated with the override
+    let thunk = |s: &str| s.strip_prefix('@').is_some_and(|r| r.split('@').next().is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit())));
+    if sig.mangled.as_deref().is_some_and(thunk) || thunk(split_scope(q).1) {
+        return Standalone::Implicit("thunk");
+    }
     if db.decls.get(q).is_some_and(|v| v.iter().any(|d| d.is_inline_defined && d.params.len() == np)) {
         return Standalone::HeaderInline;
     }

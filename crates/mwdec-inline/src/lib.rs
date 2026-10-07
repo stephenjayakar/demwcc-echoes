@@ -43,7 +43,7 @@ pub struct InlineLib {
 }
 
 /// Version of the probe generator / template extraction (part of the cache key).
-pub const TEMPLATE_VERSION: &str = "mwdec-inline templates v4";
+pub const TEMPLATE_VERSION: &str = "mwdec-inline templates v5";
 
 /// Caches shared across units and runs: templates by probe text (+ compiler and flags), and
 /// probes that failed to compile in one context (+ context hash).
@@ -55,7 +55,9 @@ pub struct ProbeCache {
 impl ProbeCache {
     /// `flags` identifies compiler + flags; `context` the unit's context TU.
     pub fn new(flags: &str, _context: &str) -> ProbeCache {
-        let dir = session::work_dir().join("tcache");
+        // one directory per generator version: stale generations can be deleted whole
+        let gen: String = TEMPLATE_VERSION.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let dir = session::work_dir().join("tcache").join(gen);
         ProbeCache {
             templates: ser::Cache::new(dir.join("templates"), format!("{TEMPLATE_VERSION}\n{flags}")),
             // a probe failing in one context (access, instantiation errors) fails elsewhere too

@@ -541,6 +541,11 @@ fn run_one(us: &UnitSlot, ext: &(ExternIndex, ExternIndex), c: &Cand, a: &Harves
         row.source = Some(r.best_src.clone());
         if row.first_exact { "exact".into() } else { "searched".into() }
     } else if r.initial.is_some() {
+        // keep the best candidate of a miss for later analysis / longer searches
+        let dir = a.out_dir.join("miss").join(sanitize(&c.unit));
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(dir.join(format!("{}.cpp", file_stem(&c.symbol))), &r.best_src);
+        }
         "mismatch".into()
     } else {
         "cc-err".into()

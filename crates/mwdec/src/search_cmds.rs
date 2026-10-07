@@ -202,7 +202,8 @@ pub fn unit_inputs_with_context(p: &Project, u: &Unit, cc: &Compilers, module_ob
                 let vt = mwdec_ctx::vtables_from_object(&target, &db);
                 mwdec_ctx::apply_vtables(&mut db, &vt);
                 if !c_mode && std::env::var("MWDEC_NO_INLINE").is_err() {
-                    mwdec_inline::complete::complete_in(&mut db, &context, &u.cflags, &m, &ctx, &plain);
+                    // (the probe driver caches its compiles on disk across runs)
+                    mwdec_inline::complete::complete_in(&mut db, &context, &u.cflags, &cc.probe_driver(p, &u.name), &ctx, &plain);
                 }
                 Some(db)
             }
@@ -752,6 +753,9 @@ fn run_one(
     let ti = ObjIndex::with_externs(&ui.target, &ext.0);
     let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &e.symbol);
     let src = choose_between(&scorer, src, plain);
+    // Compile the draft before the search clock starts: a compiler crash with the unit's PCH is
+    // repaired here (split PCH, once per unit context, cached on disk), not inside the budget.
+    let _ = scorer.eval(&src);
     let cfg = SearchConfig {
         budget: Duration::from_secs(a.budget_secs),
         max_compiles: a.max_compiles,

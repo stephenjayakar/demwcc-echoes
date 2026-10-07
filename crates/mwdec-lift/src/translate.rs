@@ -536,9 +536,10 @@ impl<'a> Lifter<'a> {
             }
         }
         let mut lay = layout(&s, has_this, sret, self.db);
-        if s.variadic {
+        if s.variadic && !lay.params.iter().any(|p| *p == ArgLoc::Stack) {
             // the variadic part: argument registers set up for this call after the named ones
-            // (marked `...`; dropped from the callee's signature once the arguments are read)
+            // (marked `...`; dropped from the callee's signature once the arguments are read);
+            // float ones only when the caller sets cr1eq (`creqv 6,6,6`)
             let g = lay.params.iter().fold(2u8, |m, l| match l {
                 ArgLoc::Gpr(r) => m.max(*r),
                 ArgLoc::GprPair(r) => m.max(*r + 1),
@@ -553,10 +554,17 @@ impl<'a> Lifter<'a> {
                     extra(&mut s.params);
                 }
             }
-            if let Some(top) = (f + 1..=8u8).rev().find(|q| self.reg_set_for_call(k, fpr(*q))) {
-                for r in f + 1..=top {
-                    lay.params.push(ArgLoc::Fpr(r));
-                    extra(&mut s.params);
+            let b = self.cfg.block_of[k];
+            let floats = (self.cfg.blocks[b].start..k).rev().take_while(|&j| !self.insns[j].is_call()).any(|j| {
+                let i = &self.insns[j];
+                i.op() == Opcode::Creqv && i.ins.field_crbd() == 6
+            });
+            if floats {
+                if let Some(top) = (f + 1..=8u8).rev().find(|q| self.reg_set_for_call(k, fpr(*q))) {
+                    for r in f + 1..=top {
+                        lay.params.push(ArgLoc::Fpr(r));
+                        extra(&mut s.params);
+                    }
                 }
             }
         }
@@ -1126,6 +1134,39 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
+        // indirect/virtual calls (signature found later): word stores into the parameter area
+        // right before the call to slots nothing reads or takes the address of
+        let read_or_addressed = |off: i32, me: &Self| {
+            me.insns.iter().any(|q| {
+                let addr = matches!(q.op(), Opcode::Addi) && q.ra() == 1 && q.simm() as i32 == off;
+                let load = q.ra() == 1 && q.reloc.is_none() && matches!(q.op(), Opcode::Lwz | Opcode::Lfs | Opcode::Lfd | Opcode::Lhz | Opcode::Lha | Opcode::Lbz) && q.simm() as i32 == off;
+                addr || load
+            })
+        };
+        for k in 0..self.insns.len() {
+            if !self.insns[k].is_bctrl() {
+                continue;
+            }
+            let b = self.cfg.block_of[k];
+            for j in (self.cfg.blocks[b].start..k).rev() {
+                let q = &self.insns[j];
+                if q.is_call() || q.is_bctrl() {
+                    break;
+                }
+                if self.frame.skip.contains(&j) {
+                    continue;
+                }
+                if matches!(q.op(), Opcode::Stw | Opcode::Stfs | Opcode::Stfd) && q.ra() == 1 && q.reloc.is_none() {
+                    let off = q.simm() as i32;
+                    if (8..8 + 0x40).contains(&off) && !read_or_addressed(off, self) {
+                        let size = if q.op() == Opcode::Stfd { 8 } else { 4 };
+                        for x in 0..size {
+                            self.out_stack.insert(off + x);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn scan_stack(&mut self) {
@@ -1159,7 +1200,7 @@ impl<'a> Lifter<'a> {
                     }
                     continue;
                 }
-                Addi if i.ra() == 1 && i.reloc.is_none() => {
+                Addi | Addic | Addic_ if i.ra() == 1 && i.reloc.is_none() => {
                     addr.push(i.simm() as i32);
                     if let Some(sz) = self.addr_object_size(k, i.rd()) {
                         let e = obj_size.entry(i.simm() as i32).or_insert(0);
@@ -1192,11 +1233,6 @@ impl<'a> Lifter<'a> {
                 conv.insert(o + 4);
             }
         }
-        for &o in &psq {
-            if !self.frame.save_slots.contains_key(&o) {
-                conv.insert(o);
-            }
-        }
         addr.sort();
         addr.dedup();
         let top = self.frame.saves_lo.min(self.frame.info.size as i32);
@@ -1213,6 +1249,13 @@ impl<'a> Lifter<'a> {
             let size = (end - o) as u32;
             let v = self.new_var(format!("stack_{:x}", o), t_unk(size), VarKind::Stack { offset: o, size }, false);
             regions.push((o, size, v));
+        }
+        // quantized loads/stores of the frame are conversion scratch, unless they read an object
+        // whose address is taken (a byte color filled by a callee, read as floats)
+        for &o in &psq {
+            if !self.frame.save_slots.contains_key(&o) && !regions.iter().any(|&(s, z, _)| o >= s && o < s + z as i32) {
+                conv.insert(o);
+            }
         }
         let mut slots = BTreeMap::new();
         for (&o, a) in &acc {
@@ -1324,6 +1367,9 @@ impl<'a> Lifter<'a> {
         }
         let d = self.obj.data.get(sym);
         let local_def = d.is_some() || self.obj.functions.iter().any(|f| f.name == sym);
+        let init = d
+            .filter(|d| matches!(d.section.as_str(), ".data" | ".sdata" | ".rodata" | ".sdata2") && d.relocs.is_empty() && !d.bytes.is_empty() && !is_literal_name(sym))
+            .map(|d| d.bytes.clone());
         self.globals.insert(
             sym.to_string(),
             GlobalRef {
@@ -1332,6 +1378,7 @@ impl<'a> Lifter<'a> {
                 is_function: is_fn,
                 section: d.map(|d| d.section.clone()),
                 local_def,
+                init,
             },
         );
     }
@@ -2157,9 +2204,10 @@ impl<'a> Lifter<'a> {
     }
 
     /// Argument values at a call for the parameter locations of `lay`.
-    fn layout_args(&mut self, st: &mut St, lay: &Layout) -> Vec<Expr> {
+    fn layout_args(&mut self, st: &mut St, lay: &Layout, sig: &FuncSig) -> Vec<Expr> {
         let mut a2 = vec![];
-        for p in &lay.params {
+        let offs = self.stack_arg_offsets(sig, lay);
+        for (n, p) in lay.params.iter().enumerate() {
             match p {
                 ArgLoc::Gpr(r) => a2.push(self.get(st, gpr(*r))),
                 ArgLoc::Fpr(r) => a2.push(self.get(st, fpr(*r))),
@@ -2167,7 +2215,12 @@ impl<'a> Lifter<'a> {
                     let p = crate::wide::pair(self.get(st, gpr(*r)), self.get(st, gpr(*r + 1)), true, &self.vars);
                     a2.push(p)
                 }
-                ArgLoc::Stack => a2.push(Expr::Unknown { text: "stack arg".into(), ty: t_unk(4) }),
+                ArgLoc::Stack => {
+                    // stored to the outgoing parameter area before the call
+                    let o = offs.iter().find(|x| x.0 == n).map(|x| 8 + x.1).unwrap_or(0);
+                    let found = (o..o + 8).find_map(|q| st.mem.get(&q).map(|x| x.1.clone()));
+                    a2.push(found.unwrap_or(Expr::Unknown { text: "stack arg".into(), ty: t_unk(4) }))
+                }
             }
         }
         a2
@@ -2271,7 +2324,7 @@ impl<'a> Lifter<'a> {
                     if let Some(s) = &vsig {
                         // the parameters follow the result and `this` (r5..), whether or not
                         // this function set them up (forwarded incoming parameters)
-                        args = self.layout_args(st, &layout(s, true, true, self.db));
+                        args = self.layout_args(st, &layout(s, true, true, self.db), s);
                         self.type_scalar_out_args(&args, s);
                     }
                     let call = Expr::Call { callee, args, ret: ret.clone() };
@@ -2285,7 +2338,7 @@ impl<'a> Lifter<'a> {
                 }
                 if let Some(s) = &vsig {
                     // trim args to the signature's arity
-                    args = self.layout_args(st, &layout(s, true, false, self.db));
+                    args = self.layout_args(st, &layout(s, true, false, self.db), s);
                     self.type_scalar_out_args(&args, s);
                     if self.deleting_dtor_call(st, k, s) {
                         args.push(Expr::int(1));
@@ -2575,10 +2628,35 @@ impl<'a> Lifter<'a> {
                 let q = ins.field_ps_i();
                 let off = ins.field_ps_offset() as i32;
                 if i.ra() == 1 && self.stack.conv.contains(&off) {
-                    // int -> float through a quantized load
-                    let (_, v) = st.mem.get(&off).cloned().unwrap_or((4, Expr::Unknown { text: "psq".into(), ty: t_unk(4) }));
-                    self.def(st, k, fpr(ins.field_frd()), Expr::cast(t_f32(), v));
-                    return;
+                    // int -> float through a quantized load of a value stored for it (as wide as
+                    // the quantized type: a wider store is an object's bytes read back)
+                    let qsize = quant_type(q).and_then(|t| scalar_size(&t));
+                    if let Some((sz, v)) = st.mem.get(&off).cloned().filter(|(sz, _)| qsize.map_or(true, |q| q == *sz)) {
+                        let _ = sz;
+                        self.def(st, k, fpr(ins.field_frd()), Expr::cast(t_f32(), v));
+                        return;
+                    }
+                    if quant_type(q).is_none() || w != 1 {
+                        self.def(st, k, fpr(ins.field_frd()), Expr::cast(t_f32(), Expr::Unknown { text: "psq".into(), ty: t_unk(4) }));
+                        return;
+                    }
+                }
+                // a scalar load through the runtime's quantization registers (qr2..qr5 = u8, u16,
+                // s8, s16; scale 0): an integer member read as a float
+                if w == 1 {
+                    if let Some(qt) = quant_type(q) {
+                        let lv = if i.ra() == 1 {
+                            match self.stack_lvalue(off, qt.clone()) {
+                                Some(lv) => lv,
+                                None => Expr::Unknown { text: "psq".into(), ty: qt.clone() },
+                            }
+                        } else {
+                            let base = self.gpr_or_zero(st, i.ra());
+                            self.mem(base, off, qt)
+                        };
+                        self.def(st, k, fpr(ins.field_frd()), Expr::cast(t_f32(), lv));
+                        return;
+                    }
                 }
                 let ty = if w == 1 && q == 0 { t_f32() } else { t_unk(8) };
                 let base = self.gpr_or_zero(st, i.ra());
@@ -2682,10 +2760,17 @@ impl<'a> Lifter<'a> {
                 self.def(st, k, rd, v);
             }
             Addic | Addic_ => {
-                let a = self.get(st, gpr(i.ra()));
                 let imm = i.simm() as i64;
+                // `addic. rD, r1, k`: a stack object's address, tested (inlined placement new)
+                let (a, v) = if i.ra() == 1 {
+                    let v = self.stack_addr(imm as i32);
+                    (v.clone(), v)
+                } else {
+                    let a = self.get(st, gpr(i.ra()));
+                    let v = arith(BinOp::Add, a.clone(), Expr::int(imm), &self.vars);
+                    (a, v)
+                };
                 st.ca = if imm == -1 { Ca::Ne0(a.clone()) } else { Ca::Unknown };
-                let v = arith(BinOp::Add, a, Expr::int(imm), &self.vars);
                 self.def(st, k, gpr(i.rd()), v);
                 if ins.op == Addic_ {
                     self.record(st, k, gpr(i.rd()));
@@ -3362,6 +3447,18 @@ fn int_ty(e: &Expr, vars: &[Var]) -> Type {
         Type::Unknown { .. } | Type::Ptr(_) | Type::Ref(_) => t_s32(),
         Type::Int { signed, .. } => t_int(4, *signed),
         _ => t_s32(),
+    }
+}
+
+/// Integer type of a quantization register as the runtime sets them up (`OSInitFastCast`):
+/// qr2 u8, qr3 u16, qr4 s8, qr5 s16.
+fn quant_type(q: u8) -> Option<Type> {
+    match q {
+        2 => Some(t_int(1, false)),
+        3 => Some(t_int(2, false)),
+        4 => Some(t_int(1, true)),
+        5 => Some(t_int(2, true)),
+        _ => None,
     }
 }
 

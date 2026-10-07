@@ -551,7 +551,31 @@ impl Scorer<'_> {
             Some(e) => ObjIndex::with_externs(&ours, e),
             None => ObjIndex::new(&ours),
         };
-        (Eval::Ok(fitness(self.target, self.tf, &oi, of)), ran)
+        let fit = fitness(self.target, self.tf, &oi, of);
+        // Candidates of a context with a split PCH (mwdec-mwcc works around a compiler crash by
+        // moving a few headers out of the PCH): confirm an exact match with the plain context.
+        if fit.exact && !self.pch_broken.load(Relaxed) && self.mwcc.uses_split(self.ctx) {
+            if let Some(plain) = self.plain {
+                let confirmed = self.mwcc.compile_in(plain, src).ok().and_then(|c| {
+                    let o = mwdec_obj::load_object_bytes("candidate.o", &c.obj).ok()?;
+                    let of = mwdec_obj::find_function(&o, &self.symbol)?;
+                    let oi = match self.ours_ext {
+                        Some(e) => ObjIndex::with_externs(&o, e),
+                        None => ObjIndex::new(&o),
+                    };
+                    Some(fitness(self.target, self.tf, &oi, of))
+                });
+                match confirmed {
+                    Some(f) if f.exact => {}
+                    Some(f) => {
+                        eprintln!("mwdec-search: split-PCH exact match of {} not confirmed by the plain context", self.symbol);
+                        return (Eval::Ok(f), true);
+                    }
+                    None => return (Eval::CompileError("plain-context confirmation failed".into()), true),
+                }
+            }
+        }
+        (Eval::Ok(fit), ran)
     }
 }
 

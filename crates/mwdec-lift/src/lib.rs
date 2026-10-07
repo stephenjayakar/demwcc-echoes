@@ -210,6 +210,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         let is_temp = l.is_temp.clone();
         aggregates::merge_copies_typing(&mut body, &mut l.vars, &|v| is_temp.get(v).copied().unwrap_or(false), db);
         arrays::container_members(&mut body, &l.vars, db);
+        arrays::absolute_globals(&mut body, db);
         bitfields::recover(&mut body, &l.vars, db);
         byval::forward(&mut body, &mut l.vars, db);
         aggregates::literal_inits(&mut body, &l.vars, db, obj);
@@ -223,11 +224,12 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     }
     localtypes::narrow(&mut body, &mut l.vars, db);
     localtypes::global_types(&mut body, &l.vars, &l.ret_ty, db);
+    localtypes::undeclared_returns(&mut body, &l.ret_ty, db);
     localtypes::drop_redundant_masks(&mut body, &l.vars, db);
     debug::stage("aggregates/bitfields", &body, &l.vars);
     ctrloop::recover(&mut body, &mut l.vars, &mut l.is_temp);
     ctrloop::recover_shape_b(&mut body, &l.vars, &l.is_temp);
-    ctrloop::rematerialize_global_temps(&mut body, &l.is_temp);
+    ctrloop::rematerialize_global_temps(&mut body, &l.vars, &l.is_temp);
     debug::stage("ctrloop", &body, &l.vars);
     simplify::recover_ctr_loops(&mut body, &mut l.vars, &mut l.is_temp);
     unroll::reroll(&mut body);
@@ -596,6 +598,30 @@ fn loop_returns(l: &mut Lifter) {
     }
     for (p, r, cont) in todo {
         l.blocks_out[p].ret = l.blocks_out[r].ret.clone();
+        make_return_at(l, p, cont);
+    }
+    // returns inside a loop that are their own blocks (`li r3,1 ; blr` in a leaf): the same,
+    // they continue at their guard's other arm
+    let loops = l.cfg.loops();
+    let mut todo2: Vec<(usize, usize)> = vec![];
+    for p in 0..l.cfg.blocks.len() {
+        if !matches!(l.cfg.blocks[p].term, cfg::Term::Return) || l.cfg.pd_extra.iter().any(|e| e.0 == p) {
+            continue;
+        }
+        let [c] = l.cfg.blocks[p].preds.as_slice() else { continue };
+        let c = *c;
+        let Some(lp) = loops.iter().filter(|lp| lp.body.contains(&c)).max_by_key(|lp| lp.body.len()) else { continue };
+        if c == lp.header || lp.latches.contains(&c) {
+            continue;
+        }
+        let cont = match l.cfg.blocks[c].term {
+            cfg::Term::Cond { taken, fall } if fall == p && taken != p => taken,
+            cfg::Term::Cond { taken, fall } if taken == p && fall != p => fall,
+            _ => continue,
+        };
+        todo2.push((p, cont));
+    }
+    for (p, cont) in todo2 {
         make_return_at(l, p, cont);
     }
 }

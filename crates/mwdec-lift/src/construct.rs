@@ -115,14 +115,22 @@ fn member_ctors_d(db: &TypeDb, cls: &str, depth: u32) -> Vec<(FuncSig, Vec<i32>)
             if depth >= 4 {
                 continue;
             }
-            let Some(b) = c.bases.iter().find(|b| sig::split_scope(&strip_tmpl(&b.name)).1 == toks[0]) else { continue };
+            // a base class or a member object built from parameters
+            let sub = match c.bases.iter().find(|b| sig::split_scope(&strip_tmpl(&b.name)).1 == toks[0]) {
+                Some(b) => Some((b.name.clone(), b.offset as i32)),
+                None => c.fields.iter().find(|f| f.name == toks[0] && f.bitfield.is_none()).and_then(|f| {
+                    let ft = types::resolve(Some(db), strip_cv(&f.ty)).into_owned();
+                    named(&ft).map(|n| (n.to_string(), f.offset as i32))
+                }),
+            };
+            let Some((sub_cls, sub_off)) = sub else { continue };
             let inner = toks[2..toks.len() - 1].join(" ");
             let bargs: Vec<String> = sig::split_top(&inner, ',').into_iter().map(|a| a.trim().to_string()).collect();
-            if let Some((_, boffs)) = member_ctors_d(db, &b.name, depth + 1).into_iter().find(|(s, _)| s.params.len() == bargs.len()) {
+            if let Some((_, boffs)) = member_ctors_d(db, &sub_cls, depth + 1).into_iter().find(|(s, _)| s.params.len() == bargs.len()) {
                 for (j, a) in bargs.iter().enumerate() {
                     if let Some(i) = names.iter().position(|n| n == a) {
                         if offs[i].is_none() {
-                            offs[i] = Some(b.offset as i32 + boffs[j]);
+                            offs[i] = Some(sub_off + boffs[j]);
                         }
                     }
                 }
@@ -145,6 +153,49 @@ fn member_ctors_d(db: &TypeDb, cls: &str, depth: u32) -> Vec<(FuncSig, Vec<i32>)
         out.push((s, offs.into_iter().map(|o| o.unwrap()).collect()));
     }
     out
+}
+
+/// An object of `cls` built from member stores (`(offset, value)` relative to the object) with a
+/// constructor that sets members from its parameters (`member_ctors`), nested class parameters
+/// built the same way. Returns the construction and the store offsets it used.
+pub fn build_from_stores(db: &TypeDb, cls: &str, stores: &[(i32, Expr)]) -> Option<(Expr, Vec<i32>)> {
+    let mut used = vec![];
+    let e = build_at(db, cls, 0, stores, 0, &mut used)?;
+    Some((e, used))
+}
+
+fn build_at(db: &TypeDb, cls: &str, base: i32, stores: &[(i32, Expr)], depth: u32, used: &mut Vec<i32>) -> Option<Expr> {
+    if depth > 4 {
+        return None;
+    }
+    'ctor: for (cs, offs) in member_ctors(db, cls) {
+        let mark = used.len();
+        let mut args = vec![];
+        for (p, o) in cs.params.iter().zip(&offs) {
+            let pt = match strip_cv(&p.ty) {
+                Type::Ref(x) => strip_cv(x).clone(),
+                t => t.clone(),
+            };
+            let pr = types::resolve(Some(db), &pt).into_owned();
+            let arg = if types::is_aggregate(Some(db), &pr) {
+                named(&pr).and_then(|pc| build_at(db, pc, base + o, stores, depth + 1, used))
+            } else {
+                stores.iter().find(|(so, _)| *so == base + o).map(|(so, x)| {
+                    used.push(*so);
+                    x.clone()
+                })
+            };
+            match arg {
+                Some(a) => args.push(a),
+                None => {
+                    used.truncate(mark);
+                    continue 'ctor;
+                }
+            }
+        }
+        return Some(Expr::Construct { class: Type::Named(cls.to_string()), ctor: Some(cs), args });
+    }
+    None
 }
 
 /// The stored value as a value of member type `ft` (scalar as is; a one-member object from its
@@ -339,6 +390,22 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
                         if ok && offs.len() == stores.len() {
                             built = Some(Expr::Construct { class: Type::Named(cls.clone()), ctor: Some(s), args });
                             break;
+                        }
+                    }
+                    // otherwise a constructor setting some members from parameters (nested
+                    // objects too); the other stores must be its own constants
+                    if built.is_none() {
+                        let flat: Vec<(i32, Expr)> = stores.iter().map(|s| (s.1, s.3.clone())).collect();
+                        let mut offs: Vec<i32> = flat.iter().map(|s| s.0).collect();
+                        offs.sort_unstable();
+                        offs.dedup();
+                        if offs.len() == flat.len() {
+                            if let Some((c, used)) = build_from_stores(db, &cls, &flat) {
+                                let rest_const = flat.iter().filter(|(o, _)| !used.contains(o)).all(|(_, x)| matches!(x, Expr::Int { .. } | Expr::Float { .. }));
+                                if rest_const {
+                                    built = Some(c);
+                                }
+                            }
                         }
                     }
                     let Some(c) = built else { continue };

@@ -16,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod compare;
+mod split;
 pub use compare::{compare, compare_detailed, compare_indexed, Detailed, DiffClass, ExternIndex, ObjIndex};
 
 /// Default project root (read-only inputs); override with `MWDEC_ROOT`.
@@ -176,6 +177,11 @@ pub struct UnitContext {
     pub mch: Option<PathBuf>,
     /// Identity of (compiler, flags, context) for cache keys.
     pub hash: u128,
+    /// Text compiled in front of each candidate after the PCH (split PCH contexts: the context
+    /// lines left out of the PCH; see `split`). Empty normally.
+    pub text: String,
+    /// Indexes of the context lines left out of the PCH (split contexts).
+    pub excluded: Vec<usize>,
     /// File name candidate TUs are compiled as (`CFoo.cpp`): the compiler names the static
     /// initializer (`__sinit_CFoo_cpp`) and the anonymous namespace (`@unnamed@CFoo_cpp@`)
     /// after it. `None`: a unique scratch name.
@@ -259,6 +265,8 @@ pub struct Mwcc {
     counter: AtomicU64,
     mem_cache: Mutex<MemCache>,
     pch_locks: Mutex<HashMap<u128, Arc<Mutex<()>>>>,
+    /// Split PCH replacements per context hash (`split`), established on the first crash.
+    splits: Mutex<HashMap<u128, Arc<std::sync::OnceLock<Option<UnitContext>>>>>,
 }
 
 impl Mwcc {
@@ -275,6 +283,7 @@ impl Mwcc {
             counter: AtomicU64::new(0),
             mem_cache: Mutex::new(MemCache::new()),
             pch_locks: Mutex::new(HashMap::new()),
+            splits: Mutex::new(HashMap::new()),
         }
     }
 
@@ -441,14 +450,14 @@ impl Mwcc {
                 let _ = std::fs::remove_file(&tmp_mch);
             }
         }
-        Ok(UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: Some(mch), hash, tu_name: None })
+        Ok(UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: Some(mch), hash, text: String::new(), excluded: vec![], tu_name: None })
     }
 
     /// A context without PCH: the context text is prepended to every candidate (slow path,
     /// and the reference for verifying that PCH does not change codegen).
     pub fn plain_context(&self, context: &str, cflags: &[String]) -> UnitContext {
         let hash = content_hash(&[CACHE_SALT.as_bytes(), b"plain", self.compiler.as_bytes(), &flags_bytes(cflags), context.as_bytes()]);
-        UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: None, hash, tu_name: None }
+        UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: None, hash, text: String::new(), excluded: vec![], tu_name: None }
     }
 
     /// Compile candidate code (function definitions etc.) in a unit context. Results (objects and
@@ -477,27 +486,27 @@ impl Mwcc {
                 cache_hit: true,
             });
         }
-        let tmp = self.work.join("tmp");
-        let plain = || {
-            let mut tu = ctx.context.clone();
-            if !tu.is_empty() && !tu.ends_with('\n') {
-                tu.push('\n');
-            }
-            tu.push_str(code);
-            self.compile_tu_as(&tu, &ctx.cflags, None, &tmp, ctx.tu_name.as_deref())
-        };
+        let log = std::env::var_os("MWDEC_MWCC_LOG").is_some();
         let mut res = match &ctx.mch {
-            Some(m) => match self.compile_tu_as(code, &ctx.cflags, Some(m), &tmp, ctx.tu_name.as_deref()) {
-                // MWCC sometimes crashes with a PCH; the plain context gives the same codegen.
-                Err(MwccError::Crash { status, messages }) => {
-                    if std::env::var_os("MWDEC_MWCC_LOG").is_some() {
-                        eprintln!("mwcc: PCH compile crashed (status {status:?}); plain retry. {}", messages.lines().take(6).collect::<Vec<_>>().join(" | "));
+            Some(_) => {
+                let split = self.known_split(ctx);
+                match self.compile_pch(split.as_ref().unwrap_or(ctx), code) {
+                    // MWCC sometimes crashes with a PCH: find a split PCH that doesn't (once per
+                    // context), else the plain context (same codegen, much slower).
+                    Err(MwccError::Crash { status, messages }) => {
+                        if log {
+                            eprintln!("mwcc: PCH compile crashed (status {status:?}). {}", messages.lines().take(3).collect::<Vec<_>>().join(" | "));
+                        }
+                        let rep = if split.is_none() { self.repair(ctx, code) } else { None };
+                        match rep.map(|sp| self.compile_pch(&sp, code)) {
+                            Some(r @ (Ok(_) | Err(MwccError::Compile { .. }))) => r,
+                            _ => self.plain_compile(ctx, code),
+                        }
                     }
-                    plain()
+                    r => r,
                 }
-                r => r,
-            },
-            None => plain(),
+            }
+            None => self.plain_compile(ctx, code),
         };
         // Cache only deterministic outcomes (not crashes / timeouts / I/O failures).
         match &mut res {

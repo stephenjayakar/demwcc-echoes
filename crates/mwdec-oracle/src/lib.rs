@@ -7,9 +7,12 @@
 //! - [`regalloc`]: model of MWCC's register colouring (predict / inverse-solve priority orders).
 pub mod asm;
 pub mod compile;
+pub mod explain;
 pub mod flags;
 pub mod hints;
+pub mod iro;
 pub mod regalloc;
+pub mod sched;
 pub mod schedcheck;
 pub mod tracer;
 pub mod variants;

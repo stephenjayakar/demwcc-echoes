@@ -260,6 +260,9 @@ pub struct GlobalRef {
     pub section: Option<String>,
     /// Defined (not extern) in the target object.
     pub local_def: bool,
+    /// Initial bytes of an object defined in an initialized data section of the target object
+    /// (without relocations), for a definition the emitter writes itself (function statics).
+    pub init: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

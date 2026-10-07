@@ -60,7 +60,8 @@ impl<'a> Em<'a> {
         let mut ndefs: HashMap<VarId, usize> = HashMap::new();
         for s in &ir.body {
             match s {
-                Stmt::Assign { dst: Expr::Var(v), src } if matches!(ir.vars[*v].kind, VarKind::Local) => {
+                // (register locals and stack spill slots)
+                Stmt::Assign { dst: Expr::Var(v), src } if matches!(ir.vars[*v].kind, VarKind::Local | VarKind::Stack { .. }) => {
                     *ndefs.entry(*v).or_default() += 1;
                     defs.insert(*v, src.clone());
                 }
@@ -244,15 +245,22 @@ impl<'a> Em<'a> {
                         continue;
                     }
                 }
-                // a base class constructed from parameters: its members
+                // a base class or a member object constructed from parameters: its members
                 if toks.len() >= 3 && toks[1] == "(" && toks.last() == Some(&")") && depth < 4 {
-                    let Some(b) = c.bases.iter().find(|b| sig::split_scope(&strip_template_args(&b.name)).1 == toks[0]) else { continue };
+                    let sub = match c.bases.iter().find(|b| sig::split_scope(&strip_template_args(&b.name)).1 == toks[0]) {
+                        Some(b) => Some((b.name.clone(), b.offset as i32)),
+                        None => c.fields.iter().find(|f| f.name == toks[0] && f.bitfield.is_none()).and_then(|f| {
+                            let ft = mwdec_lift::types::resolve(Some(db), strip_cv(&f.ty)).into_owned();
+                            named(&ft).map(|n| (n.to_string(), f.offset as i32))
+                        }),
+                    };
+                    let Some((sub_cls, sub_off)) = sub else { continue };
                     let inner = toks[2..toks.len() - 1].join(" ");
                     let bargs: Vec<String> = sig::split_top(&inner, ',').into_iter().map(|a| a.trim().to_string()).collect();
-                    for (_, boffs) in self.member_ctor_d(&b.name, depth + 1).into_iter().filter(|(s, _)| s.params.len() == bargs.len()) {
+                    for (_, boffs) in self.member_ctor_d(&sub_cls, depth + 1).into_iter().filter(|(s, _)| s.params.len() == bargs.len()) {
                         for (j, a) in bargs.iter().enumerate() {
                             if let Some(i) = names.iter().position(|n| n == a) {
-                                offs[i] = Some(b.offset as i32 + boffs[j]);
+                                offs[i] = Some(sub_off + boffs[j]);
                             }
                         }
                         break;

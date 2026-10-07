@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when the TypeDb produced for the same inputs changes (invalidates caches).
-const CACHE_VERSION: &str = "mwdec-ctx-15-errs";
+const CACHE_VERSION: &str = "mwdec-ctx-17-abs-addrs-errs";
 
 /// Parse the DWARF of an already-compiled MWCC object into a TypeDb (no header scan).
 pub fn typedb_from_object_bytes(elf: &[u8]) -> Result<TypeDb> {
@@ -405,6 +405,9 @@ fn build_uncached(root: &Path, context_tu: &str, cflags: &[String], dir: &Path) 
         }
     }
     db.namespaces.extend(sr.namespaces.iter().cloned());
+    for (n, a) in &sr.abs_addrs {
+        db.abs_addrs.insert(n.clone(), *a);
+    }
     for (n, kw) in &sr.tag_keyword {
         db.tag_keywords.insert(n.clone(), kw.clone());
     }
@@ -445,6 +448,12 @@ pub fn is_class_scope(scope: &str, db: &TypeDb) -> bool {
     }
     if db.classes.contains_key(scope) {
         return true;
+    }
+    // project namespaces are lower-case (`rstl`, `std`, `nl`); classes `CFoo`/`SFoo`/`TFoo`: an
+    // unknown lower-case scope is a namespace the context doesn't declare
+    let last = scope.rsplit("::").next().unwrap_or(scope);
+    if last.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && !scope.contains('<') {
+        return false;
     }
     !db.namespaces.contains(scope)
 }

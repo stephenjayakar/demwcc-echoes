@@ -66,8 +66,85 @@ const GPR_VOLATILE_COUNT: u32 = 11; // r0, r3..r12
 const FPR_VOLATILE_COUNT: u32 = 14; // f0..f13
 
 /// Colour nodes with the MWCC algorithm. Returns register per node (r14..r31 / f14..f31 as RegId,
-/// volatile picks as their RegId, or None when spilled).
+/// volatile picks as their RegId, or None when spilled). Without spill costs every node is assumed
+/// to cost the same, so a blocked simplify pushes the highest-degree node (see [`color_with_costs`]).
 pub fn color(nodes: &[Node], num: &[u32]) -> Vec<Option<RegId>> {
+    color_with_costs(nodes, num, None)
+}
+
+/// Spill cost of a value as GC/2.7 computes it before simplify (`0x57db30`): over every PCode
+/// operand of the value, weighted by the block's loop weight `w` (1 outside loops): a use adds
+/// `2w` (`w` if the value is rematerialisable: single `li`/`lis`/`addi rX,r1,N` definition), a
+/// definition adds `w` (subtracts `w` if rematerialisable or an argument-register copy-in).
+pub fn spill_cost(uses: &[u32], defs: &[(u32, bool)], remat: bool) -> i64 {
+    let u: i64 = uses.iter().map(|&w| if remat { w as i64 } else { 2 * w as i64 }).sum();
+    let d: i64 = defs.iter().map(|&(w, arg_init)| if remat || arg_init { -(w as i64) } else { w as i64 }).sum();
+    u + d
+}
+
+/// Simplify order (push order; colouring pops it in reverse) with GC/2.7's exact rules
+/// (`simplifygraph` `0x5088d0`):
+/// 1. scan nodes in ascending vreg order, push every node with current degree < K (pushing
+///    decrements its neighbours), repeat the scan until nothing is pushed;
+/// 2. if nodes remain, push the one with the **lowest `cost / current degree`**; ties go to the
+///    first in the remaining list, which is built by prepending during the ascending scan, so the
+///    **highest vreg wins ties**; then go back to 1.
+/// `degree0`: initial degree per node; `costs`: spill cost per node (None = all equal).
+pub fn simplify_order(adj: &[Vec<usize>], degree0: &[i64], num: &[u32], k: i64, costs: Option<&[f64]>) -> Vec<usize> {
+    let n = adj.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| num[i]);
+    let mut degree = degree0.to_vec();
+    let mut pushed = vec![false; n];
+    let mut stack = Vec::with_capacity(n);
+    loop {
+        let mut progress = true;
+        let mut remaining: Vec<usize> = vec![];
+        while progress {
+            progress = false;
+            remaining.clear();
+            for &i in &order {
+                if pushed[i] {
+                    continue;
+                }
+                if degree[i] < k {
+                    for &j in &adj[i] {
+                        degree[j] -= 1;
+                    }
+                    pushed[i] = true;
+                    stack.push(i);
+                    progress = true;
+                } else {
+                    remaining.push(i);
+                }
+            }
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        // the compiler's list is in descending vreg order (prepended); strict `<` keeps the first
+        let score = |i: usize| -> f64 {
+            let c = costs.map_or(1.0, |c| c[i]);
+            c / degree[i].max(1) as f64
+        };
+        let mut best = *remaining.last().unwrap();
+        for &i in remaining.iter().rev().skip(1) {
+            if score(i) < score(best) {
+                best = i;
+            }
+        }
+        for &j in &adj[best] {
+            degree[j] -= 1;
+        }
+        pushed[best] = true;
+        stack.push(best);
+    }
+    stack
+}
+
+/// [`color`] with per-node spill costs (see [`spill_cost`]): decides which node a blocked simplify
+/// pushes (the K-degree effect order), and so the colouring order of long-lived values.
+pub fn color_with_costs(nodes: &[Node], num: &[u32], costs: Option<&[f64]>) -> Vec<Option<RegId>> {
     let mut res = vec![None; nodes.len()];
     for float in [false, true] {
         let ids: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].float == float).collect();
@@ -76,51 +153,23 @@ pub fn color(nodes: &[Node], num: &[u32]) -> Vec<Option<RegId>> {
         }
         let k = if float { FPR_K } else { GPR_K };
         let vol_count = if float { FPR_VOLATILE_COUNT } else { GPR_VOLATILE_COUNT };
-        // simplify order: ascending vreg
-        let mut order = ids.clone();
-        order.sort_by_key(|&i| num[i]);
-        let mut degree: Vec<i64> = vec![0; nodes.len()];
-        for &i in &ids {
-            let n = &nodes[i];
-            degree[i] = n.interferes.iter().filter(|&&j| nodes[j].float == float).count() as i64
-                + if n.crosses_call { vol_count as i64 } else { 0 }
-                + n.extra_degree as i64;
-        }
-        let mut pushed = vec![false; nodes.len()];
-        let mut stack: Vec<usize> = Vec::new();
-        loop {
-            let mut progress = true;
-            let mut spill_cands: Vec<usize> = vec![];
-            while progress {
-                progress = false;
-                spill_cands.clear();
-                for &i in &order {
-                    if pushed[i] {
-                        continue;
-                    }
-                    if degree[i] < k as i64 {
-                        for &j in &nodes[i].interferes {
-                            degree[j] -= 1;
-                        }
-                        pushed[i] = true;
-                        stack.push(i);
-                        progress = true;
-                    } else {
-                        spill_cands.push(i);
-                    }
-                }
-            }
-            if spill_cands.is_empty() {
-                break;
-            }
-            // spill heuristic needs spill costs we don't have: push the highest-degree node
-            let best = *spill_cands.iter().max_by_key(|&&i| degree[i]).unwrap();
-            for &j in &nodes[best].interferes {
-                degree[j] -= 1;
-            }
-            pushed[best] = true;
-            stack.push(best);
-        }
+        let local: std::collections::HashMap<usize, usize> = ids.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        let adj: Vec<Vec<usize>> = ids
+            .iter()
+            .map(|&i| nodes[i].interferes.iter().filter_map(|j| local.get(j).copied()).collect())
+            .collect();
+        let degree0: Vec<i64> = ids
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| {
+                let n = &nodes[i];
+                adj[k].len() as i64 + if n.crosses_call { vol_count as i64 } else { 0 } + n.extra_degree as i64
+            })
+            .collect();
+        let lnum: Vec<u32> = ids.iter().map(|&i| num[i]).collect();
+        let lcost: Option<Vec<f64>> = costs.map(|c| ids.iter().map(|&i| c[i]).collect());
+        let mut stack: Vec<usize> =
+            simplify_order(&adj, &degree0, &lnum, k as i64, lcost.as_deref()).into_iter().map(|x| ids[x]).collect();
         // select
         let nonvol: Vec<RegId> = if float { (46u8..=63).rev().collect() } else { (14u8..=31).rev().collect() };
         let mut obtained: Vec<RegId> = Vec::new();
@@ -155,6 +204,11 @@ pub fn color(nodes: &[Node], num: &[u32]) -> Vec<Option<RegId>> {
 /// Convenience: classes -> predicted registers.
 pub fn predict(nodes: &[Node]) -> Vec<Option<RegId>> {
     color(nodes, &numbering(nodes))
+}
+
+/// [`predict`] with spill costs per node (see [`spill_cost`]).
+pub fn predict_with_costs(nodes: &[Node], costs: &[f64]) -> Vec<Option<RegId>> {
+    color_with_costs(nodes, &numbering(nodes), Some(costs))
 }
 
 /// Like [`solve_order`] but every pair `(a, b)` in `before` must be coloured a-then-b.

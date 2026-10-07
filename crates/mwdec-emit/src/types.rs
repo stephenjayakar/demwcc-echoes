@@ -66,7 +66,7 @@ fn base_name(t: &Type) -> String {
                     return format!("{kw} {n}");
                 }
             }
-            n.clone()
+            split_closers(n)
         }
         Type::Unknown { size: 1 } => "unsigned char".into(),
         Type::Unknown { size: 2 } => "unsigned short".into(),
@@ -120,4 +120,25 @@ fn declarator(t: &Type, inner: String) -> (String, String) {
         Type::MemberPtr { size, .. } if *size > 4 => ("int".into(), format!("{inner}[{}]", size / 4)),
         t => (base_name(t), inner),
     }
+}
+
+/// `A<B<C>>` -> `A<B<C> >`: the compiler reads `>>` as a shift (C++98), so nested template
+/// argument lists close with a space (operator names keep theirs).
+pub fn split_closers(s: &str) -> String {
+    if !s.contains(">>") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'>' && i + 1 < b.len() && b[i + 1] == b'>' && !out.ends_with("operator") && !out.ends_with("operator>") {
+            out.push_str("> ");
+            i += 1;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }

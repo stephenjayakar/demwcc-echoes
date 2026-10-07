@@ -223,6 +223,18 @@ impl<'a> Structurer<'a> {
                 Term::CondReturn { fall } => {
                     let c = self.cond_of(cur);
                     let r = self.blocks[cur].ret.clone();
+                    // `cmplwi x, N ; bgtlr` guarding a jump table whose switch ends the function:
+                    // the switch's own range check (no default)
+                    let table_guard = self.ret_void
+                        && fall < self.cfg.blocks.len()
+                        && matches!(self.cfg.blocks[fall].term, Term::Switch { .. })
+                        && !self.has_stmts(fall)
+                        && self.join_of(fall).is_none()
+                        && matches!(&c, Expr::Binary { op: BinOp::Gt, .. });
+                    if table_guard {
+                        cur = fall;
+                        continue;
+                    }
                     // `li r3,A ; b<c>lr ; li r3,B ; blr` is MWCC's select layout for `return !c ?
                     // B : A` (the else value is loaded first); `if (c) return A; return B;`
                     // would load B first

@@ -389,7 +389,10 @@ impl<'a, 'e> M<'a, 'e> {
                     }
                 }
                 (HoleKind::Obj { class, temp_ok, ptr }, Bind::Comps(m)) => {
-                    if let Some(a) = lvalue_addr(self.env, m, class) {
+                    if let Some(v) = whole_value(self.env, m, class).filter(|_| *temp_ok) {
+                        // every member of one object value (`r.mPos` set from `Lerp(...)`)
+                        out.push(if *ptr { Expr::AddrOf(Box::new(v)) } else { v });
+                    } else if let Some(a) = lvalue_addr(self.env, m, class) {
                         out.push(a);
                     } else if *temp_ok && depth < 3 && !matches!(self.t.shape, Shape::Stmts { .. }) {
                         let (v, sc) = explain_object(self.env, class, m, depth + 1)?;
@@ -420,8 +423,15 @@ pub fn use_score(t: &Template, extra: i32, nested: bool, args: &[Expr]) -> i32 {
     if nested && matches!(t.kind, CallKind::Ctor) {
         // `CVector3f(1.f, 1.f, 1.f)` constants are a natural operand; other values built by a
         // constructor are a last resort
-        let consts = args.iter().all(|a| matches!(a, Expr::Int { .. } | Expr::Float { .. }));
-        s -= if consts { 5 } else { CTOR_PENALTY };
+        let lit = |a: &Expr| matches!(a, Expr::Int { .. } | Expr::Float { .. });
+        // (some literal members, `CVector3f(0.f, 0.f, h)`, are natural too)
+        s -= if args.iter().all(lit) {
+            5
+        } else if args.iter().any(lit) {
+            25
+        } else {
+            CTOR_PENALTY
+        };
     }
     s
 }
@@ -576,6 +586,33 @@ pub fn lvalue_addr(env: &Env, m: &BTreeMap<i32, Expr>, cls: &str) -> Option<Expr
 }
 
 /// Explain the virtual object `m` (components of a `cls` value) as an object template call.
+/// The object value whose members are exactly `m` (`Member(X, o)` for every flat field `o` of
+/// `cls`), if one.
+fn whole_value(env: &Env, m: &BTreeMap<i32, Expr>, cls: &str) -> Option<Expr> {
+    let fields = crate::template::flat_fields(env.db, cls)?;
+    if fields.len() != m.len() {
+        return None;
+    }
+    let mut base: Option<&Expr> = None;
+    for (o, _) in &fields {
+        match m.get(o)? {
+            Expr::Member { base: b, offset, .. } if offset == o => {
+                if base.is_some_and(|x| x != &**b) {
+                    return None;
+                }
+                base = Some(b);
+            }
+            _ => return None,
+        }
+    }
+    let b = base?;
+    let bty = match b {
+        Expr::Construct { class, .. } => class.clone(),
+        _ => ty_of(b, env.vars),
+    };
+    (class_name(&bty, env.db).as_deref() == Some(cls)).then(|| b.clone())
+}
+
 /// Is the object at address `a` const (reached from a pointer/reference to const)?
 fn const_object(a: &Expr, env: &Env) -> bool {
     let mut e = a;
@@ -804,10 +841,22 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         drop_write_only_stack(&mut ir.body, &ir.vars);
         dce(&mut ir.body, &ir.vars);
     }
+    // constructor initializer lists (`mNormal(Cross(b - a, c - a))`)
+    if !ir.init_list.is_empty() {
+        let raw = build_defs(&ir.body, &ir.vars);
+        let vars = ir.vars.clone();
+        let env = Env { db, vars: &vars, defs: &raw, lib, objects: &idx.objects };
+        for init in ir.init_list.iter_mut() {
+            for a in init.args.iter_mut() {
+                total += scalar_expr(a, &env, &idx);
+            }
+        }
+    }
     if total > 0 {
         crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
         crate::post::name_shared_objects(&mut ir.body, &mut ir.vars);
         dce(&mut ir.body, &ir.vars);
+        crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
         crate::post::forward_cond_temps(&mut ir.body, &ir.vars);
         crate::post::return_values(&mut ir.body, &ir.vars);
     }

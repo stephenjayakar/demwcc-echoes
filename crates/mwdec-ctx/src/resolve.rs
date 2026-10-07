@@ -626,6 +626,17 @@ pub fn patch_void_pointers(db: &mut TypeDb, fields: &[(String, String, Vec<Strin
 /// types, e.g. `const void*`): the member's declared type.
 pub fn patch_const_pointees(db: &mut TypeDb, fields: &[(String, String, Vec<String>, Access)]) {
     for (scope, name, toks, _) in fields {
+        // `const T m;` (a const member must be initialized in constructor lists)
+        if toks.first().map(|s| s.as_str()) == Some("const") && !toks.iter().any(|t| t == "*" || t == "&" || t == "(" || t == "[" || t == "<") {
+            if let Some(c) = db.classes.get_mut(scope) {
+                for f in c.fields.iter_mut().filter(|f| &f.name == name && f.bitfield.is_none()) {
+                    if !matches!(f.ty, Type::Const(_)) {
+                        f.ty = Type::Const(Box::new(f.ty.clone()));
+                    }
+                }
+            }
+            continue;
+        }
         // `const T *` / `T const *` with a single pointer level, no arrays or function pointers
         if toks.iter().filter(|t| *t == "*").count() != 1 || toks.last().map(|s| s.as_str()) != Some("*") || toks.iter().any(|t| t == "(" || t == "[" || t == "<") {
             continue;

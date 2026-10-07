@@ -8,9 +8,28 @@
 //!     to move candidate registers to target registers
 //! mwcc-oracle inline <file.cpp|-e CODE> [--fn CALLER] [--all] [--full] [--json]
 //!     inliner decisions per call: cost vs inline_max_size, pass, reason; body expansion order
+//! mwcc-oracle iro <file.cpp|-e CODE> [--fn PAT] [--all] [--full] [--json]
+//!     the front-end optimizer's own dump, rendered as statements per flowgraph block: the final
+//!     form handed to code generation (reassociation, operand order, CSE temps, cond. assignments);
+//!     --all: every IRO pass; --full: the raw dump text
+//! mwcc-oracle picks <file.cpp|-e CODE> [--fn PAT] [--all] [--full] [--json]
+//!     REAL list scheduler per basic block: issue order with the reason of every pick (program
+//!     order = statement order decides; urgent/uncovers/height/opcode rank/unit busy = it does not);
+//!     --all: also the pre-RA pass; --full: the DAG (successors with edge kind and latency)
+//! mwcc-oracle copyprop <file.cpp|-e CODE> [--fn PAT] [--all]
+//!     REAL PCode copy propagation: for each copy `mr vX, vY` the uses that refused propagation and
+//!     why (a move use keeps a named local named); --all: accepted uses and removed copies too
+//! mwcc-oracle peephole <file.cpp|-e CODE> [--fn PAT]
+//!     REAL post-RA peephole: every rule that changed or removed an instruction
+//! mwcc-oracle why <cand.cpp|-e CODE> --target <target.o> --fn NAME [--json]
+//!     every order difference against the target, explained by the REAL scheduler: forced by a
+//!     dependence, register reuse, program order (=> which statement to move), waiting for an
+//!     operand (=> which computation to move), or the scheduler's priority (statement order irrelevant)
 //! mwcc-oracle sched <cand.cpp|-e CODE|cand.o> --target <target.o> --fn NAME [--json]
 //!     scheduling dependence check: per block, which instruction pairs are in a different order and
 //!     whether a data/memory dependence forces it (=> source statements must move; lines via -sym on)
+//! mwcc-oracle memclass <file.cpp|-e CODE|file.o> [--fn PAT]
+//!     the scheduler alias model per memory access: stack (range, escaped), global, pointer
 //! mwcc-oracle hints <file.cpp|-e CODE|file.o> [--fn PAT]...
 //!     emit hints from the inverted colouring model: which callee-saved values are temps, named
 //!     locals (with declaration order), params, or K-blocked
@@ -180,6 +199,35 @@ fn main() -> Result<()> {
                 }
             }
         }
+        "why" => {
+            // scheduling diff explained by the real scheduler (post-RA and pre-RA picks)
+            let tpath = a.target.clone().ok_or_else(|| anyhow!("why: need --target <target.o>"))?;
+            let fname = a.fns.first().cloned().ok_or_else(|| anyhow!("why: need --fn <mangled name>"))?;
+            let tobj = asm::parse(&std::fs::read(&tpath)?)?;
+            let tf = tobj
+                .funcs
+                .iter()
+                .find(|f| f.name == fname)
+                .or_else(|| tobj.funcs.iter().find(|f| f.name.contains(fname.as_str())))
+                .cloned()
+                .ok_or_else(|| anyhow!("function {fname} not in target"))?;
+            let src = match (&a.code, a.inputs.first()) {
+                (Some(c), _) => c.clone(),
+                (None, Some(f)) => std::fs::read_to_string(f)?,
+                _ => bail!("why: need a candidate file or -e CODE"),
+            };
+            let adv = mwdec_oracle::explain::explain_sched_diff(&compiler(&a), &src, &tf.name, &tobj, &tf)?;
+            if a.json {
+                println!("{}", serde_json::to_string_pretty(&adv)?);
+                return Ok(());
+            }
+            if adv.is_empty() {
+                println!("no instruction-order differences");
+            }
+            for x in &adv {
+                println!("target wants [{}] before [{}]: {}", x.second.text, x.first.text, x.text);
+            }
+        }
         "sched" => {
             // scheduling dependence check: candidate (source compiled with -sym on, or .o) vs target .o
             let tpath = a.target.clone().ok_or_else(|| anyhow!("sched: need --target <target.o>"))?;
@@ -210,7 +258,20 @@ fn main() -> Result<()> {
             let tf = pick(&tobj).ok_or_else(|| anyhow!("function {fname} not in target"))?;
             let cf = pick(&cobj).ok_or_else(|| anyhow!("function {fname} not in candidate"))?;
             let lines = uns.as_ref().and_then(|u| pick(u).map(|uf| mwdec_oracle::schedcheck::attribute_lines(&cobj, &cf, u, &uf, 1)));
-            let rep = mwdec_oracle::schedcheck::check(&tobj, &tf, &cobj, &cf, lines.as_deref());
+            // exact stack-local extents from the unscheduled -sym on compile (same frame layout)
+            let objs = uns.as_ref().and_then(|u| pick(u).map(|uf| mwdec_oracle::schedcheck::stack_objects(u, &uf.name)));
+            let objs = objs.filter(|o| !o.is_empty());
+            let rep = mwdec_oracle::schedcheck::check_with(
+                &tobj,
+                &tf,
+                &cobj,
+                &cf,
+                &mwdec_oracle::schedcheck::CheckOptions {
+                    lines: lines.as_deref(),
+                    cand_stack: objs.as_deref(),
+                    target_stack: objs.as_deref(),
+                },
+            );
             if a.json {
                 println!("{}", serde_json::to_string_pretty(&rep)?);
                 return Ok(());
@@ -255,16 +316,113 @@ fn main() -> Result<()> {
                 }
             }
         }
-        "inline" | "trace" => {
+        "inline" | "trace" | "iro" | "picks" | "copyprop" | "peephole" => {
             use mwdec_oracle::tracer::{trace_source, TraceOptions};
             let src = match (&a.code, a.inputs.first()) {
                 (Some(c), _) => c.clone(),
                 (None, Some(f)) => std::fs::read_to_string(f)?,
                 _ => bail!("{}: need a file or -e CODE", a.cmd),
             };
-            let opts = TraceOptions { inline: a.cmd == "inline", coloring: a.cmd == "trace", pcode: a.pcode.clone() };
+            let opts = TraceOptions {
+                inline: a.cmd == "inline",
+                coloring: a.cmd == "trace",
+                pcode: a.pcode.clone(),
+                iro: a.cmd == "iro",
+                iro_all_stages: a.all,
+                sched: a.cmd == "picks",
+                sched_filter: if a.cmd == "picks" { a.fns.first().cloned() } else { None },
+                copyprop: a.cmd == "copyprop",
+                peephole: a.cmd == "peephole",
+                ..Default::default()
+            };
             let t = trace_source(&compiler(&a), &src, &opts)?;
             let want = |f: &str| a.fns.is_empty() || a.fns.iter().any(|p| f.contains(p.as_str()));
+            if a.cmd == "copyprop" {
+                // per copy: every use decision; rejected uses explain why a named local stays named
+                let mut last = String::new();
+                for e in &t.copyprop {
+                    if !want(&e.function) || (!a.all && e.accepted) {
+                        continue;
+                    }
+                    let head = format!("{}: {}", e.function, e.copy);
+                    if head != last {
+                        println!("== {head}");
+                        last = head;
+                    }
+                    println!("   {} [{}]: {}", if e.accepted { "ok  " } else { "KEEP" }, e.use_text, e.reason);
+                }
+                for r in &t.copyprop_removals {
+                    if want(&r.function) && a.all {
+                        println!("-- {}: {} {}", r.function, r.copy, if r.removed { "removed" } else { "kept (not propagated)" });
+                    }
+                }
+                return Ok(());
+            }
+            if a.cmd == "peephole" {
+                for h in &t.peephole {
+                    if !want(&h.function) {
+                        continue;
+                    }
+                    println!(
+                        "{}: {:<32} [{}] -> {}",
+                        h.function,
+                        h.rule,
+                        h.before,
+                        h.after.as_deref().map(|x| format!("[{x}]")).unwrap_or_else(|| "removed".into())
+                    );
+                }
+                return Ok(());
+            }
+            if a.cmd == "picks" {
+                // list scheduler: DAG + picks with reasons (post-RA pass only unless --all)
+                for b in &t.sched {
+                    if !want(&b.function) || (!a.all && b.pre_ra) {
+                        continue;
+                    }
+                    println!(
+                        "== {} block {} ({} pass)",
+                        b.function,
+                        b.block,
+                        if b.pre_ra { "pre-RA" } else { "post-RA" }
+                    );
+                    if a.full {
+                        for (i, n) in b.nodes.iter().enumerate() {
+                            let succ: Vec<String> =
+                                n.succs.iter().map(|e| format!("{}:{:?}/{}", e.to, e.kind, e.latency)).collect();
+                            println!(
+                                "   n{i:<3} {:<34} h{:<3} dl{:<3} rank{:<3} -> {}",
+                                n.text,
+                                n.height,
+                                n.deadline,
+                                n.opcode_rank,
+                                succ.join(" ")
+                            );
+                        }
+                    }
+                    for p in b.analyze() {
+                        let over = p.over.map(|o| format!(" over n{o} [{}]", b.nodes[o].text)).unwrap_or_default();
+                        println!("   c{:<3} n{:<3} {:<34} {:?}{over}", p.cycle, p.node, b.nodes[p.node].text, p.reason);
+                    }
+                }
+                return Ok(());
+            }
+            if a.cmd == "iro" {
+                // --full: the raw dump; else the rendered statements of each (filtered) function
+                if a.full {
+                    print!("{}", t.iro);
+                    return Ok(());
+                }
+                for st in t.iro_stages() {
+                    if !want(&st.function) || (!a.all && st.stage != mwdec_oracle::iro::FINAL_STAGE) {
+                        continue;
+                    }
+                    println!("== {} after {}", st.function, st.stage);
+                    for l in st.render() {
+                        println!("{l}");
+                    }
+                }
+                return Ok(());
+            }
             if a.json {
                 println!("{}", serde_json::to_string_pretty(&t)?);
                 return Ok(());
@@ -407,6 +565,44 @@ fn main() -> Result<()> {
                                 );
                             }
                         }
+                    }
+                }
+            }
+        }
+        "memclass" => {
+            // the scheduler alias model's class of every memory access (source compiled with -sym on
+            // so the DWARF local extents are used, or an object)
+            let (obj, dwarf) = if a.inputs.first().map_or(false, |f| f.ends_with(".o")) {
+                (asm::parse(&std::fs::read(&a.inputs[0])?)?, true)
+            } else {
+                let src = match (&a.code, a.inputs.first()) {
+                    (Some(c), _) => c.clone(),
+                    (None, Some(f)) => std::fs::read_to_string(f)?,
+                    _ => bail!("memclass: need a file or -e CODE"),
+                };
+                let mut c = compiler(&a);
+                c.extra.extend(["-sym".to_string(), "on".to_string()]);
+                (asm::parse(&c.compile(&src)?.object)?, true)
+            };
+            for f in &obj.funcs {
+                if !a.fns.is_empty() && !a.fns.iter().any(|p| f.name.contains(p.as_str())) {
+                    continue;
+                }
+                let objs = if dwarf { mwdec_oracle::schedcheck::stack_objects(&obj, &f.name) } else { vec![] };
+                println!("{}", asm::func_header(f));
+                if !objs.is_empty() {
+                    let o: Vec<String> = objs.iter().map(|o| format!("{}@0x{:x}+{}", o.name, o.off, o.size)).collect();
+                    println!("    ; stack objects: {}", o.join(" "));
+                }
+                let cls: std::collections::BTreeMap<u32, mwdec_oracle::schedcheck::Mem> =
+                    mwdec_oracle::schedcheck::memory_classes(f, if objs.is_empty() { None } else { Some(&objs) })
+                        .into_iter()
+                        .collect();
+                for l in asm::disasm_func(&obj, f, AsmOpts { offsets: true, literals: false }) {
+                    let off = l.trim().split_once(": ").and_then(|(o, _)| u32::from_str_radix(o.trim(), 16).ok());
+                    match off.and_then(|o| cls.get(&o)) {
+                        Some(m) => println!("{l:<48} ; {m:?}"),
+                        None => println!("{l}"),
                     }
                 }
             }

@@ -122,6 +122,19 @@ fn try_copy(b: &[Stmt], start: usize, end: usize, stores: &[CStore], env: &Env) 
 fn stores_of(i: usize, s: &Stmt, env: &Env) -> Vec<CStore> {
     let Stmt::Assign { dst, src } = s else { return vec![] };
     if src.has_call() {
+        // an object member set from a folded inline's value (`r.mPos = Lerp(a, b, t)`): its
+        // components are that value's members
+        if crate::post::is_folded_value(src) {
+            let dty = ty_of(dst, env.vars);
+            if let (Some(cls), Some((dp, doff))) = (class_name(&dty, env.db), lvalue_addr(dst, env)) {
+                if let Some(fields) = flat_fields(env.db, &cls) {
+                    return fields
+                        .iter()
+                        .map(|(o, t)| CStore { stmt: i, aid: 0, addr: dp.clone(), off: doff + o, ty: t.clone(), src: Expr::Member { base: Box::new(src.clone()), offset: *o, ty: t.clone() } })
+                        .collect();
+                }
+            }
+        }
         return vec![];
     }
     let dty = ty_of(dst, env.vars);
@@ -145,9 +158,10 @@ fn stores_of(i: usize, s: &Stmt, env: &Env) -> Vec<CStore> {
         .collect()
 }
 
-fn is_barrier(s: &Stmt) -> bool {
+fn is_barrier(s: &Stmt, env: &Env) -> bool {
     match s {
-        Stmt::Assign { src, dst } => src.has_call() || dst.has_call(),
+        // folded value inlines are pure (`r.mPos = Lerp(a, b, t)` belongs to a group)
+        Stmt::Assign { src, dst } => crate::safety::effect_call(src, env.lib) || crate::safety::effect_call(dst, env.lib),
         Stmt::Comment(_) => false,
         _ => true,
     }
@@ -178,14 +192,18 @@ fn touches(s: &Stmt, addr: &Expr, lo: i32, hi: i32, env: &Env) -> bool {
 pub fn rewrite_groups(b: &mut Vec<Stmt>, env: &Env, idx: &Index) -> usize {
     let mut n = 0;
     let mut start = 0;
-    while start < b.len() {
+    // (bounded: every rewrite folds stores into fewer statements, but stay safe)
+    while start < b.len() && n < 64 {
         // segment [start, end)
         let mut end = start;
-        while end < b.len() && !is_barrier(&b[end]) {
+        while end < b.len() && !is_barrier(&b[end], env) {
             end += 1;
         }
         if end > start {
             if let Some((new, rm_lo)) = try_segment(b, start, end, env, idx) {
+                if std::env::var("MWDI_TRACE_REWRITE").is_ok() {
+                    eprintln!("GROUP rewrite {start}..{end} -> {} stmts: {}", new.len(), format!("{:?}", new).chars().take(300).collect::<String>());
+                }
                 // replace: new statement list for the segment
                 let tail: Vec<Stmt> = b.drain(start..end).collect();
                 let _ = tail;
@@ -284,6 +302,10 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
             stmts.dedup();
             let covered = stmts.iter().all(|&si| stores.iter().filter(|s| s.stmt == si).all(|s| pick.iter().any(|p| p.stmt == s.stmt && p.off == s.off)));
             if !covered {
+                continue;
+            }
+            // one statement that already assigns a whole object of this class
+            if stmts.len() == 1 && matches!(&b[stmts[0]], Stmt::Assign { dst, .. } if class_name(&ty_of(dst, env.vars), env.db).as_deref() == Some(cls.as_str())) {
                 continue;
             }
             if t.ops == 0 && is_copy(&pick, delta, &cls, env) {

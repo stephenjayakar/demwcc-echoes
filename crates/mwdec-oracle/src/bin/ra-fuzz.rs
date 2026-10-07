@@ -314,7 +314,19 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        let pred = regalloc::predict(&nodes);
+        // --costs: spill costs estimated from the webs (uses 2, defs 1; param copy-ins subtract)
+        let pred = if args.iter().any(|a| a == "--costs") {
+            let costs: Vec<f64> = mapped
+                .iter()
+                .map(|&w| {
+                    let arg_init = matches!(ws[w].origin, Origin::Param { .. });
+                    (2 * ws[w].uses.len() as i64 + if arg_init { -1 } else { 1 } * ws[w].defs.len() as i64) as f64
+                })
+                .collect();
+            regalloc::predict_with_costs(&nodes, &costs)
+        } else {
+            regalloc::predict(&nodes)
+        };
         let mut all = true;
         let mut lines = vec![];
         for (k, &w) in mapped.iter().enumerate() {

@@ -600,3 +600,141 @@ pub fn refresh_access_types(body: &mut Vec<Stmt>, vars: &[Var], db: &mwdec_core:
         }
     });
 }
+
+/// Return types of functions the context doesn't declare (unit statics): the lifter types their
+/// result as a word. When every use of a callee's result narrows it to one type (`(u16)f(..)`,
+/// returned from a `u16` function), that is the callee's return type (it returns the value
+/// already extended, so the caller doesn't extend it again).
+pub fn undeclared_returns(body: &mut Vec<Stmt>, ret: &Type, db: Option<&mwdec_core::TypeDb>) {
+    let undeclared = |sym: &str, s: &mwdec_core::FuncSig| -> bool {
+        crate::sig::ret_unknown(s) && crate::sig::demangle(sym).is_none() && !db.map_or(false, |d| d.decls.contains_key(sym) || d.functions.contains_key(sym))
+    };
+    let narrow = |t: &Type| -> Option<Type> {
+        let r = types::resolve(db, t).into_owned();
+        match strip_cv(&r) {
+            Type::Int { size: 1 | 2, .. } | Type::Bool => Some(strip_cv(t).clone()),
+            _ => None,
+        }
+    };
+    // per callee: the narrow type of every use (None = a plain use)
+    let mut uses: HashMap<String, Vec<Option<Type>>> = HashMap::new();
+    fn visit(e: &Expr, ctx: Option<Type>, uses: &mut HashMap<String, Vec<Option<Type>>>, und: &dyn Fn(&str, &mwdec_core::FuncSig) -> bool, narrow: &dyn Fn(&Type) -> Option<Type>) {
+        match e {
+            Expr::Cast { ty, e: inner } if matches!(**inner, Expr::Call { .. }) => {
+                visit(inner, narrow(ty), uses, und, narrow);
+            }
+            Expr::Call { callee, args, .. } => {
+                if let Callee::Direct { symbol, sig } = callee {
+                    if und(symbol, sig) {
+                        uses.entry(symbol.clone()).or_default().push(ctx.clone());
+                    }
+                }
+                if let Callee::Method { this, .. } | Callee::Virtual { this, .. } = callee {
+                    visit(this, None, uses, und, narrow);
+                }
+                if let Callee::Indirect(f) = callee {
+                    visit(f, None, uses, und, narrow);
+                }
+                for a in args {
+                    visit(a, None, uses, und, narrow);
+                }
+            }
+            _ => {
+                for k in direct_kids(e) {
+                    visit(k, None, uses, und, narrow);
+                }
+            }
+        }
+    }
+    let ret_narrow = narrow(ret);
+    let mut stmts = vec![];
+    all_stmt_lists(body, &mut stmts);
+    for s in &stmts {
+        match s {
+            Stmt::Return(Some(e)) => {
+                if matches!(e, Expr::Call { .. }) {
+                    visit(e, ret_narrow.clone(), &mut uses, &undeclared, &narrow);
+                } else {
+                    visit(e, None, &mut uses, &undeclared, &narrow);
+                }
+            }
+            Stmt::Expr(e) => {
+                // a result never used doesn't decide
+                if let Expr::Call { callee, args, .. } = e {
+                    for a in args {
+                        visit(a, None, &mut uses, &undeclared, &narrow);
+                    }
+                    if let Callee::Method { this, .. } | Callee::Virtual { this, .. } = callee {
+                        visit(this, None, &mut uses, &undeclared, &narrow);
+                    }
+                } else {
+                    visit(e, None, &mut uses, &undeclared, &narrow);
+                }
+            }
+            Stmt::Assign { dst, src } => {
+                visit(dst, None, &mut uses, &undeclared, &narrow);
+                visit(src, None, &mut uses, &undeclared, &narrow);
+            }
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } | Stmt::For { cond, .. } => visit(cond, None, &mut uses, &undeclared, &narrow),
+            Stmt::Switch { e, .. } => visit(e, None, &mut uses, &undeclared, &narrow),
+            _ => {}
+        }
+    }
+    let mut chosen: HashMap<String, Type> = HashMap::new();
+    for (sym, us) in uses {
+        let Some(Some(t)) = us.first().cloned() else { continue };
+        if us.iter().all(|u| u.as_ref().map(key) == Some(key(&t))) {
+            chosen.insert(sym, t);
+        }
+    }
+    if chosen.is_empty() {
+        return;
+    }
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let replace = match e {
+            Expr::Cast { e: inner, .. } => match &**inner {
+                Expr::Call { callee: Callee::Direct { symbol, .. }, .. } => chosen.get(symbol).cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(t) = replace {
+            if let Expr::Cast { e: inner, .. } = e {
+                let mut c = (**inner).clone();
+                if let Expr::Call { ret, .. } = &mut c {
+                    *ret = t;
+                }
+                *e = c;
+            }
+        } else if let Expr::Call { callee: Callee::Direct { symbol, .. }, ret, .. } = e {
+            if let Some(t) = chosen.get(symbol) {
+                *ret = t.clone();
+            }
+        }
+    });
+}
+
+fn direct_kids(e: &Expr) -> Vec<&Expr> {
+    let mut v: Vec<&Expr> = vec![];
+    match e {
+        Expr::AddrOf(x) | Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } | Expr::IncDec { e: x, .. } => v.push(x),
+        Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } => v.push(base),
+        Expr::Index { base, index, .. } => {
+            v.push(base);
+            v.push(index);
+        }
+        Expr::Binary { l, r, .. } => {
+            v.push(l);
+            v.push(r);
+        }
+        Expr::Ternary { c, t, f, .. } => {
+            v.push(c);
+            v.push(t);
+            v.push(f);
+        }
+        Expr::New { placement, args, .. } => v.extend(placement.iter().chain(args.iter())),
+        Expr::Construct { args, .. } => v.extend(args.iter()),
+        _ => {}
+    }
+    v
+}

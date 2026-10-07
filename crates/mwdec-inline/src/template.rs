@@ -191,6 +191,30 @@ fn object_comps(e: &Expr, class: &str, db: &TypeDb) -> Option<Vec<Comp>> {
     }
 }
 
+/// Expand components of class type whose value is an object hole (or a member of one) into
+/// one component per scalar field.
+fn flatten_comps(comps: Vec<Comp>, holes: &[HoleKind], db: &TypeDb) -> Vec<Comp> {
+    let mut out = vec![];
+    for c in comps {
+        let cls = class_name(&c.ty, db);
+        let fields = cls.as_deref().and_then(|k| flat_fields(db, k));
+        let src = match &c.pat {
+            Expr::Var(h) if matches!(holes.get(*h), Some(HoleKind::Obj { .. })) => Some((Expr::Var(*h), 0)),
+            Expr::Member { base, offset, .. } | Expr::Load { base, offset, .. } if matches!(&**base, Expr::Var(h) if matches!(holes.get(*h), Some(HoleKind::Obj { .. }))) => Some(((**base).clone(), *offset)),
+            _ => None,
+        };
+        match (fields, src) {
+            (Some(fs), Some((b, k))) if !fs.is_empty() => {
+                for (o, t) in fs {
+                    out.push(Comp { off: c.off + o, ty: t.clone(), pat: Expr::Member { base: Box::new(b.clone()), offset: k + o, ty: t } });
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn ty_of_load(e: &Expr) -> Type {
     match e {
         Expr::Load { ty, .. } => ty.clone(),
@@ -285,6 +309,12 @@ fn from_probe_expr(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, 
                 None => return Err("empty".into()),
             }
         }
+    };
+    // object-typed components (`mPos(pos)` copies a whole member) as their scalar members
+    let shape = match shape {
+        Shape::Object { class, comps } => Shape::Object { class, comps: flatten_comps(comps, &holes, db) },
+        Shape::Mutate { hole, comps } => Shape::Mutate { hole, comps: flatten_comps(comps, &holes, db) },
+        s => s,
     };
     // a virtual function called through the object: the probe is a plain virtual call
     let virt = |e: &Expr| matches!(e, Expr::Call { callee: mwdec_lift::Callee::Virtual { .. }, .. });

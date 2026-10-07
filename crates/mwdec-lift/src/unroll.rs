@@ -88,7 +88,17 @@ fn shape_a(b: &[Stmt], k: usize) -> Option<(VarId, Expr, Vec<Stmt>)> {
     }
     let Stmt::If { cond: rc, then: rthen, els: rels } = t[m - 1] else { return None };
     let Stmt::Assign { dst: Expr::Var(c2), src: c2src } = t[m - 2] else { return None };
-    let Stmt::If { cond: c8, then: then8, els: els8 } = t[m - 3] else { return None };
+    // the remainder may walk a pointer set up from the index (`p = base + i`)
+    let mut q = m - 3;
+    let mut ptrs: Vec<(VarId, Expr)> = vec![];
+    while let Stmt::Assign { dst: Expr::Var(p), src } = t[q] {
+        ptrs.push((*p, src.clone()));
+        if q == 0 {
+            return None;
+        }
+        q -= 1;
+    }
+    let Stmt::If { cond: c8, then: then8, els: els8 } = t[q] else { return None };
     if !rels.is_empty() || !els8.is_empty() {
         return None;
     }
@@ -100,9 +110,53 @@ fn shape_a(b: &[Stmt], k: usize) -> Option<(VarId, Expr, Vec<Stmt>)> {
     }
     let rl = real(rthen);
     let [rloop] = rl.as_slice() else { return None };
-    let (rc2, body1) = ctr_loop(rloop)?;
+    let (rc2, mut body1) = ctr_loop(rloop)?;
     if rc2 != *c2 || !straight(&body1) || body1.is_empty() {
         return None;
+    }
+    // pointer walks of the remainder are the index again: `p = base + i; ... p = p + k`
+    // reads `base + i * k`
+    // `p + k` written as an add or as `&p->field` (`&*(p + k)`)
+    fn step_of(src: &Expr, p: VarId) -> Option<i64> {
+        match strip(src) {
+            Expr::Binary { op: BinOp::Add, l, r, .. } if matches!(strip(l), Expr::Var(y) if *y == p) => r.as_int(),
+            Expr::AddrOf(x) => match &**x {
+                Expr::Load { base, offset, .. } if matches!(strip(base), Expr::Var(y) if *y == p) => Some(*offset as i64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    for (p, init) in &ptrs {
+        // `base + i` or `&base[i]` (byte elements)
+        let ok = match strip(init) {
+            Expr::Binary { op: BinOp::Add, r, .. } => matches!(strip(r), Expr::Var(x) if x == i),
+            Expr::AddrOf(x) => matches!(&**x, Expr::Index { index, ty, .. } if matches!(strip(index), Expr::Var(y) if y == i) && scalar_size(ty) == Some(1)),
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+        let steps: Vec<usize> = (0..body1.len())
+            .filter(|&k| matches!(&body1[k], Stmt::Assign { dst: Expr::Var(x), src } if x == p && step_of(src, *p).is_some()))
+            .collect();
+        let [st] = steps.as_slice() else { return None };
+        let Stmt::Assign { src, .. } = &body1[*st] else { unreachable!() };
+        // one element per iteration
+        if step_of(src, *p)? != 1 {
+            return None;
+        }
+        // the step is the iteration's last use of p
+        if body1[*st + 1..].iter().any(|s| crate::idioms::stmt_mentions(s, *p)) {
+            return None;
+        }
+        body1.remove(*st);
+        let addr = (*init).clone();
+        Stmt::rewrite_exprs(&mut body1, &mut |x| {
+            if matches!(x, Expr::Var(y) if y == p) {
+                *x = addr.clone();
+            }
+        });
     }
     // ctr2 = n - i
     match strip(c2src) {
@@ -129,7 +183,7 @@ fn shape_a(b: &[Stmt], k: usize) -> Option<(VarId, Expr, Vec<Stmt>)> {
         return None;
     }
     // the leading statements are temps for `n - 8`
-    if t[..m - 3].iter().any(|s| !matches!(s, Stmt::Assign { dst: Expr::Var(_), .. })) {
+    if t[..q].iter().any(|s| !matches!(s, Stmt::Assign { dst: Expr::Var(_), .. })) {
         return None;
     }
     Some((*i, n.clone(), body1))

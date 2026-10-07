@@ -80,9 +80,26 @@ struct Em<'a> {
     vt_ret_hint: Option<Type>,
     /// the body assigns to `this`: it is copied into a local `self`
     this_local: bool,
+    /// coercing the value of a store into a member (its declared type may be imprecise)
+    member_store: bool,
 }
 
 pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -> Emitted {
+    // locals typed after lifting (folded inline expansions) whose class can't be declared
+    // without constructor arguments stay untyped buffers
+    let mut fixed;
+    let ir = if !opts.c_mode && db.is_some() {
+        fixed = ir.clone();
+        let body = fixed.body.clone();
+        mwdec_lift::idioms::untype_undeclarable(&body, &mut fixed.vars, db);
+        if fixed.vars != ir.vars {
+            &fixed
+        } else {
+            ir
+        }
+    } else {
+        ir
+    };
     // C has no nullptr
     let c_opts;
     let opts = if opts.c_mode && opts.null == "nullptr" {
@@ -116,7 +133,7 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
             }
         }
     });
-    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), vt_count: 0, sret_local: None, gtypes: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false };
+    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), vt_count: 0, sret_local: None, gtypes: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false, member_store: false };
     // a static initializer: the global definitions it is generated from
     if ir.symbol.starts_with("__sinit_") {
         let mut em = new_em();
@@ -146,7 +163,7 @@ pub fn symbol_name(sym: &str) -> String {
     } else {
         sym.to_string()
     };
-    let n = strip_unnamed_ns(&n);
+    let n = types::split_closers(&strip_unnamed_ns(&n));
     // compiler-generated statics (`@123`) have no C++ spelling
     match n.strip_prefix('@') {
         Some(rest) => format!("_at_{}", rest.replace(|c: char| !c.is_ascii_alphanumeric(), "_")),
@@ -638,7 +655,8 @@ impl<'a> Em<'a> {
             }
             v
         };
-        let mut names: Vec<String> = fn_types(&ir.sig.qualified_name);
+        // (a free function's scope is a namespace)
+        let mut names: Vec<String> = fn_types(&ir.sig.qualified_name).into_iter().filter(|n| ir.sig.this_class.is_some() || n.starts_with('<')).collect();
         for v in &ir.vars {
             tnames(&v.ty, &mut names);
         }
@@ -903,8 +921,34 @@ impl<'a> Em<'a> {
     }
 
     fn block(&mut self, stmts: &[Stmt], depth: usize) {
-        for s in stmts {
-            self.stmt(s, depth);
+        let mut i = 0;
+        while i < stmts.len() {
+            // `v = f(); <implicit destructors>; return v;` is `return f();`: the value is
+            // computed before the locals are destroyed (a named `v` would add a copy)
+            if let Stmt::Assign { dst: Expr::Var(v), src } = &stmts[i] {
+                let mut j = i + 1;
+                while j < stmts.len() && matches!(&stmts[j], Stmt::Expr(x) if self.implicit_destruction(x)) {
+                    j += 1;
+                }
+                if j > i + 1
+                    && matches!(stmts.get(j), Some(Stmt::Return(Some(Expr::Var(w)))) if w == v)
+                    && matches!(self.ir.vars[*v].kind, VarKind::Local)
+                    && !src.uses_var(*v)
+                {
+                    let mut uses = std::collections::HashMap::new();
+                    mwdec_lift::inline::count_uses(&self.ir.body, &mut uses);
+                    if uses.get(v).copied().unwrap_or(0) == 1 {
+                        for s in &stmts[i + 1..j] {
+                            self.stmt(s, depth);
+                        }
+                        self.stmt(&Stmt::Return(Some(src.clone())), depth);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            self.stmt(&stmts[i], depth);
+            i += 1;
         }
     }
 
@@ -1080,7 +1124,9 @@ impl<'a> Em<'a> {
                 }
                 let dt = if matches!(dst, Expr::Var(_)) { local_type(&self.decl_type_rw(dst, false)) } else { self.decl_type_rw(dst, false) };
                 let d = self.lvalue(dst);
+                self.member_store = !matches!(dst, Expr::Var(_));
                 let v = self.coerce(src, &dt);
+                self.member_store = false;
                 let _ = writeln!(self.out, "{ind}{d} = {v};");
             }
             Stmt::If { cond, then, els } => {
@@ -1301,6 +1347,30 @@ impl<'a> Em<'a> {
                 Expr::Var(v) => return self.ir.this_var == Some(*v),
                 _ => return false,
             }
+        }
+    }
+
+    /// Is the member access `e` rendered through an inline getter that returns a non-const
+    /// reference or pointer?
+    fn read_via_nonconst_getter(&self, e: &Expr) -> bool {
+        let Some(db) = self.db else { return false };
+        let (base, off, ptr, ty) = match e {
+            Expr::Load { base, offset, ty } => (&**base, *offset, true, ty),
+            Expr::Member { base, offset, ty } => (&**base, *offset, false, ty),
+            _ => return false,
+        };
+        let bt = ty_of(base, self.vars());
+        let Some(ct) = (if ptr { pointee(&bt).cloned() } else { Some(bt) }) else { return false };
+        let ctr = mwdec_lift::types::resolve(Some(db), strip_cv(&ct)).into_owned();
+        let Some(cls) = named(&ctr) else { return false };
+        let want = if matches!(ty, Type::Unknown { size: 0 }) { 0 } else { scalar_size(ty).unwrap_or(0) };
+        let Some((path, _)) = field_path(db, cls, off, want) else { return false };
+        match path.last() {
+            Some(PathElem::Field(n, owner)) if !self.field_accessible(owner, n) => self.accessor_decl(owner, n).is_some_and(|(_, rt)| match strip_cv(&rt) {
+                Type::Ref(x) | Type::Ptr(x) => !matches!(**x, Type::Const(_)),
+                _ => false,
+            }),
+            _ => false,
         }
     }
 
@@ -1538,6 +1608,18 @@ impl<'a> Em<'a> {
 
     /// Render `e` converted to type `to` (casts where C++ wouldn't convert implicitly).
     fn coerce(&mut self, e: &Expr, to: &Type) -> String {
+        // a value the lifter couldn't recover (stack-passed argument, uninitialized register):
+        // a placeholder of the wanted type
+        if let Expr::Unknown { text, .. } = e {
+            let note = format!("/* {} */", text.replace("*/", "* /"));
+            let tr = mwdec_lift::types::resolve(self.db, strip_cv(to)).into_owned();
+            return match strip_cv(to) {
+                Type::Ref(inner) => format!("*({})0 {note}", ptr_to(strip_cv(inner))),
+                Type::Void | Type::Unknown { .. } => format!("0 {note}"),
+                t if mwdec_lift::types::is_aggregate(self.db, &tr) => format!("*({})0 {note}", ptr_to(t)),
+                t => format!("({})0 {note}", type_str(t)),
+            };
+        }
         // (an unknown virtual method: the stand-in class's slot gets this return type)
         if let Expr::Call { callee: Callee::Virtual { sig: vs, .. }, ret: Type::Void | Type::Unknown { .. }, .. } = e {
             if vs.as_ref().map_or(true, |s| self.method_name(s).is_empty()) && !matches!(strip_cv(to), Type::Void | Type::Unknown { size: 0 } | Type::Ref(_)) {
@@ -1643,6 +1725,14 @@ impl<'a> Em<'a> {
             }
             (Type::Ptr(_), Type::Int { .. } | Type::Unknown { .. } | Type::Bool) => e.as_int() != Some(0),
             (Type::Ptr(_), Type::Named(_)) => true,
+            // an object made from a pointer: its converting constructor (maybe `explicit`);
+            // without one, the address of an object passed by value (the object there)
+            (Type::Named(n), Type::Ptr(_)) if mwdec_lift::types::is_aggregate(self.db, tos) && e.as_int().is_none() => {
+                let key = strip_template_args(n);
+                let last = sig::split_scope(&key).1.to_string();
+                let ptr_ctor = self.db.and_then(|db| db.decls.get(&format!("{key}::{last}"))).is_some_and(|ds| ds.iter().any(|d| d.params.len() == 1 && is_ptr(strip_cv(&d.params[0].ty))));
+                return if ptr_ctor { format!("{}({})", type_str(tos), self.expr(e, 0)) } else { format!("*({}){}", ptr_to(tos), self.expr(e, 14)) };
+            }
             (Type::FuncPtr(_), Type::Int { .. } | Type::Unknown { .. } | Type::Long { .. }) => e.as_int() != Some(0),
             (Type::Int { .. } | Type::Unknown { .. } | Type::Bool, Type::Ptr(_) | Type::FuncPtr(_)) => true,
             (Type::Named(a), Type::Named(b)) => sig::norm_name(a) != sig::norm_name(b) && !self.is_base_of(Some(tos), froms),
@@ -1707,15 +1797,12 @@ impl<'a> Em<'a> {
     /// Does the method's header declaration return a reference to const (or is it the const
     /// overload of a const/non-const pair, which a const object selects)?
     fn returns_const_ref(&self, s: &mwdec_core::FuncSig, nargs: usize) -> bool {
-        if matches!(strip_cv(&s.ret), Type::Ref(x) if matches!(**x, Type::Const(_))) {
-            return true;
-        }
-        let Some(db) = self.db else { return false };
+        // (the header declarations win over a signature reconstructed elsewhere)
         let key = strip_template_args(&s.qualified_name);
-        db.decls.get(&key).map_or(false, |ds| {
-            ds.iter().filter(|d| d.params.len() == nargs).all(|d| matches!(strip_cv(&d.ret), Type::Ref(x) if matches!(**x, Type::Const(_))))
-                && ds.iter().any(|d| d.params.len() == nargs)
-        })
+        if let Some(ds) = self.db.and_then(|db| db.decls.get(&key)).filter(|ds| ds.iter().any(|d| d.params.len() == nargs)) {
+            return ds.iter().filter(|d| d.params.len() == nargs).all(|d| matches!(strip_cv(&d.ret), Type::Ref(x) if matches!(**x, Type::Const(_))));
+        }
+        matches!(strip_cv(&s.ret), Type::Ref(x) if matches!(**x, Type::Const(_)))
     }
 
     /// Is the lvalue `e` const in C++ (rooted at `this` of a const method, or at a parameter
@@ -1743,6 +1830,13 @@ impl<'a> Em<'a> {
     }
 
     fn const_ref_call(&self, this_e: &Expr, ms: &mwdec_core::FuncSig, nargs: usize) -> bool {
+        // (only a reference result is an lvalue: a value result is a temporary)
+        let key = strip_template_args(&ms.qualified_name);
+        let by_ref = matches!(strip_cv(&ms.ret), Type::Ref(_))
+            || self.db.and_then(|db| db.decls.get(&key)).is_some_and(|ds| ds.iter().any(|d| d.params.len() == nargs && matches!(strip_cv(&d.ret), Type::Ref(_))));
+        if !by_ref {
+            return false;
+        }
         if self.returns_const_ref(ms, nargs) {
             return true;
         }
@@ -1931,10 +2025,22 @@ impl<'a> Em<'a> {
             // dropped `const`): leave those conversions to the source types)
             // (a cast between function pointer types changes no code; declared types of
             // members may differ from their DWARF spelling in `const` parameters)
-            (a, b) if fptr(a) && fptr(b) => type_str(a) != type_str(b) || matches!(e, Expr::Load { .. } | Expr::Member { .. } | Expr::Var(_)),
+            // (not into members: their DWARF types may have lost the `const` the header has)
+            (a, b) if fptr(a) && fptr(b) => {
+                !self.member_store
+                    && !matches!(e, Expr::FuncAddr { symbol } if sig::sig_of(symbol, self.db).qualified_name.contains("::"))
+                    && (type_str(a) != type_str(b) || matches!(e, Expr::Load { .. } | Expr::Member { .. } | Expr::Var(_)))
+            }
             // (a function's address converted to the pointer type wanted: its declaration may
             // have other parameter types)
-            (a, b) if fptr(a) => !(matches!(e, Expr::Int { value: 0, .. })) && (intlike(b) || is_ptr(b) || matches!(e, Expr::FuncAddr { .. })),
+            (a, b) if fptr(a) => {
+                !(matches!(e, Expr::Int { value: 0, .. }))
+                    && match e {
+                        // (C function pointer members are spelled as declared)
+                        Expr::FuncAddr { symbol } => (!self.member_store || self.opts.c_mode) && !sig::sig_of(symbol, self.db).qualified_name.contains("::"),
+                        _ => intlike(b) || is_ptr(b),
+                    }
+            }
             (a, b) if fptr(b) => intlike(a) || (is_ptr(a) && !matches!(pointee(a).map(strip_cv), Some(Type::Void))),
             (a, b) if is_enum(a) => (intlike(b) && e.as_int().is_none()) || (is_enum(b) && a != b) || e.as_int().is_some(),
             _ => false,
@@ -2055,8 +2161,19 @@ impl<'a> Em<'a> {
         let t = extern_type(ty);
         let dt = self.gtypes.get(symbol).cloned().unwrap_or_else(|| t.clone());
         if let Some(st) = local_static_name(symbol) {
-            // function-local static (`init$90`): declared in the body
-            self.local_statics.insert(format!("static {};", decl(&dt, &st)));
+            // function-local static (`init$90`): declared in the body, with its initial value
+            // when the object has one (initialized data sections)
+            let g = self.ir.globals.iter().find(|g| g.symbol == symbol);
+            let init = g.and_then(|g| g.init.as_ref().map(|b| (b.clone(), g.section.clone().unwrap_or_default())));
+            match init.as_ref().and_then(|(b, sec)| static_init(&dt, b).map(|i| (i, sec.clone()))) {
+                Some((i, sec)) => {
+                    let cq = if matches!(sec.as_str(), ".rodata" | ".sdata2") { "const " } else { "" };
+                    self.local_statics.insert(format!("static {cq}{} = {i};", decl(&dt, &st)));
+                }
+                None => {
+                    self.local_statics.insert(format!("static {};", decl(&dt, &st)));
+                }
+            }
             return reinterpret_global(st, &t, &dt);
         }
         if let Some((ns, n)) = self.undeclared_ns_scope(symbol) {
@@ -2210,6 +2327,10 @@ impl<'a> Em<'a> {
     fn reachable(&self, path: &[PathElem], read: bool) -> bool {
         for (i, p) in path.iter().enumerate() {
             if let PathElem::Field(n, owner) = p {
+                // (the vtable pointer is no member one can name)
+                if n.starts_with("__vptr") || n.starts_with("__vt") {
+                    return false;
+                }
                 if self.field_accessible(owner, n) {
                     continue;
                 }
@@ -2330,11 +2451,14 @@ impl<'a> Em<'a> {
         }
         let p = self.path_str(&path, read);
         // a store through a pointer to const
+        // (not `this` of a const method: members written there are `mutable`)
         let bd = match b {
-            Expr::Load { .. } | Expr::Member { .. } => self.decl_type_rw(b, true),
-            e => ty_of(e, self.vars()),
+            Expr::Load { .. } | Expr::Member { .. } => {
+                let d = self.decl_type_rw(b, true);
+                if is_ptr(strip_cv(&d)) { d } else { ty_of(b, self.vars()) }
+            }
+            _ => Type::Void,
         };
-        let bd = if is_ptr(strip_cv(&bd)) { bd } else { ty_of(b, self.vars()) };
         let bs = match (read, ptr, pointee(strip_cv(&bd))) {
             (false, true, Some(Type::Const(x))) => format!("const_cast<{}>({})", ptr_to(x), self.expr(b, 0)),
             _ => self.expr(b, 15),
@@ -2424,7 +2548,7 @@ impl<'a> Em<'a> {
                 if let Some(s) = self.typed_member(inner, &target) {
                     // a const view (getter returning a const reference, const `this`): a
                     // non-const method needs the object non-const
-                    if !is_const_method && (self.typed_member_via_const_getter(inner, &target) || self.const_lvalue(inner)) {
+                    if !is_const_method && (self.typed_member_via_const_getter(inner, &target) || (self.const_lvalue(inner) && !self.read_via_nonconst_getter(inner))) {
                         return format!("const_cast<{c}&>({s}).");
                     }
                     return format!("{s}.");
@@ -2433,9 +2557,11 @@ impl<'a> Em<'a> {
             if named(&it).is_some() || class.is_none() {
                 if !is_const_method && matches!(&**inner, Expr::Load { .. } | Expr::Member { .. }) {
                     let dt = self.decl_type_rw(inner, true);
-                    if matches!(dt, Type::Const(_)) || self.const_lvalue(inner) {
-                        if let Some(n) = named(&it) {
-                            let n = n.to_string();
+                    // (a getter returning a non-const reference gives a modifiable object even
+                    // on a const one)
+                    if matches!(dt, Type::Const(_)) || (self.const_lvalue(inner) && !self.read_via_nonconst_getter(inner)) {
+                        let n = named(strip_cv(&dt)).filter(|_| !matches!(dt, Type::Unknown { .. })).or(named(&it)).map(|s| s.to_string());
+                        if let Some(n) = n {
                             return format!("const_cast<{n}&>({}).", self.expr(inner, 0));
                         }
                     }
@@ -2521,6 +2647,38 @@ impl<'a> Em<'a> {
         let key = strip_template_args(&s.qualified_name);
         let ds = db.decls.get(&key)?;
         ds.iter().find(|d| d.params.len() == nargs && d.is_const == s.is_const).or_else(|| ds.iter().find(|d| d.params.len() == nargs)).map(|d| d.access)
+    }
+
+    fn ctor_factory(&self, owner: &str, nargs: usize) -> Option<String> {
+        let db = self.db?;
+        let key = strip_template_args(owner);
+        let last = sig::split_scope(&key).1.to_string();
+        // every constructor of that arity is out of reach
+        let ctors: Vec<&mwdec_core::DeclInfo> = db.decls.get(&format!("{key}::{last}"))?.iter().filter(|d| d.params.len() == nargs).collect();
+        if ctors.is_empty() || ctors.iter().any(|d| self.member_access_ok(owner, d.access)) {
+            return None;
+        }
+        let prefix = format!("{key}::");
+        for (name, ds) in db.decls.range(prefix.clone()..) {
+            if !name.starts_with(&prefix) {
+                break;
+            }
+            let m = &name[prefix.len()..];
+            if m.contains("::") {
+                continue;
+            }
+            for d in ds {
+                if !d.is_static || d.access != mwdec_core::Access::Public || d.params.len() != nargs {
+                    continue;
+                }
+                let names: Vec<String> = d.params.iter().map(|p| p.name.clone().unwrap_or_default()).collect();
+                let want = format!("return {last} ( {} ) ;", names.join(" , "));
+                if d.inline_body.as_deref() == Some(want.as_str()) && names.iter().all(|n| !n.is_empty()) {
+                    return Some(m.to_string());
+                }
+            }
+        }
+        None
     }
 
     /// Can this function call a method of `owner` with the given access?
@@ -2916,6 +3074,12 @@ impl<'a> Em<'a> {
                 }
             }
             Expr::Construct { class, ctor, args } => {
+                // an inaccessible constructor: the class's public static factory that only
+                // forwards to it (`static T FromX(float x) { return T(x); }`)
+                if let Some(f) = named(strip_cv(class)).and_then(|c| self.ctor_factory(c, args.len())) {
+                    let a = self.args(args, ctor.as_ref());
+                    return format!("{}::{f}({a})", type_str(class));
+                }
                 let a = self.args(args, ctor.as_ref());
                 format!("{}({a})", type_str(class))
             }
@@ -3094,7 +3258,13 @@ impl<'a> Em<'a> {
                 // signature, so MWCC emits the real virtual-call sequence (vptr into r12)
                 let mut ptys = vec![];
                 for a in args {
-                    ptys.push(type_str(&value_type(&ty_of(a, self.vars()))));
+                    let t = value_type(&ty_of(a, self.vars()));
+                    // (the address of a const object: a pointer to const)
+                    let t = match (&t, a) {
+                        (Type::Ptr(x), Expr::AddrOf(o)) if !matches!(**x, Type::Const(_)) && self.const_lvalue(o) => Type::Ptr(Box::new(Type::Const(x.clone()))),
+                        _ => t,
+                    };
+                    ptys.push(type_str(&t));
                 }
                 let ret_t = match (ret, self.vt_ret_hint.take()) {
                     (Type::Void | Type::Unknown { .. }, Some(h)) => h,
@@ -3385,6 +3555,62 @@ fn reinterpret_global(name: String, t: &Type, dt: &Type) -> String {
         return name;
     }
     format!("(*({})&{name})", ptr_to(t))
+}
+
+/// Initializer text for an object of type `t` holding `bytes` (big-endian): scalars and arrays
+/// of scalars (nested arrays flattened by braces).
+fn static_init(t: &Type, bytes: &[u8]) -> Option<String> {
+    fn val(t: &Type, b: &[u8]) -> Option<String> {
+        let rd = |n: usize| -> Option<u64> { (b.len() >= n).then(|| b[..n].iter().fold(0u64, |a, x| (a << 8) | *x as u64)) };
+        Some(match strip_cv(t) {
+            Type::Int { size, signed } => {
+                let n = *size as usize;
+                let x = rd(n)?;
+                let v = if *signed && n < 8 { ((x << (64 - 8 * n)) as i64) >> (64 - 8 * n) } else { x as i64 };
+                if !*signed && n == 4 && v > i32::MAX as i64 {
+                    format!("{v}u")
+                } else if n == 8 {
+                    format!("{v}LL")
+                } else {
+                    format!("{v}")
+                }
+            }
+            Type::Long { signed } => {
+                let x = rd(4)?;
+                if *signed { format!("{}", x as u32 as i32) } else { format!("{x}u") }
+            }
+            Type::Char => format!("{}", rd(1)? as u8 as i8),
+            Type::Bool => match rd(1)? {
+                0 => "false".into(),
+                1 => "true".into(),
+                _ => return None,
+            },
+            Type::Float { size: 4 } => float::format_float(rd(4)?, false),
+            Type::Float { size: 8 } => float::format_float(rd(8)?, true),
+            Type::Unknown { size: s @ (1 | 2 | 4) } => format!("{}", rd(*s as usize)?),
+            Type::Ptr(_) if rd(4)? == 0 => "0".into(),
+            Type::Array(e, n) => {
+                let es = mwdec_lift::types::size_of(None, e)? as usize;
+                if es == 0 || b.len() < es * *n as usize {
+                    return None;
+                }
+                let parts: Option<Vec<String>> = (0..*n as usize).map(|k| val(e, &b[k * es..])).collect();
+                format!("{{{}}}", parts?.join(", "))
+            }
+            // byte buffers
+            Type::Unknown { size } => {
+                let n = *size as usize;
+                if b.len() < n {
+                    return None;
+                }
+                format!("{{{}}}", b[..n].iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+            }
+            _ => return None,
+        })
+    }
+    let s = val(t, bytes)?;
+    // a scalar initializer of a byte-array declaration is a brace list too
+    Some(s)
 }
 
 /// C++ name of a function-local static symbol (`init$90`, `buf$11_803DF590`), if it is one.

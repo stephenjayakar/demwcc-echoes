@@ -864,24 +864,39 @@ pub fn propagate_constant_temps(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[b
 /// `t = G; if (c(t)) { *(t + k) = x; }` -> the global read again in each use: the source read
 /// `G` twice and MWCC CSE'd the second read (nothing in between may store to it). Naming it
 /// gives the value its own variable (different registers).
-pub fn rematerialize_global_temps(body: &mut Vec<Stmt>, is_temp: &[bool]) {
+pub fn rematerialize_global_temps(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
     let mut uses: HashMap<VarId, usize> = HashMap::new();
     crate::inline::count_uses(body, &mut uses);
     Stmt::for_each_block_mut(body, &mut |b| {
         let mut i = 0;
         while i + 1 < b.len() {
+            // a global, or a member read through a variable (`t = p->cb; if (t) t(0);`)
+            let simple_read = |g: &Expr| match g {
+                Expr::Global { .. } => true,
+                // (not stack objects: their single read lets the object fold away)
+                Expr::Load { base, .. } | Expr::Member { base, .. } => matches!(&**base, Expr::Var(v) if !matches!(vars[*v].kind, VarKind::Stack { .. })),
+                _ => false,
+            };
             let (t, g) = match &b[i] {
-                Stmt::Assign { dst: Expr::Var(t), src: g @ Expr::Global { .. } } if is_temp.get(*t).copied().unwrap_or(false) => (*t, g.clone()),
+                Stmt::Assign { dst: Expr::Var(t), src: g } if is_temp.get(*t).copied().unwrap_or(false) && simple_read(g) => (*t, g.clone()),
                 _ => {
                     i += 1;
                     continue;
                 }
+            };
+            let base_var = match &g {
+                Expr::Load { base, .. } | Expr::Member { base, .. } => match &**base {
+                    Expr::Var(v) => Some(*v),
+                    _ => None,
+                },
+                _ => None,
             };
             let total = uses.get(&t).copied().unwrap_or(0);
             let ok = match &b[i + 1] {
                 Stmt::If { cond, then, els } => {
                     let mut n = 0;
                     cond.walk(&mut |e| if matches!(e, Expr::Var(x) if *x == t) { n += 1 });
+                    let in_cond = n;
                     // uses in the first statement of each arm, which is a plain store or
                     // assignment without calls
                     let mut arm_ok = true;
@@ -891,14 +906,35 @@ pub fn rematerialize_global_temps(body: &mut Vec<Stmt>, is_temp: &[bool]) {
                             if !m {
                                 continue;
                             }
-                            let plain = matches!(s, Stmt::Assign { src, .. } if !src.has_call());
+                            // a call whose callee or plain arguments read it (evaluated before
+                            // the call)
+                            let call_ok = |c: &Expr| match c {
+                                Expr::Call { callee, args, .. } => {
+                                    let callee_ok = match callee {
+                                        Callee::Indirect(f) => !f.has_call(),
+                                        Callee::Direct { .. } => true,
+                                        _ => false,
+                                    };
+                                    callee_ok && args.iter().all(|a| !a.has_call())
+                                }
+                                _ => false,
+                            };
+                            let assigns_base = base_var.map_or(false, |v| matches!(s, Stmt::Assign { dst: Expr::Var(x), .. } if *x == v));
+                            let plain = !assigns_base
+                                && match s {
+                                    Stmt::Assign { src, .. } => !src.has_call() || call_ok(src),
+                                    Stmt::Expr(c) => call_ok(c),
+                                    _ => false,
+                                };
                             if k != 0 || !plain {
                                 arm_ok = false;
                             }
                             Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| if matches!(e, Expr::Var(x) if *x == t) { n += 1 });
                         }
                     }
-                    arm_ok && n == total && n >= 2 && !cond.has_call()
+                    // read in the test and again in an arm (a value only tested keeps its one
+                    // read: re-reading it there would let MWCC CSE a later read too)
+                    arm_ok && n == total && in_cond >= 1 && n > in_cond && !cond.has_call()
                 }
                 _ => false,
             };

@@ -8,6 +8,31 @@ use crate::types;
 use mwdec_core::{Type, TypeDb};
 use std::collections::HashSet;
 
+/// Every statement of a body, nested ones included.
+fn each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
+    for s in body {
+        f(s);
+        match s {
+            Stmt::If { then, els, .. } => {
+                each_stmt(then, f);
+                each_stmt(els, f);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => each_stmt(body, f),
+            Stmt::For { init, step, body, .. } => {
+                each_stmt(init, f);
+                each_stmt(step, f);
+                each_stmt(body, f);
+            }
+            Stmt::Switch { cases, .. } => {
+                for c in cases {
+                    each_stmt(&c.body, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Does the function construct an object of another class into its first parameter, with an
 /// unknown return type? Then that "parameter" is the hidden struct-return pointer (the mangled
 /// name has no return type and the headers don't declare the function).
@@ -21,6 +46,25 @@ pub fn constructs_into_param0(ir: &IrFunction) -> bool {
     let Some(&p0) = ir.params.first() else { return false };
     let p0_class = named(&ir.vars[p0].ty).map(sig::norm_name).or_else(|| pointee(&ir.vars[p0].ty).and_then(named).map(sig::norm_name));
     let mut found = false;
+    // a store through a pointer/reference-to-const first parameter: C++ can't write there, so
+    // that register is the hidden struct-return pointer
+    let p0_const = ir.sig.params.first().is_some_and(|p| matches!(strip_cv(&p.ty), Type::Ref(x) | Type::Ptr(x) if matches!(**x, Type::Const(_))));
+    if p0_const {
+        let mut stores = false;
+        each_stmt(&ir.body, &mut |s| {
+            if let Stmt::Assign { dst, .. } = s {
+                let into = match dst {
+                    Expr::Var(v) => *v == p0,
+                    Expr::Load { base, .. } | Expr::Member { base, .. } => matches!(&**base, Expr::Var(v) if *v == p0),
+                    _ => false,
+                };
+                stores |= into;
+            }
+        });
+        if stores {
+            return true;
+        }
+    }
     Stmt::walk_exprs(&ir.body, &mut |e| {
         if let Expr::Call { callee: Callee::Method { sig: s, this, .. }, .. } = e {
             if sig::is_ctor(s) {
@@ -40,7 +84,7 @@ pub fn constructs_into_param0(ir: &IrFunction) -> bool {
 
 /// A guessed struct return (`StructRet` pointing at an unknown type) takes the class of the
 /// object constructed into it.
-fn type_guessed_sret(ir: &mut IrFunction) {
+fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) {
     let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return };
     if !matches!(pointee(&ir.vars[sret].ty), Some(Type::Unknown { .. })) {
         return;
@@ -53,6 +97,41 @@ fn type_guessed_sret(ir: &mut IrFunction) {
             }
         }
     });
+    // or of an object stored there whole
+    if cls.is_none() {
+        each_stmt(&ir.body, &mut |s| {
+            if let Stmt::Assign { dst: Expr::Load { base, offset: 0, .. }, src: Expr::Construct { class, .. } } = s {
+                if cls.is_none() && matches!(&**base, Expr::Var(v) if *v == sret) {
+                    cls = named(class).map(|n| n.to_string());
+                }
+            }
+        });
+    }
+    // or, filled member by member, the class of a by-reference parameter that spans the stores
+    // (`T f(const T& a, const T& b)` helpers)
+    if let (None, Some(db)) = (&cls, db) {
+        let mut extent = 0i32;
+        let mut any = false;
+        each_stmt(&ir.body, &mut |s| {
+            if let Stmt::Assign { dst: Expr::Load { base, offset, ty } | Expr::Member { base, offset, ty }, .. } = s {
+                if matches!(&**base, Expr::Var(v) if *v == sret) {
+                    any = true;
+                    extent = extent.max(offset + types::size_of(Some(db), ty).unwrap_or(4) as i32);
+                }
+            }
+        });
+        if any {
+            cls = ir.sig.params.iter().find_map(|p| {
+                let t = match strip_cv(&p.ty) {
+                    Type::Ref(x) => strip_cv(x).clone(),
+                    _ => return None,
+                };
+                let n = named(&t)?.to_string();
+                // (the stores fill exactly such an object)
+                (types::size_of(Some(db), &t)? as i32 == extent && types::is_aggregate(Some(db), &t)).then_some(n)
+            });
+        }
+    }
     if let Some(c) = cls {
         ir.vars[sret].ty = t_ptr(Type::Named(c.clone()));
         ir.sig.ret = Type::Named(c);
@@ -60,7 +139,7 @@ fn type_guessed_sret(ir: &mut IrFunction) {
 }
 
 pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
-    type_guessed_sret(ir);
+    type_guessed_sret(ir, db);
     let vars = ir.vars.clone();
     fold_new(&mut ir.body, &vars);
     let this = ir.this_var;
@@ -182,27 +261,80 @@ fn construct_from_stores(stores: &[(i32, Expr)], ret: &Type, db: Option<&TypeDb>
 
 /// `return obj` for member-wise stores that copy every member of another object of the
 /// returned type (an inlined trivial copy constructor).
-fn copy_from_stores(stores: &[(i32, Expr)], ret: &Type, db: Option<&TypeDb>) -> Option<Expr> {
+fn copy_from_stores(stores: &[(i32, Expr)], ret: &Type, db: Option<&TypeDb>, temps: &std::collections::HashMap<VarId, Expr>) -> Option<Expr> {
     let db = db?;
     let cls = named(&types::resolve(Some(db), ret)).map(|s| s.to_string())?;
-    let mut fields = vec![];
-    if !flat_fields(db, &cls, 0, &mut fields, 0) || fields.len() != stores.len() || fields.is_empty() {
+    // whole members copied (`r.mList = o.mList`) cover their leaves; single-definition temps
+    // read from the source object count as reads of it
+    let mut leaves: Vec<(i32, Expr)> = vec![];
+    for (off, v) in stores {
+        let v = match v {
+            Expr::Var(t) => temps.get(t).cloned().unwrap_or_else(|| v.clone()),
+            v => v.clone(),
+        };
+        let (base, boff, ptr, ty) = match &v {
+            Expr::Load { base, offset, ty } => ((**base).clone(), *offset, true, ty.clone()),
+            Expr::Member { base, offset, ty } => ((**base).clone(), *offset, false, ty.clone()),
+            _ => {
+                leaves.push((*off, v.clone()));
+                continue;
+            }
+        };
+        let rt = types::resolve(Some(db), &ty).into_owned();
+        let mut sub = vec![];
+        match named(&rt) {
+            Some(c) if types::is_aggregate(Some(db), &rt) && flat_fields(db, c, 0, &mut sub, 0) => {
+                for (lo, lt) in sub {
+                    let e = if ptr {
+                        Expr::Load { base: Box::new(base.clone()), offset: boff + lo, ty: lt }
+                    } else {
+                        Expr::Member { base: Box::new(base.clone()), offset: boff + lo, ty: lt }
+                    };
+                    leaves.push((*off + lo, e));
+                }
+            }
+            _ => leaves.push((*off, v.clone())),
+        }
+    }
+    let stores = &leaves[..];
+    // every byte of the object copied once, from one source object at the same relative offset
+    let size = types::size_of(Some(db), &Type::Named(cls.clone()))? as usize;
+    if size == 0 || size > 0x400 {
         return None;
     }
+    let mut covered = vec![false; size];
     let mut src: Option<(&Expr, i32, bool)> = None;
-    for (off, _) in &fields {
-        let (_, v) = stores.iter().find(|(o, _)| o == off)?;
-        let (base, boff, ptr) = match v {
-            Expr::Load { base, offset, .. } => (&**base, *offset, true),
-            Expr::Member { base, offset, .. } => (&**base, *offset, false),
+    for (off, v) in stores {
+        let (base, boff, ptr, ty) = match v {
+            Expr::Load { base, offset, ty } => (&**base, *offset, true, ty),
+            Expr::Member { base, offset, ty } => (&**base, *offset, false, ty),
             _ => return None,
         };
+        let n = types::size_of(Some(db), ty).filter(|n| *n > 0)? as usize;
         let start = boff - off;
         match src {
             None => src = Some((base, start, ptr)),
             Some((b, s0, p)) if b == base && s0 == start && p == ptr => {}
             _ => return None,
         }
+        let o = usize::try_from(*off).ok()?;
+        if o + n > size || covered[o..o + n].iter().any(|c| *c) {
+            return None;
+        }
+        covered[o..o + n].iter_mut().for_each(|c| *c = true);
+    }
+    // padding bytes need no copy: only the members' bytes must be covered
+    let mut fields = vec![];
+    if flat_fields(db, &cls, 0, &mut fields, 0) {
+        for (fo, ft) in &fields {
+            let n = types::size_of(Some(db), ft).unwrap_or(0) as usize;
+            let o = *fo as usize;
+            if o + n > size || covered[o..o + n].iter().any(|c| !*c) {
+                return None;
+            }
+        }
+    } else if covered.iter().any(|c| !*c) {
+        return None;
     }
     let (base, start, ptr) = src?;
     Some(if ptr {
@@ -239,6 +371,20 @@ fn fold_struct_return(body: &mut Vec<Stmt>, sret: VarId, ret: &Type, db: Option<
     }
     // `if (a) { R = x; } else { R = y; } return;`: each branch returns its own object
     Stmt::for_each_block_mut(body, &mut |b| distribute_sret_return(b, sret));
+    // single-definition temps holding a member read (`t = o->m; ... R.m = t;`)
+    let temps: std::collections::HashMap<VarId, Expr> = {
+        let mut defs: std::collections::HashMap<VarId, (usize, Expr)> = Default::default();
+        let mut snap = body.clone();
+        Stmt::for_each_block_mut(&mut snap, &mut |b| {
+            for s in b.iter() {
+                if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+                    let e = defs.entry(*v).or_insert((0, src.clone()));
+                    e.0 += 1;
+                }
+            }
+        });
+        defs.into_iter().filter(|(_, (n, e))| *n == 1 && matches!(e, Expr::Load { .. } | Expr::Member { .. }) && !e.has_call()).map(|(v, (_, e))| (v, e)).collect()
+    };
     Stmt::for_each_block_mut(body, &mut |b| {
         // constructor call on the return slot
         let mut i = 0;
@@ -260,19 +406,36 @@ fn fold_struct_return(body: &mut Vec<Stmt>, sret: VarId, ret: &Type, db: Option<
         if let Some(rp) = b.iter().position(|s| matches!(s, Stmt::Return(None))) {
             let mut k = rp;
             let mut stores = vec![];
+            // temps loaded in between (`t = o->a; R.b = o->b; R.a = t;`): part of the copy
+            let mut temp_defs: Vec<VarId> = vec![];
             while k > 0 {
                 match &b[k - 1] {
                     Stmt::Assign { dst: Expr::Load { base, offset, .. }, src } if matches!(**base, Expr::Var(v) if v == sret) && !src.uses_var(sret) => {
                         stores.push((*offset, src.clone()));
                         k -= 1;
                     }
+                    Stmt::Assign { dst: Expr::Var(t), .. } if temps.contains_key(t) && !stores.is_empty() => {
+                        temp_defs.push(*t);
+                        k -= 1;
+                    }
                     _ => break,
                 }
             }
+            // (a window must start with a store; leading temp defs belong to other code)
+            while k < rp && matches!(&b[k], Stmt::Assign { dst: Expr::Var(t), .. } if temp_defs.contains(t)) {
+                if let Stmt::Assign { dst: Expr::Var(t), .. } = &b[k] {
+                    let t = *t;
+                    temp_defs.retain(|x| *x != t);
+                }
+                k += 1;
+            }
+            // temps used outside the window can't be folded away
+            let outside = temp_defs.iter().any(|t| b.iter().enumerate().any(|(j, s)| (j < k || j > rp) && stmt_mentions(s, *t)));
             // a whole object stored (a call returning it) is no member-wise construction
             let whole = stores.iter().any(|(_, e)| matches!(e, Expr::Call { ret: r, .. } if types::is_aggregate(db, r)));
-            if !stores.is_empty() && !whole {
-                if let Some(e) = construct_from_stores(&stores, ret, db).or_else(|| copy_from_stores(&stores, ret, db)) {
+            if !stores.is_empty() && !whole && !outside {
+                let folded = if temp_defs.is_empty() { construct_from_stores(&stores, ret, db) } else { None };
+                if let Some(e) = folded.or_else(|| copy_from_stores(&stores, ret, db, &temps)) {
                     b.splice(k..=rp, [Stmt::Return(Some(e))]);
                 }
             }
@@ -324,6 +487,30 @@ fn distribute_sret_return(b: &mut Vec<Stmt>, sret: VarId) {
     if n >= 2 && matches!(b[n - 1], Stmt::Return(None)) && matches!(b[n - 2], Stmt::If { .. }) && ends_with_sret_def(&b[n - 2..n - 1], sret) {
         b.pop();
         push_return(b);
+        return;
+    }
+    // `switch (x) { case a: R = ..; break; ... default: R = ..; break; } return;`
+    if n >= 2 && matches!(b[n - 1], Stmt::Return(None)) {
+        if let Stmt::Switch { cases, .. } = &b[n - 2] {
+            let all = cases.iter().any(|c| c.is_default)
+                && cases.iter().all(|c| {
+                    let body = &c.body;
+                    match body.last() {
+                        Some(Stmt::Break) => ends_with_sret_def(&body[..body.len() - 1], sret),
+                        _ => false,
+                    }
+                });
+            if all {
+                if let Stmt::Switch { cases, .. } = &mut b[n - 2] {
+                    for c in cases.iter_mut() {
+                        if let Some(last) = c.body.last_mut() {
+                            *last = Stmt::Return(None);
+                        }
+                    }
+                }
+                b.pop();
+            }
+        }
     }
 }
 
@@ -568,7 +755,7 @@ fn memberwise_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Typ
                     Type::Ref(x) => strip_cv(x).clone(),
                     t => t.clone(),
                 });
-                match spellable_in_init(v, false, pty.as_ref(), &ir.body[..*k], &vars, this, Some(db)) {
+                match spellable_in_init(v, false, pty.as_ref(), &ir.body[..*k], &vars, this, Some(db), false) {
                     Some(e) => args.push(e),
                     None => break,
                 }
@@ -603,6 +790,7 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
         let refs: Vec<bool> = (0..init.args.len())
             .map(|i| init.ctor.as_ref().and_then(|s| s.params.get(i)).map_or(init.ctor.is_none(), |p| matches!(p.ty.unqualified(), Type::Ref(_))))
             .collect();
+        let members_ok = matches!(init.target, InitTarget::Member(_));
         let ptys: Vec<Option<Type>> = (0..init.args.len())
             .map(|i| init.ctor.as_ref().and_then(|s| s.params.get(i)).map(|p| match strip_cv(&p.ty) {
                 Type::Ref(x) => strip_cv(x).clone(),
@@ -610,7 +798,7 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
             }))
             .collect();
         for ((a, by_ref), pty) in init.args.iter_mut().zip(refs).zip(ptys) {
-            match spellable_in_init(a, by_ref, pty.as_ref(), &ir.body[..k], &vars, this, db) {
+            match spellable_in_init(a, by_ref, pty.as_ref(), &ir.body[..k], &vars, this, db, members_ok) {
                 Some(e) => *a = e,
                 None => {
                     ok = false;
@@ -696,6 +884,16 @@ fn no_default_member_store(st: &Stmt, this: VarId, own: &str, db: Option<&TypeDb
     // copies a one-member object)
     let f = c.fields.iter().find(|f| f.offset as i32 == *offset && f.bitfield.is_none())?;
     let ft = f.ty.clone();
+    // reference and const members can only be initialized in the list either
+    if matches!(ft, Type::Ref(_) | Type::Const(_)) && !src.uses_var(this) {
+        let fs = match &ft {
+            Type::Ref(_) => Some(4),
+            t => types::size_of(Some(db), t),
+        };
+        if fs == Some(size) || matches!(ft, Type::Ref(_)) {
+            return Some(Init { target: InitTarget::Member(f.name.clone()), ctor: None, args: vec![src.clone()], member_ty: Some(ft) });
+        }
+    }
     if !types::is_aggregate(Some(db), &ft) || default_constructible(Some(db), &ft) || types::size_of(Some(db), &ft) != Some(size) {
         return None;
     }
@@ -776,7 +974,7 @@ fn default_constructible(db: Option<&TypeDb>, t: &Type) -> bool {
 }
 
 /// `e` rewritten for an initializer list (see `late_ctor_inits`), or None.
-fn spellable_in_init(e: &Expr, by_ref: bool, pty: Option<&Type>, before: &[Stmt], vars: &[Var], this: VarId, db: Option<&TypeDb>) -> Option<Expr> {
+fn spellable_in_init(e: &Expr, by_ref: bool, pty: Option<&Type>, before: &[Stmt], vars: &[Var], this: VarId, db: Option<&TypeDb>, members_ok: bool) -> Option<Expr> {
     let stack_var = |e: &Expr| -> Option<VarId> {
         match e {
             Expr::Var(v) if matches!(vars[*v].kind, VarKind::Stack { .. }) => Some(*v),
@@ -798,7 +996,8 @@ fn spellable_in_init(e: &Expr, by_ref: bool, pty: Option<&Type>, before: &[Stmt]
         let mut ok = true;
         e.walk(&mut |x| {
             if let Expr::Var(v) = x {
-                if !matches!(vars[*v].kind, VarKind::Param { .. } | VarKind::This) || *v == this {
+                // (a member's initializer may read members built before it)
+                if !matches!(vars[*v].kind, VarKind::Param { .. } | VarKind::This) || (*v == this && !members_ok) {
                     ok = false;
                 }
             }
@@ -838,6 +1037,13 @@ fn spellable_in_init(e: &Expr, by_ref: bool, pty: Option<&Type>, before: &[Stmt]
             // a single-member object set by one store: a copy of the object the value came
             // from, or the member's value
             ([], None) if single_store(before, &slot_aliases(vars, v), vars, db).is_some() => single_store(before, &slot_aliases(vars, v), vars, db),
+            // filled member by member (an expanded inline constructor): that constructor
+            ([], None)
+                if (by_ref || !matches!(e, Expr::AddrOf(_)))
+                    && object_from_member_stores(e, v, pty, before, vars, db).is_some_and(|x| matches!(&x, Expr::Construct { args, .. } if args.iter().all(pure))) =>
+            {
+                object_from_member_stores(e, v, pty, before, vars, db)
+            }
             // never assigned as a whole: a default-constructed temporary (member-wise setup
             // stays in the body); an untyped one is spelled as the parameter's class
             ([], None) if default_constructible(db, &vars[v].ty) && (named(&vars[v].ty).is_some() || pty.map_or(true, |t| default_constructible(db, t))) => Some(e.clone()),
@@ -855,6 +1061,64 @@ fn spellable_in_init(e: &Expr, by_ref: bool, pty: Option<&Type>, before: &[Stmt]
     } else {
         None
     }
+}
+
+/// The class object a stack temporary holds when `before` fills it member by member (top-level
+/// stores only): built with a constructor that sets those members from its parameters, nested
+/// objects likewise.
+fn object_from_member_stores(_e: &Expr, v: VarId, pty: Option<&Type>, before: &[Stmt], vars: &[Var], db: Option<&TypeDb>) -> Option<Expr> {
+    let db = db?;
+    let aliases = slot_aliases(vars, v);
+    let cls_t = match named(&vars[v].ty) {
+        Some(_) => vars[v].ty.clone(),
+        None => pty?.clone(),
+    };
+    let cls = named(&types::resolve(Some(db), strip_cv(&cls_t)).into_owned())?.to_string();
+    let mut stores: Vec<(i32, Expr)> = vec![];
+    for s in before {
+        match s {
+            Stmt::Assign { dst: Expr::Member { base, offset, .. }, src } if matches!(&**base, Expr::Var(x) if aliases.contains(x)) => {
+                let src = inline_locals(src, before, vars, Some(db), 0)?;
+                stores.push((*offset, src));
+            }
+            s if aliases.iter().any(|&x| stmt_mentions(s, x)) && !matches!(s, Stmt::Expr(_)) => return None,
+            _ => {}
+        }
+    }
+    if stores.is_empty() {
+        return None;
+    }
+    build_object(db, &cls, 0, &stores, 0)
+}
+
+fn build_object(db: &TypeDb, cls: &str, base: i32, stores: &[(i32, Expr)], depth: u32) -> Option<Expr> {
+    if depth > 4 {
+        return None;
+    }
+    'ctor: for (cs, offs) in crate::construct::member_ctors(db, cls) {
+        let mut args = vec![];
+        for (p, o) in cs.params.iter().zip(&offs) {
+            let pt = match strip_cv(&p.ty) {
+                Type::Ref(x) => strip_cv(x).clone(),
+                t => t.clone(),
+            };
+            let pr = types::resolve(Some(db), &pt).into_owned();
+            if types::is_aggregate(Some(db), &pr) {
+                let Some(pc) = named(&pr) else { continue 'ctor };
+                match build_object(db, pc, base + o, stores, depth + 1) {
+                    Some(x) => args.push(x),
+                    None => continue 'ctor,
+                }
+            } else {
+                match stores.iter().find(|(so, _)| *so == base + o) {
+                    Some((_, x)) => args.push(x.clone()),
+                    None => continue 'ctor,
+                }
+            }
+        }
+        return Some(Expr::Construct { class: Type::Named(cls.to_string()), ctor: Some(cs), args });
+    }
+    None
 }
 
 /// `e` with every register local replaced by its single top-level definition in `before`.
@@ -1103,7 +1367,9 @@ pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) {
         Stmt::for_each_block_mut(&mut snap, &mut |b| {
             for i in 0..b.len().saturating_sub(1) {
                 if let Some((v, dst, _)) = def_lv(&b[i]) {
-                    if mentions(&b[i + 1], v) == 1 && matches!(b[i + 1], Stmt::Expr(_) | Stmt::Assign { .. } | Stmt::Return(_)) {
+                    // (a redefinition is no read: `v = a; v = b;`)
+                    let redef = matches!(&b[i + 1], Stmt::Assign { dst: d, .. } if d.uses_var(v));
+                    if !redef && mentions(&b[i + 1], v) == 1 && matches!(b[i + 1], Stmt::Expr(_) | Stmt::Assign { .. } | Stmt::Return(_)) {
                         let mut found = false;
                         Stmt::walk_exprs(std::slice::from_ref(&b[i + 1]), &mut |e| {
                             if *e == dst {
@@ -1409,7 +1675,9 @@ pub fn untype_undeclarable(body: &[Stmt], vars: &mut [Var], db: Option<&TypeDb>)
         let key = format!("{}::{}", strip_tmpl(&cls), strip_tmpl(sig::split_scope(&cls).1));
         let has_default = match db.decls.get(&key) {
             Some(ds) => ds.iter().any(|d| d.params.is_empty()),
-            None => true,
+            // (an instance of a class template the context never instantiates: nothing says
+            // it can be default-constructed)
+            None => !(cls.contains('<') && sig::find_class(db, &cls).is_none()),
         };
         if !has_default {
             var.ty = Type::Unknown { size };

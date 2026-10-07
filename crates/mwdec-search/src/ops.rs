@@ -1193,10 +1193,24 @@ fn op_remove_cast(m: &mut M) -> Option<Vec<Edit>> {
             _ => false,
         })
     };
+    // A pointer cast that is an operand of `+` / `-` sets the arithmetic's scale
+    // (`(char*)p + 8`): removing it changes the address, never just the form.
+    let arith = |n: usize| -> bool {
+        let mut p = c.parent(n);
+        while let Some(x) = p {
+            if c.kind(x) == "parenthesized_expression" {
+                p = c.parent(x);
+            } else {
+                break;
+            }
+        }
+        p.is_some_and(|x| c.kind(x) == "binary_expression" && matches!(c.op(x), Some("+" | "-")))
+    };
+    let ptr_cast = |n: usize| c.child(n, "type").is_some() && c.text(n).split(')').next().is_some_and(|t| t.contains('*'));
     let cands: Vec<usize> = m
         .of_kind(&["cast_expression"])
         .into_iter()
-        .filter(|&n| !(derefd(n) && c.child(n, "type").is_some() && c.text(n).split(')').next().is_some_and(|t| t.contains('*'))))
+        .filter(|&n| !(ptr_cast(n) && (derefd(n) || arith(n))))
         .collect();
     let n = m.pick(&cands)?;
     let v = c.child(n, "value")?;

@@ -90,6 +90,24 @@ fn simp(e: &mut Expr, vars: &[Var]) {
             }
         }
     }
+    // (x + ((u32)x >> 31)) >> 1  ==  x / 2 (signed; `srwi 31 ; add ; srawi 1`)
+    if let Expr::Binary { op: BinOp::Shr, l, r, .. } = e {
+        if r.as_int() == Some(1) {
+            if let Expr::Binary { op: BinOp::Add, l: a, r: b, .. } = uncast(l) {
+                let sign_of = |s: &Expr, x: &Expr| matches!(uncast(s), Expr::Binary { op: BinOp::Shr, l: y, r: k, .. } if k.as_int() == Some(31) && uncast(y) == uncast(x));
+                let x = if sign_of(a, b) { Some(b) } else if sign_of(b, a) { Some(a) } else { None };
+                if let Some(x) = x {
+                    let xv = uncast(x).clone();
+                    let signed_x = matches!(is_signed(&ty_of(&xv, vars)), Some(true) | None);
+                    if signed_x {
+                        let ty = t_s32();
+                        *e = Expr::Binary { op: BinOp::Div, l: Box::new(xv), r: Box::new(Expr::int(2)), ty };
+                        return;
+                    }
+                }
+            }
+        }
+    }
     // (signed char)c where c is a plain char (signed in MWCC): no-op
     if let Expr::Cast { ty: Type::Int { size: 1, signed: true }, e: x } = e {
         if matches!(strip_cv(&ty_of(x, vars)), Type::Char | Type::Int { size: 1, signed: true }) {

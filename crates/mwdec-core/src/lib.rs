@@ -361,6 +361,10 @@ pub struct TypeDb {
     /// written in the header (unqualified or partially qualified).
     #[serde(default)]
     pub friends: BTreeMap<String, Vec<String>>,
+    /// Variables declared at an absolute address (`vu16 __DSPRegs[32] : 0xCC005000;`, a
+    /// CodeWarrior extension DWARF doesn't describe): name -> address.
+    #[serde(default)]
+    pub abs_addrs: BTreeMap<String, u32>,
 }
 
 // ---------------------------------------------------------------- match results
