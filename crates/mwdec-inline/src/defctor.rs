@@ -32,6 +32,8 @@ pub enum CE {
     Load(Box<CE>, u32),
     /// a local the code never set (an empty object's byte copied from an unset temporary)
     Unset,
+    /// the result of a call to this function (by qualified name / parameter count)
+    Ret(String),
     /// `(char*)p + k` for parameter `p` (a pointer's value, or the address of an object
     /// passed by reference)
     Param(usize, i32),
@@ -78,6 +80,8 @@ struct Canon<'a> {
     unset: HashSet<VarId>,
     /// parameters
     params: HashSet<VarId>,
+    /// locals set once from a call's result: the callee
+    calls: HashMap<VarId, String>,
     defs: &'a HashMap<VarId, Expr>,
     db: &'a TypeDb,
 }
@@ -93,10 +97,12 @@ impl Canon<'_> {
                 Some(d) => self.val(d, depth + 1),
                 None if self.unset.contains(v) => Some(CE::Unset),
                 None if self.params.contains(v) => Some(CE::Param(*v, 0)),
-                None => None,
+                None => self.calls.get(v).map(|n| CE::Ret(n.clone())),
             },
             Expr::Int { value, .. } => Some(CE::Int(*value)),
             Expr::Float { bits, .. } => Some(CE::Float(*bits)),
+            // (only the copy-construction steps let calls through stores, see `op`)
+            Expr::Call { callee, .. } => call_name(callee).map(CE::Ret),
             Expr::Cast { e, .. } => self.val(e, depth + 1),
             Expr::AddrOf(x) => self.addr(x, depth + 1),
             Expr::Global { ty, .. } | Expr::Load { ty, .. } | Expr::Member { ty, .. } => Some(CE::Load(Box::new(self.addr(e, depth + 1)?), size_of(ty, self.db)?)),
@@ -181,6 +187,24 @@ fn temp_defs(body: &[Stmt], vars: &[mwdec_lift::Var]) -> HashMap<VarId, Expr> {
     out
 }
 
+/// Locals assigned exactly once, from a call: the callee's name.
+fn call_defs(ir: &IrFunction) -> HashMap<VarId, String> {
+    let mut n: HashMap<VarId, usize> = HashMap::new();
+    let mut out = HashMap::new();
+    for s in &ir.body {
+        if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+            *n.entry(*v).or_default() += 1;
+            if let Expr::Call { callee, .. } = src {
+                if let Some(name) = call_name(callee) {
+                    out.insert(*v, name);
+                }
+            }
+        }
+    }
+    out.retain(|v, _| n[v] == 1 && ir.vars[*v].kind == VarKind::Local);
+    out
+}
+
 fn param_vars(ir: &IrFunction) -> HashSet<VarId> {
     (0..ir.vars.len()).filter(|v| matches!(ir.vars[*v].kind, VarKind::Param { .. })).collect()
 }
@@ -231,7 +255,7 @@ fn from_probe(ir: &IrFunction, db: &TypeDb) -> Option<Vec<CStore>> {
         return None;
     }
     let defs = temp_defs(&ir.body, &ir.vars);
-    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
     let mut out = vec![];
     for s in &ir.body {
         match s {
@@ -331,7 +355,7 @@ impl DefCache {
 
 const PROBE: &str = "__mwdec_dc";
 /// Version of the canonical form (part of the cache key).
-const VERSION: &str = "defctor v5";
+const VERSION: &str = "defctor v12";
 
 fn probe_text(spelled: &str, k: usize) -> String {
     format!("struct {PROBE}{k} {{ {spelled} m; {PROBE}{k}(); }};\n{PROBE}{k}::{PROBE}{k}() {{}}\n")
@@ -423,7 +447,7 @@ pub fn strip(ir: &mut IrFunction, db: &TypeDb, dc: &DefCtors) -> (usize, Pending
     }
     // the leading run of stores (temporaries in between)
     let defs = temp_defs(&ir.body, &ir.vars);
-    let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+    let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
     let mut lead: Vec<(usize, CStore)> = vec![];
     for (i, s) in ir.body.iter().enumerate() {
         match s {
@@ -503,7 +527,7 @@ fn explicit_inits(ir: &mut IrFunction, db: &TypeDb, this: VarId, unmatched: &[(i
         }
         let Some(size) = mwdec_lift::types::size_of(Some(db), fty) else { continue };
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
         // the first top-level statement writing into the member
         let mut found = None;
         for (i, s) in ir.body.iter().enumerate() {
@@ -611,7 +635,7 @@ fn memberwise_copies(ir: &mut IrFunction, db: &TypeDb, this: VarId, unmatched: &
             continue;
         }
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
         let mut src: Option<usize> = None;
         let mut hits: Vec<(usize, i32, i32)> = vec![];
         let mut ok = true;
@@ -867,7 +891,7 @@ fn copy_inits(ir: &mut IrFunction, db: &TypeDb, this: VarId, members: &[(i32, St
         }
         let Some(size) = mwdec_lift::types::size_of(Some(db), fty) else { continue };
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
         let same = |t: &Type| crate::util::class_name(t, db).is_some_and(|c| mwdec_lift::sig::norm_name(&c) == mwdec_lift::sig::norm_name(cls));
         // `this->m = src` with src an object of the class
         let Some(b) = ir.body.iter().position(|s| {
@@ -947,7 +971,7 @@ fn call_copy_inits(ir: &mut IrFunction, db: &TypeDb, this: VarId, members: &[(i3
         }
         let Some(size) = mwdec_lift::types::size_of(Some(db), fty) else { continue };
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
         let same = |t: &Type| crate::util::class_name(t, db).is_some_and(|x| mwdec_lift::sig::norm_name(&x) == mwdec_lift::sig::norm_name(cls));
         let mut found = None;
         for (k, s) in ir.body.iter().enumerate() {
@@ -1004,7 +1028,7 @@ pub fn finish(ir: &mut IrFunction, db: &TypeDb, pending: &Pending) -> usize {
     // the lifter built the initializer list): entries now, with the members set before them
     loop {
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
         let found = ir.body.iter().enumerate().find_map(|(k, s)| match s {
             Stmt::Expr(Expr::Call { callee: mwdec_lift::Callee::Method { sig, this: obj, .. }, args, .. }) if mwdec_lift::sig::is_ctor(sig) => {
                 let Some(CE::This(off)) = cn.val(obj, 0) else { return None };
@@ -1074,7 +1098,7 @@ pub fn finish(ir: &mut IrFunction, db: &TypeDb, pending: &Pending) -> usize {
         .collect();
     for (off, size, root) in copies {
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
         let mut gone = copy_residue(ir, &cn, &defs, 0, off, size);
         if let (Some(r), true) = (root, gone.is_empty()) {
             // `*(bool*)&src = false` (an owning pointer's transfer) right at the start
@@ -1151,8 +1175,51 @@ pub type CopyCtors = HashMap<String, Vec<COp>>;
 
 const CPROBE: &str = "__mwdec_cc";
 
-fn copy_probe_text(spelled: &str, k: usize) -> String {
-    format!("struct {CPROBE}{k} {{ {spelled} m; {CPROBE}{k}(const {spelled}& o); }};\n{CPROBE}{k}::{CPROBE}{k}(const {spelled}& o) : m(o) {{}}\n")
+/// Probe building a `spelled` member from a `from` object (a copy when they are the same).
+fn copy_probe_text(spelled: &str, from: &str, k: usize) -> String {
+    // (a non-const reference binds to constructors taking either)
+    format!("struct {CPROBE}{k} {{ {spelled} m; {CPROBE}{k}({from}& o); }};\n{CPROBE}{k}::{CPROBE}{k}({from}& o) : m(o) {{}}\n")
+}
+
+/// Key of the construction of a `cls` member from a `from` object in [`CopyCtors`].
+pub fn copy_key(cls: &str, from: &str) -> String {
+    if mwdec_lift::sig::norm_name(cls) == mwdec_lift::sig::norm_name(from) {
+        cls.to_string()
+    } else {
+        format!("{cls}|{from}")
+    }
+}
+
+/// (member class, source class) pairs worth a probe: the copies of every member class, and the
+/// conversions from the class-typed parameters of the constructors `symbols` define.
+pub fn wanted_pairs<'a>(symbols: impl Iterator<Item = &'a str> + Clone, db: &TypeDb) -> Vec<(String, String)> {
+    let classes = wanted(symbols.clone(), db);
+    let mut out: Vec<(String, String)> = classes.iter().map(|c| (c.clone(), c.clone())).collect();
+    for s in symbols {
+        if !s.starts_with("__ct__") {
+            continue;
+        }
+        let sig = mwdec_lift::sig::sig_of(s, Some(db));
+        let Some(own) = sig.this_class.as_deref() else { continue };
+        let Some(c) = mwdec_lift::sig::find_class(db, own) else { continue };
+        for p in &sig.params {
+            let inner = match strip_cv(&p.ty) {
+                Type::Ref(x) => strip_cv(x).clone(),
+                t => t.clone(),
+            };
+            let Some(pc) = crate::util::class_name(&inner, db) else { continue };
+            for f in &c.fields {
+                let ft = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
+                if let Some(fc) = crate::util::class_name(&ft, db) {
+                    let pair = (fc, pc.clone());
+                    if pair.0 != pair.1 && !out.contains(&pair) && out.len() < 96 {
+                        out.push(pair);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn call_name(c: &mwdec_lift::Callee) -> Option<String> {
@@ -1173,8 +1240,14 @@ impl Canon<'_> {
     }
 
     fn op(&self, s: &Stmt) -> Option<COp> {
+        // (a call whose returned reference is dropped: `&(this->Normalize())`)
+        if let Stmt::Expr(Expr::AddrOf(e) | Expr::Cast { e, .. }) = s {
+            if matches!(&**e, Expr::Call { .. }) {
+                return self.op(&Stmt::Expr((**e).clone()));
+            }
+        }
         match s {
-            Stmt::Expr(Expr::Call { callee, args, .. }) => {
+            Stmt::Expr(Expr::Call { callee, args, .. }) | Stmt::Assign { dst: Expr::Var(_), src: Expr::Call { callee, args, .. } } => {
                 let name = call_name(callee)?;
                 let mut a = vec![];
                 if let mwdec_lift::Callee::Method { this: obj, .. } = callee {
@@ -1185,6 +1258,14 @@ impl Canon<'_> {
                 }
                 Some(COp::Call { name, args: a })
             }
+            // a store of a call's result (`m.mItem = o.GetObj()->...`)
+            Stmt::Assign { dst, src } if !matches!(dst, Expr::Var(_)) && src.has_call() => {
+                let ty = match dst {
+                    Expr::Load { ty, .. } | Expr::Member { ty, .. } | Expr::Global { ty, .. } => ty,
+                    _ => return None,
+                };
+                Some(COp::Store(CStore { addr: self.addr(dst, 0)?, size: size_of(ty, self.db)?, val: self.val(src, 0)? }))
+            }
             s => self.store(s).map(COp::Store),
         }
     }
@@ -1192,7 +1273,7 @@ impl Canon<'_> {
 
 fn ops_from_probe(ir: &IrFunction, db: &TypeDb) -> Option<Vec<COp>> {
     let defs = temp_defs(&ir.body, &ir.vars);
-    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
     let mut out = vec![];
     // constructor calls the lifter put in the initializer list (bases of the member)
     let own = ir.sig.this_class.clone().unwrap_or_default();
@@ -1220,17 +1301,23 @@ fn ops_from_probe(ir: &IrFunction, db: &TypeDb) -> Option<Vec<COp>> {
 }
 
 /// Copy constructions of `classes`, from the cache or by compiling probes.
-pub fn build_copies(db: &TypeDb, classes: &[String], cache: Option<&DefCache>, compile: &(dyn Fn(&str) -> Result<ObjectFile, String> + Sync)) -> CopyCtors {
+pub fn build_copies(db: &TypeDb, pairs: &[(String, String)], cache: Option<&DefCache>, compile: &(dyn Fn(&str) -> Result<ObjectFile, String> + Sync)) -> CopyCtors {
     let mut out = CopyCtors::new();
-    let mut todo: Vec<(String, String)> = vec![];
-    for c in classes {
+    // (key, member spelling, source spelling)
+    let mut todo: Vec<(String, String, String)> = vec![];
+    if std::env::var("MWDI_DEFCTOR_DEBUG").is_ok() {
+        eprintln!("copy pairs {pairs:?}");
+    }
+    for (c, from) in pairs {
         let Some(sp) = crate::probe::spell(&Type::Named(c.clone()), db, &[]) else { continue };
-        match cache.and_then(|ca| ca.get::<Vec<COp>>(&copy_probe_text(&sp, 0))) {
+        let Some(fp) = crate::probe::spell(&Type::Named(from.clone()), db, &[]) else { continue };
+        let key = copy_key(c, from);
+        match cache.and_then(|ca| ca.get::<Vec<COp>>(&copy_probe_text(&sp, &fp, 0))) {
             Some(Some(v)) => {
-                out.insert(c.clone(), v);
+                out.insert(key, v);
             }
             Some(None) => {}
-            None => todo.push((c.clone(), sp)),
+            None => todo.push((key, sp, fp)),
         }
     }
     if todo.is_empty() {
@@ -1246,14 +1333,23 @@ pub fn build_copies(db: &TypeDb, classes: &[String], cache: Option<&DefCache>, c
         }
         r
     };
-    let all: String = todo.iter().enumerate().map(|(k, (_, sp))| copy_probe_text(sp, k)).collect();
+    let all: String = todo.iter().enumerate().map(|(k, (_, sp, fp))| copy_probe_text(sp, fp, k)).collect();
     let results: Vec<Option<Vec<COp>>> = match compile(&all) {
         Ok(obj) => (0..todo.len()).map(|k| lift(&obj, k)).collect(),
-        Err(_) => todo.iter().map(|(_, sp)| compile(&copy_probe_text(sp, 0)).ok().and_then(|o| lift(&o, 0))).collect(),
+        Err(_) => todo
+            .iter()
+            .map(|(_, sp, fp)| {
+                let r = compile(&copy_probe_text(sp, fp, 0));
+                if let (Err(e), true) = (&r, std::env::var("MWDI_DEFCTOR_DEBUG").is_ok()) {
+                    eprintln!("copy probe {sp} <- {fp}: {}", e.lines().filter(|l| l.contains("Error")).take(2).collect::<Vec<_>>().join(" | "));
+                }
+                r.ok().and_then(|o| lift(&o, 0))
+            })
+            .collect(),
     };
-    for ((c, sp), r) in todo.iter().zip(results) {
+    for ((c, sp, fp), r) in todo.iter().zip(results) {
         if let Some(ca) = cache {
-            ca.put(&copy_probe_text(sp, 0), &r);
+            ca.put(&copy_probe_text(sp, fp, 0), &r);
         }
         if let Some(v) = r {
             out.insert(c.clone(), v);
@@ -1288,6 +1384,77 @@ fn first_param(ops: &[COp]) -> Option<usize> {
     })
 }
 
+/// Members the lifter already initialized from a parameter (`m(in)`, from the first step of
+/// their inline constructor, a base constructor call): the rest of that constructor's steps in
+/// the body is implicit (`CUnitVector3f(CInputStream&)` normalizing after reading).
+fn residue_of_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors, c: &mwdec_core::Class) -> usize {
+    let Some(this) = ir.this_var else { return 0 };
+    let mut n = 0;
+    let inits: Vec<(String, VarId)> = ir
+        .init_list
+        .iter()
+        .filter_map(|i| match (&i.target, i.args.as_slice()) {
+            (InitTarget::Member(m), [Expr::Var(p)]) if matches!(ir.vars[*p].kind, VarKind::Param { .. }) => Some((m.clone(), *p)),
+            (InitTarget::Member(m), [Expr::AddrOf(x)]) => match &**x {
+                Expr::Var(p) if matches!(ir.vars[*p].kind, VarKind::Param { .. }) => Some((m.clone(), *p)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    for (m, p) in inits {
+        let Some(f) = c.fields.iter().find(|f| f.name == m) else { continue };
+        let ft = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
+        let Some(cls) = crate::util::class_name(&ft, db) else { continue };
+        let pclass = match strip_cv(&ir.vars[p].ty) {
+            Type::Ptr(x) | Type::Ref(x) => crate::util::class_name(strip_cv(x), db),
+            t => crate::util::class_name(t, db),
+        };
+        let Some(pc) = pclass else { continue };
+        if std::env::var("MWDI_DEFCTOR_DEBUG").is_ok() {
+            eprintln!("residue {m}: {cls} <- {pc}: {:?}", cc.get(&copy_key(&cls, &pc)));
+        }
+        let Some(ops) = cc.get(&copy_key(&cls, &pc)) else { continue };
+        let Some(src) = first_param(ops) else { continue };
+        // the first step is the constructor call the lifter turned into the entry
+        let [COp::Call { .. }, rest @ ..] = ops.as_slice() else { continue };
+        if rest.is_empty() {
+            continue;
+        }
+        let off = f.offset as i32;
+        let defs = temp_defs(&ir.body, &ir.vars);
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let body_ops: Vec<Option<COp>> = ir.body.iter().map(|s| cn.op(s)).collect();
+        let mut pick = vec![];
+        let mut at = 0;
+        for o in rest {
+            let want = match o {
+                COp::Store(s) => COp::Store(CStore { addr: bind_ce(&s.addr, off, src, p), size: s.size, val: bind_ce(&s.val, off, src, p) }),
+                COp::Call { name, args } => COp::Call { name: name.clone(), args: args.iter().map(|a| bind_ce(a, off, src, p)).collect() },
+            };
+            match (at..body_ops.len()).find(|&k| body_ops[k].as_ref() == Some(&want)) {
+                Some(k) => {
+                    pick.push(k);
+                    at = k + 1;
+                }
+                None => {
+                    pick.clear();
+                    break;
+                }
+            }
+        }
+        // (right at the start of the body: the construction ran before anything else)
+        if pick.first().is_none_or(|&k| ir.body[..k].iter().any(|s| !matches!(s, Stmt::Assign { dst: Expr::Var(_), .. } | Stmt::Comment(_)))) {
+            continue;
+        }
+        n += pick.len();
+        for &k in pick.iter().rev() {
+            ir.body.remove(k);
+        }
+    }
+    n
+}
+
 /// Members whose inline copy constructor's steps appear in the body (in order), copying a
 /// parameter: `m(param)`.
 pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usize {
@@ -1297,23 +1464,30 @@ pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usiz
     if cc.is_empty() || !ir.symbol.starts_with("__ct__") {
         return 0;
     }
-    let mut moved = 0;
+    let mut moved = residue_of_inits(ir, db, cc, &c);
     for f in &c.fields {
         if f.bitfield.is_some() || ir.init_list.iter().any(|i| i.target == InitTarget::Member(f.name.clone())) {
             continue;
         }
         let ft = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
         let Some(cls) = crate::util::class_name(&ft, db) else { continue };
-        let Some(ops) = cc.get(&cls) else { continue };
-        let Some(src) = first_param(ops) else { continue };
         let off = f.offset as i32;
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
         let body_ops: Vec<Option<COp>> = ir.body.iter().map(|s| cn.op(s)).collect();
         let mut params: Vec<VarId> = param_vars(ir).into_iter().collect();
         params.sort_unstable();
         let mut found = None;
         for p in params {
+            // the construction from this parameter's class (a copy, or a conversion)
+            let pty = ir.vars[p].ty.clone();
+            let pclass = match strip_cv(&pty) {
+                Type::Ptr(x) | Type::Ref(x) => crate::util::class_name(strip_cv(x), db),
+                t => crate::util::class_name(t, db),
+            };
+            let Some(pc) = pclass else { continue };
+            let Some(ops) = cc.get(&copy_key(&cls, &pc)) else { continue };
+            let Some(src) = first_param(ops) else { continue };
             let mut pick = vec![];
             let mut at = 0;
             for o in ops {
@@ -1339,12 +1513,9 @@ pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usiz
         }
         let Some((p, pick)) = found else { continue };
         let pt = ir.vars[p].ty.clone();
-        let same = |t: &Type| crate::util::class_name(t, db).is_some_and(|x| mwdec_lift::sig::norm_name(&x) == mwdec_lift::sig::norm_name(&cls));
         let arg = match strip_cv(&pt) {
-            Type::Ptr(x) if same(strip_cv(x)) => Expr::Load { base: Box::new(Expr::Var(p)), offset: 0, ty: ft.clone() },
-            Type::Ref(x) if same(strip_cv(x)) => Expr::Var(p),
-            t if same(t) => Expr::Var(p),
-            _ => continue,
+            Type::Ptr(x) => Expr::Load { base: Box::new(Expr::Var(p)), offset: 0, ty: strip_cv(x).clone() },
+            _ => Expr::Var(p),
         };
         let first = pick[0];
         for &k in pick.iter().rev() {

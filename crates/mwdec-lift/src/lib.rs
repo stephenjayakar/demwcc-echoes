@@ -36,6 +36,7 @@ pub mod sig;
 pub mod scalars;
 pub mod simplify;
 pub mod structcopy;
+pub mod variants;
 pub mod structure;
 pub mod switchtree;
 pub mod translate;
@@ -49,6 +50,10 @@ pub use mwdec_core::{Function, ObjectFile, TypeDb};
 
 use std::collections::HashMap;
 use translate::Lifter;
+
+/// Name prefix of locals the draft declares but never uses (frame slots of the SDK compiler);
+/// the emitter declares them although nothing refers to them.
+pub const UNUSED_LOCAL_PREFIX: &str = "unused";
 
 /// Options for the late, optional passes (all on by default).
 #[derive(Clone, Debug)]
@@ -203,7 +208,12 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     let mut body = {
         let vars = l.vars.clone();
         let s = structure::Structurer::new(&l.cfg, &mut l.blocks_out, &vars, ret_void).with_insns(&l.insns);
-        s.run()
+        let (body, extra) = s.run_with_vars();
+        for v in extra {
+            l.vars.push(v);
+            l.is_temp.push(false);
+        }
+        body
     };
     debug::stage("structure", &body, &l.vars);
     structure::volatile_spin_loads(&mut body);
@@ -217,11 +227,11 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     if sig::demangle(&f.name).is_some() {
         bool_return(&body, &l.vars, &mut l.ret_ty);
     }
-    wide::merge_halves(&mut body, &l.vars, &l.is_temp);
+    wide::merge_halves(&mut body, &l.vars, &l.is_temp, l.param_home_slots);
     wide::merge_or_assigns(&mut body, &l.vars, &l.is_temp);
     wide::merge_compares(&mut body, &l.vars);
     // compiler-made stack copies the source never names, then fold the temps they kept alive
-    let dead_stores = idioms::drop_dead_stack_stores_kept(&mut body, &l.vars);
+    let mut dead_stores = idioms::drop_dead_stack_stores_kept(&mut body, &l.vars);
     localtypes::fold_delete_checks(&mut body);
     if l.sig.variadic {
         varargs::recover(&mut body, &mut l.vars, l.params.last().copied());
@@ -239,6 +249,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         arrays::absolute_globals(&mut body, &l.vars, db);
         bitfields::recover(&mut body, &l.vars, db);
         byval::forward(&mut body, &mut l.vars, db);
+        byval::copy_temporaries(&mut body, &mut dead_stores, db);
         aggregates::literal_inits(&mut body, &l.vars, db, obj);
         byval::forward_ptmf_args(&mut body, &l.vars, db);
         construct::fold(&mut body, &l.vars, db);
@@ -251,8 +262,10 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         simplify::simplify_body(&mut body, &l.vars);
     }
     construct::fold_returned_temps(&mut body, &l.vars, &mut l.is_temp, &l.ctor_ret_used);
-    for g in arrays::synth_hw_arrays(&mut body, &l.vars, db) {
-        l.globals.insert(g.symbol.clone(), g);
+    if l.param_home_slots {
+        for g in arrays::synth_hw_arrays(&mut body, &l.vars, db) {
+            l.globals.insert(g.symbol.clone(), g);
+        }
     }
     localtypes::narrow(&mut body, &mut l.vars, db);
     localtypes::global_types(&mut body, &l.vars, &l.ret_ty, db);
@@ -270,6 +283,8 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     ctrloop::rematerialize_global_temps(&mut body, &l.vars, &l.is_temp);
     debug::stage("ctrloop", &body, &l.vars);
     simplify::recover_ctr_loops(&mut body, &mut l.vars, &mut l.is_temp);
+    structure::offset_ctr_loops(&mut body, &l.vars);
+    structure::ctr_break_loops(&mut body, &mut l.vars, &mut l.is_temp);
     unroll::reroll(&mut body);
     if opts.inline_temps {
         reinline(&mut body, &l.is_temp, &l.vars);
@@ -281,12 +296,27 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::form_incdec(&mut body, &l.vars, &l.is_temp, db);
     simplify::fold_ternary_constants(&mut body);
     simplify::inline_ternary_results(&mut body);
-    bitfields::insert_chains(&mut body, &mut l.vars, &mut l.is_temp);
+    bitfields::insert_chains(&mut body, &mut l.vars, &mut l.is_temp, l.param_home_slots);
     localtypes::forward_global_pointers(&mut body, &l.vars, &l.is_temp);
     if ret_void {
         simplify::drop_trailing_return(&mut body);
     }
     simplify::drop_garbage_return(&mut body);
+
+    // GC/1.2.5n reserves a frame slot for every declared local once the frame has a local area,
+    // used or not (and for the parameters and locals of inlined helpers): a frame larger than
+    // this draft's slots make it gets unused locals (functions without stack objects only)
+    if l.param_home_slots && l.frame.info.size > 0 && !l.has_stack_objects() {
+        let slots = l.sig.params.iter().map(|p| if crate::types::size_of(db, &p.ty).unwrap_or(4) > 4 { 2 } else { 1 }).sum::<u32>();
+        if l.sdk_frame_size(slots) < l.frame.info.size {
+            if let Some(k) = (1..=6).find(|&k| l.sdk_frame_size(slots + k) == l.frame.info.size) {
+                for n in 0..k {
+                    l.vars.push(Var { name: format!("{UNUSED_LOCAL_PREFIX}{}", n + 1), ty: mwdec_core::Type::Int { size: 4, signed: true }, kind: VarKind::Local });
+                    l.is_temp.push(false);
+                }
+            }
+        }
+    }
 
     let mut sig = l.sig.clone();
     sig.ret = l.ret_ty.clone();
@@ -415,6 +445,16 @@ fn rematerialize_loop_headers(l: &mut Lifter) {
             }
             inline::count_uses(&items, &mut uses);
         }
+        // variables the reads depend on (`*p`): reassigning one ends the stretch where the read
+        // may be repeated
+        let mut deps: Vec<VarId> = vec![];
+        for (_, e) in &defs {
+            e.walk(&mut |x| {
+                if let Expr::Var(y) = x {
+                    deps.push(*y);
+                }
+            });
+        }
         let in_cond = |v: VarId, l: &Lifter| l.blocks_out[h].cond.as_ref().map_or(0, |c| {
             let mut n = 0;
             c.walk(&mut |e| if matches!(e, Expr::Var(x) if *x == v) { n += 1 });
@@ -430,7 +470,7 @@ fn rematerialize_loop_headers(l: &mut Lifter) {
                 Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| if matches!(e, Expr::Var(x) if *x == v) { n += 1 });
                 seen += n;
                 let effectful = match s {
-                    Stmt::Assign { dst, src } => !matches!(dst, Expr::Var(_)) || src.has_call(),
+                    Stmt::Assign { dst: Expr::Var(x), src } => src.has_call() || deps.contains(x),
                     _ => true,
                 };
                 if effectful {
@@ -448,7 +488,7 @@ fn rematerialize_loop_headers(l: &mut Lifter) {
         // loop blocks dominated by the body's first block through effect-free blocks only (the
         // arms of an `if` at the top of the body re-reading the value)
         let effect_free = |blk: usize, l: &Lifter| {
-            l.blocks_out[blk].stmts.iter().all(|s| matches!(s, Stmt::Assign { dst: Expr::Var(_), src } if !src.has_call()) || matches!(s, Stmt::Label(_) | Stmt::Comment(_)))
+            l.blocks_out[blk].stmts.iter().all(|s| matches!(s, Stmt::Assign { dst: Expr::Var(x), src } if !src.has_call() && !deps.contains(x)) || matches!(s, Stmt::Label(_) | Stmt::Comment(_)))
         };
         let mut deeper: Vec<usize> = vec![];
         for &u in &lp.body {
@@ -648,9 +688,9 @@ fn early_returns(l: &mut Lifter) {
         let Some(tail) = l.cfg.blocks[r].preds.iter().copied().find(|&p| matches!(l.cfg.blocks[p].term, cfg::Term::Fall(t) if t == r)) else {
             continue;
         };
-        if l.cfg.blocks[tail].preds.len() < 2 {
-            continue;
-        }
+        // a tail with one way in: only returns the tests jump forward to over their other arm
+        // (`if (p) { ... } else { return false; } return true;`) meet it
+        let forward_only = l.cfg.blocks[tail].preds.len() < 2;
         // the tail only sets the returned value (`return false;`): in void functions a jump to
         // the epilogue is a `break` or the end of an if/else as often as a return
         let Some(Expr::Var(rv)) = l.blocks_out[r].ret.clone() else { continue };
@@ -659,6 +699,11 @@ fn early_returns(l: &mut Lifter) {
             continue;
         }
         let jumps: Vec<usize> = l.cfg.blocks[r].preds.iter().copied().filter(|&p| p != tail && matches!(l.cfg.blocks[p].term, cfg::Term::Jump(t) if t == r)).collect();
+        let forward = |p: usize, l: &Lifter| match l.cfg.blocks[p].preds.as_slice() {
+            [c] => matches!(l.cfg.blocks[*c].term, cfg::Term::Cond { taken, fall } if taken == p && fall != p && l.cfg.blocks[p].start > l.cfg.blocks[fall].start),
+            _ => false,
+        };
+        let jumps: Vec<usize> = jumps.into_iter().filter(|&p| !forward_only || (forward(p, l) && sets_ret(p, l))).collect();
         for p in jumps {
             l.blocks_out[p].ret = l.blocks_out[r].ret.clone();
             // for structuring, the return continues where its guarding test's other arm goes

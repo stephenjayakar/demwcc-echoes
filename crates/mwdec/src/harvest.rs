@@ -517,8 +517,9 @@ fn run_one(us: &UnitSlot, ext: &(ExternIndex, ExternIndex), c: &Cand, a: &Harves
         }
     };
     let ti = ObjIndex::with_externs(&ui.target, &ext.0);
-    let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &c.symbol);
-    let src = super::search_cmds::repair_registers(&scorer, choose_draft(ui, f, &scorer, src), ui.tracer.as_deref());
+    let prover = crate::placeholders::UnitProver::new(&ui.mwcc, &ui.ctx, ui.db.as_ref());
+    let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &c.symbol).with_prover(Some(&prover));
+    let src = super::search_cmds::repair_or_variant(&scorer, choose_draft(ui, f, &scorer, src), super::search_cmds::variant_drafts(ui, f, true), ui.tracer.as_deref());
     let cfg = SearchConfig {
         budget: Duration::from_secs(a.budget_secs),
         max_compiles: a.max_compiles,
@@ -717,7 +718,8 @@ pub fn cmd_repolish(root: &Path, work: &Path, dir: &Path, out: &Path, split: Opt
             let src = v.get("source").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let Some(f) = mwdec_obj::find_function(&ui.target, &sym) else { continue };
             let ti = ObjIndex::with_externs(&ui.target, &ext.0);
-            let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &sym);
+            let prover = crate::placeholders::UnitProver::new(&ui.mwcc, &ui.ctx, ui.db.as_ref());
+            let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &sym).with_prover(Some(&prover));
             // the stored result must still be exact here (same context and compiler)
             if !scorer.eval(&src).0.fitness().map_or(false, |x| x.exact) {
                 lost += 1;

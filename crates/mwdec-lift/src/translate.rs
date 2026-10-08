@@ -390,9 +390,13 @@ impl<'a> Lifter<'a> {
                 ArgLoc::Fpr(r) => {
                     self.entry_vals.insert(fpr(r), Expr::Var(v));
                 }
+                ArgLoc::GprPair(r) if !self.param_home_slots => {
+                    self.entry_vals.insert(gpr(r), Expr::Var(v));
+                }
                 ArgLoc::GprPair(r) => {
-                    // high word in the first register of the pair (typed as the 64-bit integer
-                    // a typedef like `OSTime` stands for, so its halves are recognized)
+                    // (SDK compiler units) high word in the first register of the pair (typed as
+                    // the 64-bit integer a typedef like `OSTime` stands for, so its halves are
+                    // recognized)
                     let rt = types::resolve(self.db, &self.vars[v].ty).into_owned();
                     if crate::wide::is_wide(&rt) && !crate::wide::is_wide(&self.vars[v].ty) {
                         self.vars[v].ty = rt;
@@ -578,7 +582,10 @@ impl<'a> Lifter<'a> {
             let g = g.max(lay.this.unwrap_or(0)).max(lay.sret.unwrap_or(0));
             let f = lay.params.iter().fold(0u8, |m, l| if let ArgLoc::Fpr(r) = l { m.max(*r) } else { m });
             let extra = |p: &mut Vec<mwdec_core::Param>| p.push(mwdec_core::Param { name: Some("...".into()), ty: Type::Unknown { size: 0 } });
-            if let Some(top) = (g + 1..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q))) {
+            let set = (g + 1..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q)));
+            // (or incoming parameters passed on unchanged: the allocator kept them free)
+            let through = self.passed_through(k).filter(|&r| r > g && self.entry_vals.contains_key(&gpr(r)));
+            if let Some(top) = set.max(through) {
                 for r in g + 1..=top {
                     lay.params.push(ArgLoc::Gpr(r));
                     extra(&mut s.params);
@@ -1364,6 +1371,10 @@ impl<'a> Lifter<'a> {
         }
         addr.sort();
         addr.dedup();
+        // the linkage area holds no object: an address there points just below the lowest object
+        if addr.iter().any(|&a| a >= 8) {
+            addr.retain(|&a| a >= 8);
+        }
         // addresses inside a class object whose address is taken too (a member passed by
         // reference) are parts of that object, not objects of their own: unless they are
         // themselves objects reaching past its end, struct returns, or method receivers (an
@@ -1607,6 +1618,15 @@ impl<'a> Lifter<'a> {
         }
         if let Some(&v) = self.stack.slots.get(&off) {
             return Expr::AddrOf(Box::new(Expr::Var(v)));
+        }
+        // below the locals (the linkage area): a block copy's pre-decremented pointer into the
+        // lowest object (`addi r5, r1, 4; lwzu r0, 8(r5)`)
+        if off < 8 {
+            if let Some(&(s, _, v)) = self.stack.regions.iter().min_by_key(|r| r.0) {
+                if s - off <= 8 {
+                    return Expr::AddrOf(Box::new(Expr::Member { base: Box::new(Expr::Var(v)), offset: off - s, ty: t_unk(0) }));
+                }
+            }
         }
         Expr::Unknown { text: format!("sp+0x{off:x}"), ty: t_ptr(Type::Void) }
     }
@@ -2076,6 +2096,20 @@ impl<'a> Lifter<'a> {
 
     /// C functions whose prototype the context doesn't have: parameters are the argument
     /// registers read before being written.
+    /// GC/1.2.5n frame size for a function with `slots` 4-byte parameter/local slots and no
+    /// address-taken locals: linkage (8), then (only when the frame has a local area at all:
+    /// saved registers or slots) the slots rounded to 8, then the register saves; all rounded to 8.
+    pub fn sdk_frame_size(&self, slots: u32) -> u32 {
+        let saves = 4 * self.frame.info.saved_gprs.len() as u32 + 8 * self.frame.info.saved_fprs.len() as u32;
+        let area = if saves > 0 || slots > 0 { (4 * slots + 7) & !7 } else { 0 };
+        (8 + area + saves + 7) & !7
+    }
+
+    /// Any r1-relative access outside the prologue/epilogue (a stack object).
+    pub fn has_stack_objects(&self) -> bool {
+        self.lowest_local_offset().is_some()
+    }
+
     /// Lowest r1 offset of a local stack object (an address taken or a slot accessed), outside
     /// the linkage area and the register save area.
     fn lowest_local_offset(&self) -> Option<i32> {
@@ -2124,12 +2158,20 @@ impl<'a> Lifter<'a> {
         });
         let mut gmax = (3..=10u8).rev().find(|r| live.contains(&gpr(*r)));
         let fmax = (1..=8u8).rev().find(|r| live.contains(&fpr(*r)));
-        // unused trailing parameters still own a home slot: the lowest local sits above them
-        if self.param_home_slots && fmax.is_none() {
+        // unused trailing parameters still own a home slot: the lowest local sits above them,
+        // or (no stack objects) the frame is larger than the used parameters' slots make it
+        if self.param_home_slots && fmax.is_none() && self.frame.info.size > 0 {
             if let Some(lo) = self.lowest_local_offset() {
                 let slots = ((lo - 8) / 4) as u8;
                 if (1..=8).contains(&slots) && gmax.map_or(true, |g| g - 2 < slots) {
                     gmax = Some(2 + slots);
+                }
+            } else {
+                let used = gmax.map_or(0, |g| (g - 2) as u32);
+                if self.sdk_frame_size(used) < self.frame.info.size {
+                    if let Some(n) = (used + 1..=8).find(|&n| self.sdk_frame_size(n) == self.frame.info.size) {
+                        gmax = Some(2 + n as u8);
+                    }
                 }
             }
         }
@@ -2570,6 +2612,9 @@ impl<'a> Lifter<'a> {
     /// the halves of one 64-bit value is one argument, and a stale low half in the even register
     /// before it is the alignment gap, not an argument.
     fn wide_args_unprototyped(&mut self, st: &St, sym: &str, sig: &mut FuncSig, lay: &mut Layout) {
+        if !self.param_home_slots {
+            return;
+        }
         if sig::demangle(sym).is_some() || self.db.map_or(false, |db| db.decls.contains_key(sym) || db.functions.contains_key(sym)) || lay.this.is_some() || lay.sret.is_some() {
             return;
         }
@@ -2673,6 +2718,9 @@ impl<'a> Lifter<'a> {
 
     /// [`wide::pair`], also recognizing halves computed through temps.
     fn pair_of(&self, hi: Expr, lo: Expr, signed: bool) -> Expr {
+        if !self.param_home_slots {
+            return crate::wide::pair(hi, lo, signed, &self.vars);
+        }
         match self.pair_resolved(hi.clone(), lo.clone()) {
             Some(p) => p,
             None => crate::wide::pair(hi, lo, signed, &self.vars),
@@ -2926,9 +2974,12 @@ impl<'a> Lifter<'a> {
             return self.pair_of(h, l, signed);
         }
         // an undeclared return: r3:r4 holding the halves of one computed 64-bit value
-        if r == gpr(3) && (sig::ret_unknown(&self.sig) || matches!(self.sig.ret, Type::Unknown { .. })) && matches!(self.ret_ty, Type::Unknown { size: 0 | 4 }) {
+        if r == gpr(3) && self.param_home_slots && (sig::ret_unknown(&self.sig) || matches!(self.sig.ret, Type::Unknown { .. })) && matches!(self.ret_ty, Type::Unknown { size: 0 | 4 }) {
             let (h, l) = (self.get(st, gpr(3)), self.get(st, gpr(4)));
-            if !(h.as_int().is_some() && l.as_int().is_some()) {
+            let (hr, lr) = (self.resolve_temps(&h), self.resolve_temps(&l));
+            // halves recognizably taken from one 64-bit value (not a garbage r4)
+            let recognized = crate::wide::as_hi(&hr, &self.vars).is_some() && !lr.any_unknown();
+            if recognized {
                 if let Some(x) = self.pair_resolved(h, l) {
                     let xt = types::ty_of(&x, &self.vars);
                     if crate::wide::is_wide(&xt) {
@@ -3159,6 +3210,21 @@ impl<'a> Lifter<'a> {
                             let base = self.gpr_or_zero(st, i.ra());
                             self.mem(base, off, qt)
                         };
+                        // the header's fast-cast inline (`CCast::ToReal32(const uchar&)`: `psq_l r,
+                        // 0(in), 1, 2`) when the context declares it; a C cast is the int->float magic
+                        let fast = match q {
+                            2 => Some(("CCast::ToReal32", "ToReal32__5CCastFRCUc")),
+                            5 => Some(("CCast::StoF", "StoF__5CCastFRCs")),
+                            _ => None,
+                        };
+                        if let (Some((qn, sym)), Some(db)) = (fast, self.db) {
+                            if !matches!(lv, Expr::Unknown { .. }) && db.decls.contains_key(qn) {
+                                let sig = sig::sig_of(sym, Some(db));
+                                let call = Expr::Call { callee: Callee::Direct { symbol: sym.to_string(), sig }, args: vec![Expr::AddrOf(Box::new(lv))], ret: t_f32() };
+                                self.def(st, k, fpr(ins.field_frd()), call);
+                                return;
+                            }
+                        }
                         self.def(st, k, fpr(ins.field_frd()), Expr::cast(t_f32(), lv));
                         return;
                     }
@@ -3381,7 +3447,7 @@ impl<'a> Lifter<'a> {
                     }
                     (Addze, Ca::Srawi(x, n)) => arith(BinOp::Div, as_signed(x.clone(), &self.vars), Expr::int(1i64 << n), &self.vars),
                     // high word of a 64-bit addition / subtraction: the halves of two 64-bit values
-                    (Adde, Ca::Addc(alo, blo)) | (Subfe, Ca::Subfc(alo, blo)) => {
+                    (Adde, Ca::Addc(alo, blo)) | (Subfe, Ca::Subfc(alo, blo)) if self.param_home_slots => {
                         let b2 = self.get(st, gpr(i.rb()));
                         let (x, y) = (self.pair_resolved(a.clone(), alo.clone()), self.pair_resolved(b2, blo.clone()));
                         match (x, y) {
@@ -3541,7 +3607,17 @@ impl<'a> Lifter<'a> {
                 let konst = matches!(&s, Expr::Int { .. }) || matches!(&s, Expr::Cast { e, .. } if matches!(**e, Expr::Int { .. }));
                 let m = mask32(mb, me);
                 let base_konst = matches!(&a, Expr::Int { .. }) || matches!(&a, Expr::Cast { e, .. } if matches!(**e, Expr::Int { .. }));
-                let v = if konst || base_konst || !known_zero(&a, m, &self.vars, &|t| self.temp_def.get(&t), 0) {
+                // the SDK compiler's `t = (x >> k) & m; __rlwimi(t, y, ..)`: a field extracted into
+                // a variable that is then inserted into (`GXSetCullMode`'s hardware mode)
+                let extracted = self.param_home_slots && {
+                    let ar = self.resolve_temps(&a);
+                    let e = match &ar {
+                        Expr::Cast { e, .. } => &**e,
+                        e => e,
+                    };
+                    matches!(e, Expr::Binary { op: BinOp::And, l, r, .. } if r.as_int().is_some() && matches!(&**l, Expr::Binary { op: BinOp::Shr, r: k, .. } if k.as_int().is_some_and(|k| k > 0)))
+                };
+                let v = if extracted || konst || base_konst || !known_zero(&a, m, &self.vars, &|t| self.temp_def.get(&t), 0) {
                     // inserting a constant or into a constant (C shift/mask forms would fold to a
                     // plain and/or), or into
                     // a value whose target bits aren't known clear (the older compiler clears them
@@ -3561,7 +3637,16 @@ impl<'a> Lifter<'a> {
                     // operand of `|` becomes the insert target (C functions: SDK code built by
                     // the older compiler, which always takes it), allocated r0 when it can be
                     let c_linkage = sig::demangle(sig::strip_dtk_suffix(&self.f.name)).is_none();
-                    if c_linkage || (i.ra() == 0 && i.rs() != 0) {
+                    // (a field inserted into a single shifted/masked value, `a | (b << 8)`: the
+                    // compiler builds the shifted right operand and inserts the left one)
+                    let leaf = |e: &Expr| {
+                        let e = match e {
+                            Expr::Var(t) => self.temp_def.get(t).unwrap_or(e),
+                            e => e,
+                        };
+                        matches!(e, Expr::Binary { op: BinOp::Shl | BinOp::And, l, .. } if !matches!(&**l, Expr::Binary { op: BinOp::Or, .. }))
+                    };
+                    if c_linkage || (i.ra() == 0 && i.rs() != 0) || leaf(&keep) {
                         arith(BinOp::Or, ins_part, keep, &self.vars)
                     } else {
                         arith(BinOp::Or, keep, ins_part, &self.vars)

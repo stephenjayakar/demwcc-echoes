@@ -38,11 +38,14 @@ pub struct DraftReply {
     /// Draft with member accesses as raw offsets, when it differs (a fallback for drafts that
     /// don't compile, e.g. private members).
     pub raw: Option<String>,
+    /// Draft variants (`mwdec_lift::variants`): the draft with one ambiguous decision flipped.
+    /// Tried only when the default pipeline doesn't reach an exact match.
+    pub variants: Vec<String>,
     pub error: Option<String>,
 }
 
 impl DraftReply {
-    fn err(status: &str, error: impl Into<String>) -> DraftReply {
+    pub(crate) fn err(status: &str, error: impl Into<String>) -> DraftReply {
         DraftReply { status: status.into(), error: Some(error.into()), ..Default::default() }
     }
 }
@@ -79,6 +82,11 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_e
             if ui.db.is_some() && r.implicit.is_none() {
                 r.raw = super::search_cmds::draft_raw(ui, f).ok().filter(|p| *p != s);
             }
+            // ambiguous lift/emit decisions (mwdec_lift::variants): every variant, compiled by
+            // the caller with the other candidates
+            if r.implicit.is_none() {
+                r.variants = super::search_cmds::variant_drafts(ui, f, include_implicit).into_iter().filter(|p| *p != s).collect();
+            }
             // a static initializer of `const` globals schedules their stores differently
             if f.name.starts_with("__sinit_") && ui.db.is_some() {
                 r.alts.extend(super::search_cmds::draft_sinit_const(ui, f).ok().filter(|p| *p != s));
@@ -106,7 +114,7 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_e
 }
 
 fn reply_json(r: &DraftReply) -> String {
-    serde_json::json!({"status": r.status, "src": r.src, "plain": r.plain, "implicit": r.implicit, "alts": r.alts, "raw": r.raw, "error": r.error}).to_string()
+    serde_json::json!({"status": r.status, "src": r.src, "plain": r.plain, "implicit": r.implicit, "alts": r.alts, "raw": r.raw, "variants": r.variants, "error": r.error}).to_string()
 }
 
 fn parse_reply(line: &str) -> DraftReply {
@@ -114,8 +122,8 @@ fn parse_reply(line: &str) -> DraftReply {
         return DraftReply::err("crash", format!("bad draft-server reply: {}", line.chars().take(200).collect::<String>()));
     };
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-    let alts = v.get("alts").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
-    DraftReply { status: s("status").unwrap_or_default(), src: s("src"), plain: s("plain"), implicit: s("implicit"), alts, raw: s("raw"), error: s("error") }
+    let list = |k: &str| -> Vec<String> { v.get(k).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default() };
+    DraftReply { status: s("status").unwrap_or_default(), src: s("src"), plain: s("plain"), implicit: s("implicit"), alts: list("alts"), raw: s("raw"), variants: list("variants"), error: s("error") }
 }
 
 /// `mwdec draft-server`: one JSON request per stdin line ({"unit","symbol","include_implicit"}),

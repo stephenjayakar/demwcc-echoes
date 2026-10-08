@@ -53,6 +53,8 @@ pub const REG_OPS: &[&str] = &[
     "select_init",
     "hint_order",
     "hint_temp",
+    // macro: every local of one integer type flips signedness (last: displaces nothing above)
+    "retype_all",
 ];
 
 #[derive(Clone, Debug)]
@@ -93,7 +95,8 @@ pub struct Repair {
 /// so variable-structure and evaluation-order edits are the right tools.
 pub fn register_only(f: &Fitness) -> bool {
     let p: &DiffProfile = &f.profile;
-    !f.exact && f.size_delta == 0 && p.inserted + p.deleted + p.substituted == 0 && p.stack == 0 && p.branch == 0 && p.reloc == 0 && p.reg + p.reorder > 0
+    // (instructions moved far are aligned as deleted + inserted ones: a few of those in pairs too)
+    !f.exact && f.size_delta == 0 && p.inserted == p.deleted && p.inserted + p.substituted <= 4 && p.stack == 0 && p.branch == 0 && p.reloc == 0 && p.reg + p.reorder + p.other + p.inserted > 0
 }
 
 /// Every distinct neighbour of `src` under [`REG_OPS`] (one operator application each), in
@@ -101,6 +104,21 @@ pub fn register_only(f: &Fitness) -> bool {
 pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64, seen: &mut HashSet<String>) -> Vec<(String, &'static str)> {
     let Some(p) = Parsed::new(src, symbol) else { return vec![] };
     let mut out = vec![];
+    for c in narrow_ret_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "narrow_ret"));
+        }
+    }
+    for c in ret_flag_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "ret_flag"));
+        }
+    }
+    for c in widen_local_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "widen_local"));
+        }
+    }
     for c in select_else_variants(src, symbol) {
         if seen.insert(normalize(&c)) {
             out.push((c, "select_else"));
@@ -109,6 +127,29 @@ pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64,
     for c in sink_load_variants(src, symbol) {
         if seen.insert(normalize(&c)) {
             out.push((c, "sink_load"));
+        }
+    }
+    // every such load sunk at once (one step each would need as many levels)
+    let mut cur = src.to_string();
+    for _ in 0..8 {
+        match sink_load_variants(&cur, symbol).into_iter().next() {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    if cur != src {
+        if let Some(cc) = compound_all(&cur, symbol) {
+            if seen.insert(normalize(&cc)) {
+                out.push((cc, "sink_load"));
+            }
+        }
+        if seen.insert(normalize(&cur)) {
+            out.push((cur, "sink_load"));
+        }
+    }
+    if let Some(cc) = compound_all(src, symbol) {
+        if seen.insert(normalize(&cc)) {
+            out.push((cc, "compound_assign"));
         }
     }
     for c in return_construct_variants(src, symbol) {
@@ -159,6 +200,9 @@ pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64,
     for name in REG_OPS {
         let Some(op) = ops::op_index(name) else { continue };
         if (*name == "hint_order" || *name == "hint_temp") && hints.is_none() {
+            continue;
+        }
+        if *name == "retype_all" && std::env::var_os("MWDEC_NO_MACROS").is_some() {
             continue;
         }
         let mut dry = 0;
@@ -557,7 +601,10 @@ pub fn swap_defs_variants(src: &str, symbol: &str) -> Vec<String> {
         };
         let ok = c.descendants(v).into_iter().all(|d| match c.kind(d) {
             "assignment_expression" | "update_expression" | "new_expression" | "delete_expression" => false,
-            "call_expression" => c.child(d, "function").is_some_and(|f| c.kind(f) == "field_expression" && c.child(f, "field").is_some_and(|x| c.text(x).starts_with("Get"))),
+            "call_expression" => c.child(d, "function").is_some_and(|f| {
+                (c.kind(f) == "field_expression" && c.child(f, "field").is_some_and(|x| c.text(x).starts_with("Get")))
+                    || ["const_cast", "static_cast", "reinterpret_cast"].iter().any(|k| c.text(f).starts_with(k))
+            }),
             _ => true,
         });
         ok.then_some((name, v))
@@ -848,7 +895,13 @@ pub fn sink_load_variants(src: &str, symbol: &str) -> Vec<String> {
     let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
     let mut out = vec![];
     let idents = |n: usize| -> Vec<String> { c.descendants(n).into_iter().filter(|&d| c.kind(d) == "identifier").map(|d| c.text(d).to_string()).collect() };
-    let has_call = |n: usize| c.descendants(n).into_iter().any(|d| matches!(c.kind(d), "call_expression" | "new_expression" | "delete_expression"));
+    // (zero-argument `Get*` accessors read, they don't write)
+    let getter = |d: usize| {
+        c.kind(d) == "call_expression"
+            && c.child(d, "arguments").is_some_and(|a| c.named(a).is_empty())
+            && c.child(d, "function").is_some_and(|f| c.kind(f) == "field_expression" && c.child(f, "field").is_some_and(|x| c.text(x).starts_with("Get")))
+    };
+    let has_call = |n: usize| c.descendants(n).into_iter().any(|d| matches!(c.kind(d), "call_expression" | "new_expression" | "delete_expression") && !getter(d));
     for blk in c.descendants(info.body) {
         if c.kind(blk) != "compound_statement" {
             continue;
@@ -990,6 +1043,162 @@ pub fn select_else_variants(src: &str, symbol: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Narrow integer locals (`unsigned short x;`) declared `int` / `unsigned int` instead: a value
+/// the compiler knows is already extended (loaded with `lhz`, a constant) is not narrowed again
+/// at each use, which changes both instructions and registers.
+pub fn widen_local_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    const NARROW: &[&str] = &["unsigned short", "short", "unsigned char", "signed char", "char", "u8", "u16", "s8", "s16", "uchar", "ushort"];
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    for t in c.descendants(info.body) {
+        if c.kind(t) != "declaration" {
+            continue;
+        }
+        let Some(ty) = c.child(t, "type") else { continue };
+        let tt = c.text(ty).split_whitespace().collect::<Vec<_>>().join(" ");
+        if !NARROW.contains(&tt.as_str()) || c.children_by_field(t, "declarator").count() != 1 {
+            continue;
+        }
+        let d = c.child(t, "declarator").unwrap();
+        if crate::func::declarator_name(&c, d).is_none_or(|(_, suf)| !suf.is_empty()) {
+            continue;
+        }
+        let signed = !(tt.starts_with("unsigned") || tt.starts_with('u'));
+        for w in if signed { ["int", "unsigned int"] } else { ["unsigned int", "int"] } {
+            if let Some(s) = apply(src, &[Edit::replace(&c, ty, w.to_string())]) {
+                if Cst::parse(&s).errors <= c.errors {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every `L = L op e;` written `L op= e;` (one candidate): MWCC evaluates the compound form's
+/// operands in another order, which matters for read-modify-writes of memory.
+pub fn compound_all(src: &str, symbol: &str) -> Option<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let def = crate::func::find_target(&c, symbol)?;
+    let body = c.child(def, "body")?;
+    let mut edits = vec![];
+    for a in c.descendants(body) {
+        if c.kind(a) != "assignment_expression" || c.op(a) != Some("=") {
+            continue;
+        }
+        let (Some(l), Some(r)) = (c.child(a, "left"), c.child(a, "right")) else { continue };
+        let r = if c.kind(r) == "parenthesized_expression" { c.named(r).first().copied().unwrap_or(r) } else { r };
+        if c.kind(r) != "binary_expression" {
+            continue;
+        }
+        let Some(op) = c.op(r).filter(|o| matches!(*o, "|" | "&" | "^" | "+" | "-" | "*" | "<<" | ">>")) else { continue };
+        let (Some(rl), Some(rr)) = (c.child(r, "left"), c.child(r, "right")) else { continue };
+        let rl = if c.kind(rl) == "parenthesized_expression" { c.named(rl).first().copied().unwrap_or(rl) } else { rl };
+        if c.text(rl).replace(' ', "") != c.text(l).replace(' ', "") {
+            continue;
+        }
+        let rr = if c.kind(rr) == "parenthesized_expression" { c.named(rr).first().copied().unwrap_or(rr) } else { rr };
+        edits.push(Edit::replace(&c, a, format!("{} {op}= {}", c.text(l), c.text(rr))));
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let s = apply(src, &edits)?;
+    (Cst::parse(&s).errors <= c.errors).then_some(s)
+}
+
+/// A boolean result kept in a local flag set before everything else (`bool r = K; ...; return r;`):
+/// `return a && b;` -> `bool r = false; ... if (a && b) { r = true; } return r;` and
+/// `if (c) { ...; return e; } return K;` -> `bool r = K; ... if (c) { ...; r = e; } return r;`.
+/// The flag's constant is materialized up front (often in a callee-saved register).
+pub fn ret_flag_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let ret_bool = c.child(def, "type").is_some_and(|t| matches!(c.text(t).trim(), "bool" | "BOOL" | "const bool"));
+    if !ret_bool {
+        return vec![];
+    }
+    let sibs: Vec<usize> = c.named(info.body).into_iter().filter(|&n| crate::func::is_stmt(c.kind(n))).collect();
+    let (Some(&first), Some(&last)) = (sibs.first(), sibs.last()) else { return vec![] };
+    if c.kind(last) != "return_statement" {
+        return vec![];
+    }
+    let Some(e) = c.named(last).first().copied() else { return vec![] };
+    let name = info.fresh_name(&c, "result");
+    let at = c.nodes[first].start;
+    let line_start = src[..at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+    let ind = src[line_start..at].to_string();
+    let lit = |n: usize| matches!(c.text(n).trim(), "true" | "false" | "0" | "1");
+    let mut out = vec![];
+    let mut push = |edits: Vec<Edit>| {
+        if let Some(s) = apply(src, &edits) {
+            if Cst::parse(&s).errors <= c.errors {
+                out.push(s);
+            }
+        }
+    };
+    if !lit(e) {
+        push(vec![
+            Edit::insert(at, format!("bool {name} = false;\n{ind}")),
+            Edit::replace(&c, last, format!("if ({}) {{\n{ind}    {name} = true;\n{ind}}}\n{ind}return {name};", c.text(e))),
+        ]);
+    } else if sibs.len() >= 2 {
+        let prev = sibs[sibs.len() - 2];
+        if c.kind(prev) == "if_statement" && c.child(prev, "alternative").is_none() {
+            if let Some(cons) = c.child(prev, "consequence").filter(|&x| c.kind(x) == "compound_statement") {
+                let inner: Vec<usize> = c.named(cons).into_iter().filter(|&n| crate::func::is_stmt(c.kind(n))).collect();
+                let rets = c.descendants(cons).into_iter().filter(|&d| c.kind(d) == "return_statement").count();
+                if let Some(&r) = inner.last() {
+                    if c.kind(r) == "return_statement" && rets == 1 {
+                        if let Some(re) = c.named(r).first().copied() {
+                            push(vec![
+                                Edit::insert(at, format!("bool {name} = {};\n{ind}", c.text(e))),
+                                Edit::replace(&c, r, format!("{name} = {};", c.text(re))),
+                                Edit::replace(&c, last, format!("return {name};")),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A returned comparison narrowed explicitly (`return (unsigned char)(a == b);`): the 0/1 is
+/// then truncated to a byte (`extrwi`), as when the source returned it through a byte-sized type.
+pub fn narrow_ret_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(body) = c.child(def, "body") else { return vec![] };
+    let mut edits = vec![];
+    for r in c.descendants(body) {
+        if c.kind(r) != "return_statement" {
+            continue;
+        }
+        let Some(e) = c.named(r).first().copied() else { continue };
+        let e0 = if c.kind(e) == "parenthesized_expression" { c.named(e).first().copied().unwrap_or(e) } else { e };
+        let cmp = c.kind(e0) == "binary_expression" && matches!(c.op(e0), Some("==" | "!=" | "<" | ">" | "<=" | ">="));
+        if cmp {
+            edits.push(Edit::replace(&c, e, format!("(unsigned char)({})", c.text(e0))));
+        }
+    }
+    if edits.is_empty() {
+        return vec![];
+    }
+    match apply(src, &edits) {
+        Some(s) if Cst::parse(&s).errors <= c.errors => vec![s],
+        _ => vec![],
+    }
 }
 
 struct Scored {

@@ -475,6 +475,8 @@ pub struct Scorer<'a> {
     pub symbol: String,
     /// Set once the PCH crashed the compiler: use `plain` from then on.
     pub pch_broken: std::sync::atomic::AtomicBool,
+    /// Proves target placeholders (`fn_<addr>`) equal to our named functions.
+    pub prover: Option<&'a dyn mwdec_mwcc::PlaceholderProver>,
 }
 
 impl<'a> Scorer<'a> {
@@ -487,7 +489,13 @@ impl<'a> Scorer<'a> {
         ours_ext: Option<&'a ExternIndex>,
         symbol: &str,
     ) -> Scorer<'a> {
-        Scorer { mwcc, ctx, plain, target, tf, ours_ext, symbol: symbol.to_string(), pch_broken: Default::default() }
+        Scorer { mwcc, ctx, plain, target, tf, ours_ext, symbol: symbol.to_string(), pch_broken: Default::default(), prover: None }
+    }
+
+    /// Resolve target placeholders through `p` (see `mwdec_mwcc::placeholder`).
+    pub fn with_prover(mut self, p: Option<&'a dyn mwdec_mwcc::PlaceholderProver>) -> Self {
+        self.prover = p;
+        self
     }
 }
 
@@ -550,7 +558,8 @@ impl Scorer<'_> {
         let oi = match self.ours_ext {
             Some(e) => ObjIndex::with_externs(&ours, e),
             None => ObjIndex::new(&ours),
-        };
+        }
+        .with_prover(self.prover);
         let fit = fitness(self.target, self.tf, &oi, of);
         // An exact match from the fast path (a persistent compiler) only counts once a normal
         // compile of the same candidate confirms it.
@@ -603,7 +612,8 @@ impl Scorer<'_> {
         let oi = match self.ours_ext {
             Some(e) => ObjIndex::with_externs(&o, e),
             None => ObjIndex::new(&o),
-        };
+        }
+        .with_prover(self.prover);
         Some(fitness(self.target, self.tf, &oi, of))
     }
 }

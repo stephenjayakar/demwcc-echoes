@@ -18,10 +18,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod compare;
+pub mod placeholder;
 mod fast;
 mod split;
 pub use fast::FastStats;
 pub use compare::{compare, compare_detailed, compare_indexed, Detailed, DiffClass, ExternIndex, ObjIndex};
+pub use placeholder::PlaceholderProver;
 
 /// Default project root (read-only inputs); override with `MWDEC_ROOT`.
 

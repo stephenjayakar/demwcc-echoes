@@ -602,6 +602,13 @@ impl Expr {
         }
     }
 
+    /// Contains a value the lifter couldn't express (`Expr::Unknown`, e.g. an uninitialised register).
+    pub fn any_unknown(&self) -> bool {
+        let mut found = false;
+        self.walk(&mut |e| found |= matches!(e, Expr::Unknown { .. }));
+        found
+    }
+
     pub fn has_call(&self) -> bool {
         let mut found = false;
         self.walk(&mut |e| {

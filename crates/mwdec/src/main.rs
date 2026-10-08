@@ -14,6 +14,7 @@ mod draft_server;
 mod autoctx;
 mod harvest;
 mod search_cmds;
+mod placeholders;
 
 #[derive(Parser)]
 #[command(name = "mwdec", about = "Matching decompiler for Metroid Prime 2 (MWCC GC/2.7)")]
@@ -249,6 +250,10 @@ enum Cmd {
         /// eval's output), for comparable re-runs; split/size filters still apply.
         #[arg(long)]
         list: Option<PathBuf>,
+        /// Draft only, no compiles: rows carry a hash of the draft texts (cheap no-loss check
+        /// between two binaries, `tools/drafts_diff.py`).
+        #[arg(long)]
+        drafts_only: bool,
     },
     /// Internal: first drafts for `eval`, one JSON request/reply per line (stdin/stdout).
     #[command(hide = true)]
@@ -311,11 +316,11 @@ fn real_main() -> Result<()> {
             }
             harvest::cmd_verify_units(&root, &units)
         }
-        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, exclude_implicit, mem_report, list } => {
+        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, exclude_implicit, mem_report, list, drafts_only } => {
             search_cmds::cmd_eval(
                 &root,
                 &cli.work.clone().unwrap_or_else(search_cmds::search_work),
-                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit: include_implicit || !exclude_implicit, mem_report, list },
+                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit: include_implicit || !exclude_implicit, mem_report, list, drafts_only },
             )
         }
     }
@@ -434,7 +439,8 @@ fn cmd_check(
     };
     let ext = module_externs(&p, std::iter::once(u.name.as_str()));
     let (text, oext) = &ext[Project::module_of(&u.name)];
-    let d = mwdec_mwcc::compare_indexed(&ObjIndex::with_externs(&target, text), tf, &ObjIndex::with_externs(&ours, oext), of);
+    let prover = placeholders::UnitProver::new(&m, &ctx, None);
+    let d = mwdec_mwcc::compare_indexed(&ObjIndex::with_externs(&target, text), tf, &ObjIndex::with_externs(&ours, oext).with_prover(Some(&prover)), of);
     let r = &d.result;
     println!(
         "{} {symbol}: score {:.1} ({}; target {:#x} bytes, ours {:#x}; ctx {:.0} ms, compile {:.0} ms{})",

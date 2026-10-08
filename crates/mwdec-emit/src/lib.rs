@@ -75,6 +75,10 @@ struct Em<'a> {
     /// Declared type of each global the emitter declares itself (one per symbol, even when the
     /// IR accesses it with several types).
     gtypes: std::collections::HashMap<String, Type>,
+    /// Undeclared globals accessed as several scalar members: (offset, type) per member of the
+    /// stand-in struct they are declared as (named-object accesses, which the compiler's alias
+    /// analysis tells apart, unlike casts of its address).
+    gstructs: std::collections::HashMap<String, Vec<(i32, Type)>>,
     /// Function-local statics (`init$90`) declared at the top of the body.
     local_statics: BTreeSet<String>,
     /// Forward declarations of functions the context doesn't declare (file-local statics,
@@ -145,7 +149,7 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
             }
         }
     });
-    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), obj_arrays: Default::default(), vt_count: 0, sret_local: None, gtypes: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false, member_store: false };
+    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), obj_arrays: Default::default(), vt_count: 0, sret_local: None, gtypes: Default::default(), gstructs: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false, member_store: false };
     // a static initializer: the global definitions it is generated from
     if ir.symbol.starts_with("__sinit_") {
         let mut em = new_em();
@@ -409,6 +413,12 @@ impl<'a> Em<'a> {
                 used.insert(*v);
             }
         });
+        // locals declared for their frame slots only
+        for (v, var) in ir.vars.iter().enumerate() {
+            if var.kind == VarKind::Local && var.name.starts_with(mwdec_lift::UNUSED_LOCAL_PREFIX) {
+                used.insert(v);
+            }
+        }
         // C89 (c_mode) only allows declarations at the start of a block
         self.constructed = if self.opts.c_mode { HashSet::new() } else { mwdec_lift::idioms::decl_at_first_def(&ir.body, &ir.vars) };
         // local arrays of objects are declared where they are constructed
@@ -1054,6 +1064,76 @@ impl<'a> Em<'a> {
             };
             self.gtypes.insert(sym, t);
         }
+        self.collect_global_structs();
+    }
+
+    /// Globals the context lacks that are only read and written as scalar members (not just the
+    /// one at offset 0; never by address): a stand-in struct with one member per offset.
+    fn collect_global_structs(&mut self) {
+        let mut fields: std::collections::HashMap<String, std::collections::BTreeMap<i32, Vec<Type>>> = Default::default();
+        let mut total: std::collections::HashMap<String, usize> = Default::default();
+        let mut covered: std::collections::HashMap<String, usize> = Default::default();
+        Stmt::walk_exprs(&self.ir.body, &mut |e| match e {
+            Expr::Global { symbol, .. } => *total.entry(symbol.clone()).or_default() += 1,
+            Expr::Member { base, offset, ty } => {
+                if let Expr::Global { symbol, .. } = &**base {
+                    *covered.entry(symbol.clone()).or_default() += 1;
+                    let v = fields.entry(symbol.clone()).or_default().entry(*offset).or_default();
+                    if !v.contains(ty) {
+                        v.push(ty.clone());
+                    }
+                }
+            }
+            _ => {}
+        });
+        for (sym, fs) in fields {
+            // (one member at offset 0 is the object itself: nothing to name)
+            if (fs.len() < 2 && fs.keys().all(|&o| o == 0)) || total.get(&sym) != covered.get(&sym) || !self.self_declared(&sym) || local_static_name(&sym).is_some() {
+                continue;
+            }
+            if !sym.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let mut members = vec![];
+            let mut list = vec![];
+            let mut at = 0i32;
+            let mut ok = true;
+            for (off, ts) in &fs {
+                let [t] = ts.as_slice() else { ok = false; break };
+                let t = extern_type(t);
+                let sz = match strip_cv(&t) {
+                    Type::Int { size, .. } => *size as i32,
+                    Type::Float { size } => *size as i32,
+                    Type::Bool | Type::Char => 1,
+                    Type::Ptr(_) => 4,
+                    _ => 0,
+                };
+                if sz == 0 || *off < at || off % sz != 0 {
+                    ok = false;
+                    break;
+                }
+                if *off > at {
+                    members.push(format!("unsigned char _p{:x}[{}];", at, off - at));
+                }
+                members.push(format!("{};", decl(&t, &format!("f{:x}", off))));
+                list.push((*off, t));
+                at = off + sz;
+            }
+            if !ok {
+                continue;
+            }
+            let name = format!("__mwdec_g_{sym}");
+            // (keeps the object's size when its other uses showed it)
+            if let Some(Type::Array(_, n)) = self.gtypes.get(&sym) {
+                if (*n as i32) > at {
+                    members.push(format!("unsigned char _p{:x}[{}];", at, *n as i32 - at));
+                }
+            }
+            // (a typedef: the same spelling in C and C++ units)
+            self.type_defs.push(format!("typedef struct {{ {} }} {name};", members.join(" ")));
+            self.gtypes.insert(sym.clone(), Type::Named(name));
+            self.gstructs.insert(sym, list);
+        }
     }
 
     fn ind(&self, depth: usize) -> String {
@@ -1087,9 +1167,50 @@ impl<'a> Em<'a> {
                     }
                 }
             }
+            // `U u(r); x = u;` with `r` a reference bound to a call result: `x = U(r);`. The
+            // reference's temporary was kept apart because it lies above the object built from
+            // it, which then has to be a temporary created after it (a named `u` comes first
+            // in MWCC's frame object list).
+            if let (Some((c, sg, args)), Some(Stmt::Assign { dst, src: Expr::Var(w) })) = (self.ctor_from_ref_binding(&stmts[i]), stmts.get(i + 1)) {
+                let mut uses = std::collections::HashMap::new();
+                mwdec_lift::inline::count_uses(&self.ir.body, &mut uses);
+                if *w == c && !dst.uses_var(c) && uses.get(&c).copied().unwrap_or(0) <= 2 {
+                    let class = Type::Named(sg.this_class.clone().unwrap_or_default());
+                    let st = Stmt::Assign { dst: dst.clone(), src: Expr::Construct { class, ctor: Some(sg.clone()), args: args.to_vec() } };
+                    self.stmt(&st, depth);
+                    i += 2;
+                    continue;
+                }
+            }
             self.stmt(&stmts[i], depth);
             i += 1;
         }
+    }
+
+    /// `&u->U(args)` on a frame object with an argument that is a frame temporary bound to a
+    /// reference: (u, constructor, args).
+    fn ctor_from_ref_binding<'s>(&self, s: &'s Stmt) -> Option<(VarId, &'s mwdec_core::FuncSig, &'s [Expr])> {
+        let Stmt::Expr(Expr::Call { callee: Callee::Method { sig: sg, this, .. }, args, .. }) = s else { return None };
+        if !sig::is_ctor(sg) || sg.this_class.is_none() {
+            return None;
+        }
+        let Expr::AddrOf(x) = &**this else { return None };
+        let Expr::Var(c) = &**x else { return None };
+        if !matches!(self.ir.vars[*c].kind, VarKind::Stack { .. }) {
+            return None;
+        }
+        let bound = |e: &Expr| {
+            let mut hit = false;
+            e.walk(&mut |y| {
+                if let Expr::Var(r) = y {
+                    if matches!(self.ir.vars[*r].kind, VarKind::Stack { .. }) && matches!(self.ir.vars[*r].ty, Type::Ref(_)) {
+                        hit = true;
+                    }
+                }
+            });
+            hit
+        };
+        args.iter().any(bound).then_some((*c, sg, args.as_slice()))
     }
 
     /// `if (p) p->T(args);` with `p` not a frame object: the expansion of `new (p) T(args)`.
@@ -2218,6 +2339,15 @@ impl<'a> Em<'a> {
         let intlike = |t: &Type| matches!(t, Type::Int { .. } | Type::Long { .. } | Type::Char | Type::WChar | Type::Bool | Type::Unknown { .. });
         let is_enum = |t: &Type| mwdec_lift::types::is_enum(db, t);
         let to_scalar = scalar(&tr) || is_ptr(&tr) || is_enum(&tr);
+        // a negated condition as a (small) enum: the selection of the two constants, which MWCC
+        // materializes without narrowing the 0/1 (`(E)!x` truncates to the enum's size)
+        if let Expr::Unary { op: UnOp::Not, e: x, .. } = e {
+            if is_enum(&tr) {
+                let t = type_str(to);
+                let c = self.expr(x, 4);
+                return Some(format!("({c} ? ({t})0 : ({t})1)"));
+            }
+        }
         // an aggregate member read where a scalar is wanted: reinterpret its bytes
         if to_scalar && mwdec_lift::types::is_aggregate(db, &fr) && !matches!(tr, Type::Unknown { size: 0 }) {
             if let Expr::Load { base, offset, .. } | Expr::Member { base, offset, .. } = e {
@@ -2645,6 +2775,14 @@ impl<'a> Em<'a> {
     /// Member of an aggregate lvalue (stack region, global, by-value param).
     fn member_access(&mut self, base: &Expr, off: i32, ty: &Type) -> String {
         let read = !std::mem::replace(&mut self.lvalue_ctx, false);
+        if let Expr::Global { symbol, .. } = base {
+            if let Some(t) = self.gstructs.get(symbol).and_then(|l| l.iter().find(|f| f.0 == off)).map(|f| f.1.clone()) {
+                let dt = self.gtypes.get(symbol).cloned().unwrap_or_else(|| t.clone());
+                let g = self.global(symbol, &dt);
+                let m = format!("{g}.f{off:x}");
+                return if extern_type(ty) == t { m } else { format!("(*({})&{m})", ptr_to(&extern_type(ty))) };
+            }
+        }
         let bt = ty_of(base, self.vars());
         // an arithmetic value has no address: the value itself (its bits read as another
         // same-sized scalar can't be spelled)

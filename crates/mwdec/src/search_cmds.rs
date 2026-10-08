@@ -5,6 +5,7 @@
 //! other target objects (literal values), the include-only context TU (`harness::context_tu`)
 //! and the compiler. No source file body is ever opened here.
 use super::{find_unit, load_obj, load_project, module_externs};
+use crate::draft_server::DraftReply;
 use anyhow::{anyhow, bail, Context, Result};
 use mwdec_core::*;
 use mwdec_mwcc::{ExternIndex, Mwcc, ObjIndex, UnitContext};
@@ -307,6 +308,28 @@ pub fn choose_draft(ui: &UnitInputs, f: &Function, scorer: &Scorer, with_inlines
     choose_between(scorer, with_inlines, plain)
 }
 
+/// Register repair of the chosen draft, then the draft variants (`mwdec_lift::variants`) when
+/// that is not exact: the best variant, repaired too, replaces it only if strictly better (so a
+/// variant never costs a match the default pipeline finds).
+pub fn repair_or_variant(scorer: &Scorer, chosen: String, variants: Vec<String>, tracer: Option<&mwdec_search::trace::Tracer>) -> String {
+    let base = repair_registers(scorer, chosen, tracer);
+    if variants.is_empty() {
+        return base;
+    }
+    let fit = |s: &str| scorer.eval(s).0.fitness().cloned();
+    let bf = fit(&base);
+    if bf.as_ref().is_some_and(|f| f.exact) {
+        return base;
+    }
+    let Some(v) = choose_among(scorer, variants) else { return base };
+    let v = repair_registers(scorer, v, tracer);
+    match (fit(&v), bf) {
+        (Some(x), Some(y)) if x.better_than(&y) => v,
+        (Some(_), None) => v,
+        _ => base,
+    }
+}
+
 /// Kind of a function the compiler emits without a definition in the unit (`hdr-inline` or an
 /// `mwdec_project::standalone` implicit kind); None for ordinary functions.
 pub fn emitted_kind(ui: &UnitInputs, f: &Function) -> Option<String> {
@@ -507,6 +530,43 @@ pub fn draft_sinit_variant(ui: &UnitInputs, f: &Function, k: u8) -> std::result:
 }
 
 fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool, raw_offsets: bool, sinit_const: bool, sinit_variant: u8) -> std::result::Result<String, NoDraft> {
+    draft_flipped(ui, f, inlines, include_implicit, raw_offsets, sinit_const, sinit_variant, &[]).map(|(s, _)| s)
+}
+
+/// Draft variant points tried per function (each costs one lift + emit and, when the source
+/// differs, one compile).
+pub const MAX_VARIANT_POINTS: usize = 4;
+
+/// The draft variants of `f` (`mwdec_lift::variants`): the default draft (with folded inlines)
+/// redrafted with each decision point it asked flipped, distinct sources other than the default.
+/// The caller compiles them with the other candidates and keeps the best.
+pub fn variant_drafts(ui: &UnitInputs, f: &Function, include_implicit: bool) -> Vec<String> {
+    if std::env::var_os("MWDEC_NO_VARIANTS").is_some() {
+        return vec![];
+    }
+    let Ok((base, points)) = draft_flipped(ui, f, true, include_implicit, false, false, 0, &[]) else { return vec![] };
+    let mut out: Vec<String> = Vec::new();
+    for p in points.into_iter().take(MAX_VARIANT_POINTS) {
+        if let Ok((s, _)) = draft_flipped(ui, f, true, include_implicit, false, false, 0, &[p]) {
+            if s != base && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// One draft with the given variant points flipped; also returns the points it asked.
+fn draft_flipped(
+    ui: &UnitInputs,
+    f: &Function,
+    inlines: bool,
+    include_implicit: bool,
+    raw_offsets: bool,
+    sinit_const: bool,
+    sinit_variant: u8,
+    flipped: &[&'static str],
+) -> std::result::Result<(String, Vec<&'static str>), NoDraft> {
     if !include_implicit {
         if let Some(why) = mwdec_lift::asmonly::requires_asm(&ui.target, f) {
             return Err(NoDraft::Asm(why));
@@ -520,8 +580,20 @@ fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bo
             _ => {}
         }
     }
+    // the inline library lifts its probes: build it outside the variant scope
+    if inlines && ui.inlines.enabled && ui.db.is_some() {
+        let _ = ui.inlines.get(ui, &format!("{}
+{}", ui.mwcc.compiler, ui.ctx.cflags.join(" ")));
+    }
+    let (res, points) = mwdec_lift::variants::draft(flipped, || draft_once(ui, f, inlines, raw_offsets, sinit_const, sinit_variant));
+    res.map(|s| (s, points))
+}
+
+fn draft_once(ui: &UnitInputs, f: &Function, inlines: bool, raw_offsets: bool, sinit_const: bool, sinit_variant: u8) -> std::result::Result<String, NoDraft> {
     let ir = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let lopts = mwdec_lift::LiftOptions { compiler: Some(ui.mwcc.compiler.clone()), ..Default::default() };
+        // (`MWDEC_NO_UNIT_COMPILER=1`: lift as for the game compiler, to measure the compiler-specific rules)
+        let compiler = if std::env::var_os("MWDEC_NO_UNIT_COMPILER").is_some() { None } else { Some(ui.mwcc.compiler.clone()) };
+        let lopts = mwdec_lift::LiftOptions { compiler, ..Default::default() };
         let mut ir = mwdec_lift::lift_function_with(ui.lift_obj.as_ref().unwrap_or(&ui.target), f, ui.db.as_ref(), &lopts)?;
         if let (Some(db), true) = (&ui.db, inlines && ui.inlines.enabled) {
             let lib = ui.inlines.get(ui, &format!("{}
@@ -653,7 +725,8 @@ pub fn cmd_match(root: &Path, work: &Path, a: MatchArgs) -> Result<()> {
         None => match draft(&ui, f) {
             Ok(s) if emitted_kind(&ui, f).is_some() || mwdec_emit::instantiate::is_template_instance(&f.name) => {
                 let ti = ObjIndex::with_externs(&ui.target, &t_ext);
-                let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&o_ext), &a.symbol);
+                let prover = crate::placeholders::UnitProver::new(&ui.mwcc, &ui.ctx, ui.db.as_ref());
+                let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&o_ext), &a.symbol).with_prover(Some(&prover));
                 let mut c = instantiation_drafts(&ui, f);
                 let lifted = specialization_drafts(&c, std::iter::once(s));
                 c.extend(lifted);
@@ -667,9 +740,10 @@ pub fn cmd_match(root: &Path, work: &Path, a: MatchArgs) -> Result<()> {
         },
     };
     let ti = ObjIndex::with_externs(&ui.target, &t_ext);
-    let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&o_ext), &a.symbol);
+    let prover = crate::placeholders::UnitProver::new(&ui.mwcc, &ui.ctx, ui.db.as_ref());
+    let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&o_ext), &a.symbol).with_prover(Some(&prover));
     let init = if a.init.is_none() && emitted_kind(&ui, f).is_none() && !mwdec_emit::instantiate::is_template_instance(&f.name) {
-        repair_registers(&scorer, choose_draft(&ui, f, &scorer, init), ui.tracer.as_deref())
+        repair_or_variant(&scorer, choose_draft(&ui, f, &scorer, init), variant_drafts(&ui, f, true), ui.tracer.as_deref())
     } else {
         init
     };
@@ -757,6 +831,10 @@ pub struct EvalArgs {
     pub disable_ops: Option<String>,
     pub mem_report: bool,
     pub list: Option<PathBuf>,
+    /// Draft only (no compiles): each row carries `draft_hash`, a hash of every draft text the
+    /// compile stage would see (default, plain, raw, alternatives, variants). Two binaries with
+    /// equal hashes on a function produce the same eval result for it (`tools/drafts_diff.py`).
+    pub drafts_only: bool,
 }
 
 #[derive(Default, Clone)]
@@ -792,6 +870,8 @@ struct Row {
     /// exact and MWDEC_EVAL_POLISH is set)
     nat_draft: Option<String>,
     nat_final: Option<String>,
+    /// `--drafts-only`: hash of the draft texts.
+    draft_hash: Option<String>,
 }
 
 impl Row {
@@ -804,9 +884,19 @@ impl Row {
             "evals": self.evals, "compiles": self.compiles, "seconds": self.seconds, "error": self.error,
             "winning_ops": self.winning_ops, "ops": self.ops, "polished": self.polished, "implicit": self.implicit,
             "first_profile": self.first_profile, "best_profile": self.best_profile, "traces": self.traces, "mem_mb": self.mem_mb,
-            "nat_draft": self.nat_draft, "nat_final": self.nat_final,
+            "nat_draft": self.nat_draft, "nat_final": self.nat_final, "draft_hash": self.draft_hash,
         })
     }
+}
+
+/// Hash of every draft text of a reply (`--drafts-only`).
+fn draft_hash(d: &DraftReply) -> String {
+    let mut parts: Vec<&[u8]> = vec![d.status.as_bytes(), b"\0src", d.src.as_deref().unwrap_or("").as_bytes(), b"\0plain", d.plain.as_deref().unwrap_or("").as_bytes(), b"\0raw", d.raw.as_deref().unwrap_or("").as_bytes()];
+    parts.push(b"\0alts");
+    parts.extend(d.alts.iter().map(|s| s.as_bytes()));
+    parts.push(b"\0variants");
+    parts.extend(d.variants.iter().map(|s| s.as_bytes()));
+    format!("{:032x}", mwdec_mwcc::content_hash(&parts))
 }
 
 /// Deterministic shuffle (SplitMix64-driven Fisher-Yates).
@@ -896,6 +986,26 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                 let Some(e) = ds.get(i) else { break };
                 let t = Instant::now();
                 let mut row = Row { unit: e.unit.clone(), symbol: e.symbol.clone(), size: e.size, ..Default::default() };
+                if a.drafts_only {
+                    let d = match &drafter {
+                        Some(c) => c.draft(&e.unit, &e.symbol, a.include_implicit, false),
+                        None => DraftReply::err("unit-err", "--drafts-only needs the draft server"),
+                    };
+                    row.status = d.status.clone();
+                    row.error = d.error.clone();
+                    row.implicit = d.implicit.clone();
+                    row.drafted = d.src.is_some() || !d.alts.is_empty();
+                    row.draft_hash = Some(draft_hash(&d));
+                    row.seconds = t.elapsed().as_secs_f64();
+                    let mut f = out_file.lock().unwrap();
+                    let _ = writeln!(f, "{}", row.json());
+                    let _ = f.flush();
+                    drop(f);
+                    if (i + 1) % 200 == 0 {
+                        eprintln!("[{:>4}/{}] drafts", i + 1, ds.len());
+                    }
+                    continue;
+                }
                 let module = Project::module_of(&e.unit).to_string();
                 let ext = externs.get(&module);
                 let slot = units.lock().unwrap().entry(e.unit.clone()).or_default().clone();
@@ -1006,7 +1116,8 @@ fn run_one(
     };
     row.drafted = true;
     let ti = ObjIndex::with_externs(&ui.target, &ext.0);
-    let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &e.symbol);
+    let prover = crate::placeholders::UnitProver::new(&ui.mwcc, &ui.ctx, ui.db.as_ref());
+    let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &e.symbol).with_prover(Some(&prover));
     let src = if d.alts.is_empty() {
         choose_between(&scorer, src, plain)
     } else {
@@ -1031,7 +1142,7 @@ fn run_one(
             best
         }
     };
-    let src = repair_registers(&scorer, src, ui.tracer.as_deref());
+    let src = repair_or_variant(&scorer, src, d.variants.clone(), ui.tracer.as_deref());
     // Compile the draft before the search clock starts: a compiler crash with the unit's PCH is
     // repaired here (split PCH, once per unit context, cached on disk), not inside the budget.
     let (first, _) = scorer.eval(&src);

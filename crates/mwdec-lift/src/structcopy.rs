@@ -14,11 +14,15 @@
 //! - a returned object built member by member from values that don't depend on it, for a class
 //!   with a constructor taking one argument per member -> `return T(a, b);`.
 //!
-//! (Setter runs `v.SetX(o.GetX()); ...` are left alone: drafts built that way are often exact.)
+//! - a run of member stores into a local object, one per member, from one object's members
+//!   (rendered `v.SetX(o.GetX()); v.SetY(o.GetY()); ...` for private members) -> `v = o;`. Drafts
+//!   built member by member are often exact as they are, so this one is a draft variant
+//!   ([`crate::variants::STRUCTCOPY_SETTERS`]), and so is leaving each of the other two alone.
 //!
 //! Runs on the final body, after inline expansions were folded back into calls.
 use crate::ir::*;
 use crate::types;
+use crate::variants;
 use mwdec_core::{Type, TypeDb};
 
 /// Apply both rewrites; returns how many copies were formed.
@@ -27,9 +31,34 @@ pub fn apply(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> usize {
         return 0;
     }
     let mut n = 0;
-    n += returned_copy(body, vars, db) as usize;
-    for s in body.iter_mut() {
-        stmt_exprs(s, &mut |e| n += construct_copies(e, vars, db));
+    // each rewrite is tried on a copy and asks its variant point only when it applies
+    let mut b = body.clone();
+    if returned_copy(&mut b, vars, db) && !variants::alt(variants::STRUCTCOPY_NO_RETURN) {
+        *body = b;
+        n += 1;
+    }
+    // the returned object copied from one object through its copy constructor's branches
+    // (`optional_object`: flag, then the value only when set): a variant
+    let mut b = body.clone();
+    if returned_whole(&mut b, vars) && variants::alt(variants::STRUCTCOPY_RETURN_WHOLE) {
+        *body = b;
+        n += 1;
+    }
+    let mut b = body.clone();
+    let mut k = 0;
+    for s in b.iter_mut() {
+        stmt_exprs(s, &mut |e| k += construct_copies(e, vars, db));
+    }
+    if k > 0 && !variants::alt(variants::STRUCTCOPY_NO_TEMP) {
+        *body = b;
+        n += k;
+    }
+    let mut b = body.clone();
+    let mut k = 0;
+    Stmt::for_each_block_mut(&mut b, &mut |l| k += setters(l, vars, db));
+    if k > 0 && variants::alt(variants::STRUCTCOPY_SETTERS) {
+        *body = b;
+        n += k;
     }
     n
 }
@@ -191,6 +220,13 @@ fn any_bare_return(body: &[Stmt]) -> bool {
 /// Returned objects (module docs): the statement list that builds the returned object and
 /// returns it must hold every use of it; other paths return values of their own.
 fn returned_copy(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> bool {
+    in_returning_list(body, vars, false, &mut |l, rv| returned_copy_in(l, rv, vars, db))
+}
+
+/// Apply `f` to the statement list that holds every use of the returned object (straight-line,
+/// or with `if`s when `ifs`), then drop the dead trailing `return __return_value;`; undone if any
+/// use or bare `return` remains.
+fn in_returning_list(body: &mut Vec<Stmt>, vars: &[Var], ifs: bool, f: &mut dyn FnMut(&mut Vec<Stmt>, VarId) -> bool) -> bool {
     let Some(rv) = vars.iter().position(|v| v.kind == VarKind::StructRet) else { return false };
     let total = count_mentions(body, rv);
     if total == 0 {
@@ -199,8 +235,8 @@ fn returned_copy(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> boo
     let orig = body.clone();
     let mut done = false;
     Stmt::for_each_block_mut(body, &mut |l| {
-        if !done && count_mentions(l, rv) == total && l.iter().all(|s| matches!(s, Stmt::Assign { .. } | Stmt::Expr(_) | Stmt::Return(_) | Stmt::Comment(_))) {
-            done = returned_copy_in(l, rv, vars, db);
+        if !done && count_mentions(l, rv) == total && l.iter().all(|s| matches!(s, Stmt::Assign { .. } | Stmt::Expr(_) | Stmt::Return(_) | Stmt::Comment(_)) || (ifs && matches!(s, Stmt::If { .. }))) {
+            done = f(l, rv);
         }
     });
     if !done {
@@ -271,6 +307,151 @@ fn returned_copy_in(body: &mut Vec<Stmt>, rv: VarId, vars: &[Var], db: Option<&T
     let args: Vec<Expr> = args.into_iter().map(|a| a.unwrap()).collect();
     body.splice(first..=last, [Stmt::Return(Some(Expr::Construct { class: class.clone(), ctor: None, args }))]);
     true
+}
+
+// ------------------------------------------------------------------ whole returned object
+
+/// `return x;` for a function whose straight-line body only fills the struct-return object from
+/// one object `x` (loads at one fixed distance from the stores, directly or through temporaries),
+/// with early `return`s on conditions that don't read the returned object, and values that read
+/// nothing from it (a copied flag). The copy constructor's code it stands for is not checked:
+/// this is a variant, compiled and kept only when better.
+fn returned_whole(body: &mut Vec<Stmt>, vars: &[Var]) -> bool {
+    in_returning_list(body, vars, true, &mut |l, rv| returned_whole_in(l, rv, vars))
+}
+
+fn returned_whole_in(body: &mut Vec<Stmt>, rv: VarId, vars: &[Var]) -> bool {
+    let Some(class) = pointee(&vars[rv].ty).cloned() else { return false };
+    if !matches!(body.last(), Some(Stmt::Return(None))) {
+        return false;
+    }
+    let is_rv = |e: &Expr| matches!(e, Expr::Var(x) if *x == rv);
+    let mut temps: std::collections::HashMap<VarId, (Expr, i32)> = std::collections::HashMap::new();
+    let mut source: Option<(Expr, i32)> = None; // (base, distance src - dst)
+    let mut copies = 0;
+    for s in &body[..body.len() - 1] {
+        match s {
+            Stmt::Assign { dst: Expr::Var(t), src } if !mentions_var(src, rv) && !has_call(src) => {
+                if let Some((b, o)) = member_access(src) {
+                    temps.insert(*t, (b.clone(), o));
+                }
+            }
+            Stmt::Assign { dst: Expr::Load { base, offset, .. }, src } if is_rv(base) => {
+                if mentions_var(src, rv) {
+                    return false;
+                }
+                let from = match src {
+                    Expr::Var(t) => temps.get(t).cloned(),
+                    e => member_access(e).map(|(b, o)| (b.clone(), o)),
+                };
+                if let Some((b, o)) = from {
+                    let here = (b, o - offset);
+                    match &source {
+                        Some(s0) if *s0 != here => return false,
+                        _ => source = Some(here),
+                    }
+                    copies += 1;
+                }
+            }
+            Stmt::If { cond, then, els } if els.is_empty() && matches!(then.as_slice(), [Stmt::Return(None)]) && !mentions_var(cond, rv) && !has_call(cond) => {}
+            _ => return false,
+        }
+    }
+    let Some((base, dist)) = source.filter(|_| copies >= 2) else { return false };
+    if dist < 0 {
+        return false;
+    }
+    *body = vec![Stmt::Return(Some(Expr::Load { base: Box::new(base), offset: dist, ty: class }))];
+    true
+}
+
+// ------------------------------------------------------------------ member runs
+
+/// `v.m = <src>` into a member of local object `v`: (v, member offset, value).
+fn member_store(s: &Stmt) -> Option<(VarId, i32, &Expr)> {
+    match s {
+        Stmt::Assign { dst: Expr::Member { base, offset, ty }, src } if scalar_size(ty).is_some() => match **base {
+            Expr::Var(v) => Some((v, *offset, src)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A run of member stores into local object `v`, one per scalar member of its class, from the
+/// members at the same relative offsets of one object behind a pointer (the value read directly
+/// or through a temporary defined just before): `v = *(T*)(p + s)`. Temporaries stay, read back
+/// from `v`. (Rendered with setters/getters when the members are private: `v.SetX(o.GetX())`.)
+fn setters(b: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        // value of a store: a load, or a temp defined by the previous statement as a load
+        let value_at = |b: &[Stmt], k: usize| -> Option<(VarId, i32, Expr, i32, Option<usize>)> {
+            let (v, off, src) = member_store(&b[k])?;
+            if let Some((base, so)) = member_access(src) {
+                return Some((v, off, base.clone(), so, None));
+            }
+            let Expr::Var(t) = src else { return None };
+            let Some(Stmt::Assign { dst: Expr::Var(td), src: ld }) = k.checked_sub(1).map(|j| &b[j]) else { return None };
+            if td != t {
+                return None;
+            }
+            let (base, so) = member_access(ld)?;
+            Some((v, off, base.clone(), so, Some(k - 1)))
+        };
+        let Some((v, off0, base, so0, td0)) = value_at(b, i) else {
+            i += 1;
+            continue;
+        };
+        let Some(members) = scalar_members(db, &vars[v].ty) else {
+            i += 1;
+            continue;
+        };
+        let delta = so0 - off0;
+        let mut run: Vec<(usize, i32, Option<usize>)> = vec![(i, off0, td0)];
+        let mut j = i + 1;
+        while j < b.len() && run.len() < members.len() {
+            let k = if value_at(b, j).is_none() && j + 1 < b.len() { j + 1 } else { j };
+            match value_at(b, k) {
+                Some((v2, o2, b2, s2, td)) if v2 == v && b2 == base && s2 - o2 == delta && (k == j || td == Some(j)) => {
+                    run.push((k, o2, td));
+                    j = k + 1;
+                }
+                _ => break,
+            }
+        }
+        let mut offs: Vec<i32> = run.iter().map(|r| r.1).collect();
+        offs.sort();
+        let want: Vec<i32> = members.iter().map(|m| m.0).collect();
+        if offs != want || delta + want[0] < 0 {
+            i = j.max(i + 1);
+            continue;
+        }
+        let first_stmt = run.iter().map(|(k, _, td)| td.unwrap_or(*k)).min().unwrap();
+        let class = vars[v].ty.clone();
+        let mut keep: Vec<Stmt> = vec![Stmt::Assign { dst: Expr::Var(v), src: Expr::Load { base: Box::new(base.clone()), offset: delta, ty: class } }];
+        for k in first_stmt..j {
+            if run.iter().any(|(r, _, _)| *r == k) {
+                continue;
+            }
+            let mut s = b[k].clone();
+            // a temporary feeding the run re-reads the member from the copy
+            if let Some((_, o, _)) = run.iter().find(|(_, _, td)| *td == Some(k)) {
+                if let Stmt::Assign { src, .. } = &mut s {
+                    if let Expr::Load { ty, .. } = src {
+                        *src = Expr::Member { base: Box::new(Expr::Var(v)), offset: *o, ty: ty.clone() };
+                    }
+                }
+            }
+            keep.push(s);
+        }
+        let len = keep.len();
+        b.splice(first_stmt..j, keep);
+        n += 1;
+        i = first_stmt + len;
+    }
+    n
 }
 
 // ------------------------------------------------------------------ traversal

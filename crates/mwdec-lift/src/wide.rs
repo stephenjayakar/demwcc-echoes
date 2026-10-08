@@ -345,7 +345,8 @@ pub fn merge_or_assigns(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
 
 /// Late clean-up: locals assigned once from a half of a 64-bit temp read the half directly,
 /// and `*(u32*)p = (u32)(x >> 32); *(u32*)(p + 4) = (u32)x;` become one 64-bit store.
-pub fn merge_halves(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
+/// `params`: halves of never-reassigned 64-bit parameters too (SDK compiler units).
+pub fn merge_halves(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool], params: bool) {
     // single-assignment locals holding a half of a temp
     let mut assigns: HashMap<VarId, usize> = HashMap::new();
     let mut src_of: HashMap<VarId, Expr> = HashMap::new();
@@ -385,7 +386,7 @@ pub fn merge_halves(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
                 && matches!(vars[*v].kind, VarKind::Local)
                 && (as_hi(e, vars).or_else(|| as_lo(e, vars))).map_or(false, |x| {
                     // a half of a temp, or of a 64-bit parameter never reassigned
-                    matches!(x, Expr::Var(t) if is_temp.get(t).copied().unwrap_or(false) || (matches!(vars[t].kind, VarKind::Param { .. }) && !assigns.contains_key(&t)))
+                    matches!(x, Expr::Var(t) if is_temp.get(t).copied().unwrap_or(false) || (params && matches!(vars[t].kind, VarKind::Param { .. }) && !assigns.contains_key(&t)))
                 })
         })
         .collect();

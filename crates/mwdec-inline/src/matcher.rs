@@ -882,6 +882,10 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
             }
         }
     }
+    // loops over pointer-iterated containers, as iterator loops
+    if std::env::var("MWDI_NO_ITERLOOPS").is_err() {
+        total += crate::iterloops::apply(ir, db);
+    }
     // members built explicitly, now that their values are folded calls
     total += crate::defctor::finish(ir, db, &pending);
     if total > 0 {

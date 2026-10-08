@@ -137,6 +137,7 @@ pub const OPS: &[OpDef] = &[
     OpDef { name: "swap_args", cat: Cat::Expr, weight: 2.0, aff: S | R | L | C, f: crate::near::op_swap_args },
     OpDef { name: "ret_var", cat: Cat::Control, weight: 2.0, aff: L | C, f: crate::near::op_ret_var },
     OpDef { name: "delete_stmt", cat: Cat::Expr, weight: 1.0, aff: C, f: crate::near::op_delete_stmt },
+    OpDef { name: "retype_all", cat: Cat::Types, weight: 3.0, aff: R | C, f: op_retype_all },
     OpDef { name: "ctor_copy", cat: Cat::Expr, weight: 4.0, aff: S | R | C, f: crate::near::op_ctor_copy },
     // Verified no codegen effect: near-zero weight (cleanup / stepping stones only).
     OpDef { name: "unwrap_block", cat: Cat::Order, weight: 0.46, aff: 0, f: op_unwrap_block },
@@ -1334,6 +1335,20 @@ fn literals_fit(c: &Cst, info: &FuncInfo, name: &str, t: &str) -> bool {
         }
     }
     true
+}
+
+/// Signedness pairs for [`op_retype_all`].
+const SIGN_FLIPS: &[(&str, &str)] = &[("unsigned int", "int"), ("int", "unsigned int"), ("u32", "s32"), ("s32", "u32"), ("unsigned short", "short"), ("u16", "s16"), ("unsigned char", "char"), ("u8", "s8")];
+
+/// Macro: every local declared with one integer type gets its other-signedness twin at once
+/// (drafts type all of a function's temporaries from one guess; fixing them one by one needs as
+/// many chained edits, each of which alone may change nothing).
+fn op_retype_all(m: &mut M) -> Option<Vec<Edit>> {
+    let c = m.cst;
+    let decls: Vec<(usize, String)> = m.of_kind(&["declaration"]).into_iter().filter_map(|d| c.child(d, "type").map(|t| (t, c.text(t).to_string()))).collect();
+    let present: Vec<(&str, &str)> = SIGN_FLIPS.iter().copied().filter(|(f, _)| decls.iter().filter(|(_, t)| t == f).count() >= 2).collect();
+    let (from, to) = m.pick_one(&present)?;
+    Some(decls.iter().filter(|(_, t)| t == from).map(|(n, _)| Edit::replace(c, *n, to)).collect())
 }
 
 fn op_local_type(m: &mut M) -> Option<Vec<Edit>> {
@@ -2667,12 +2682,48 @@ pub fn neighbours(src: &str, symbol: &str, weights: &[f64], hints: Option<&RegHi
             }
         }
     }
+    // macro: every local inlined (the draft's temporaries the source never named)
+    let macros = std::env::var_os("MWDEC_NO_MACROS").is_none();
+    if let (Some(op), true, true) = (op_index("inline_var_all"), macros, weights.get(op_index("inline_var_all").unwrap_or(0)).is_some_and(|w| *w > 0.0)) {
+        if let Some(s) = inline_all(src, symbol, op) {
+            let w = weights[op];
+            push(s, op, w, &mut out);
+        }
+    }
     out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(cap);
     out
 }
 
+/// `src` with every local inlined in turn (`op` = `inline_var_all` for several uses, else
+/// `inline_temp`); `None` if fewer than two were inlined.
+pub fn inline_all(src: &str, symbol: &str, op: usize) -> Option<String> {
+    let names: Vec<String> = {
+        let p = Parsed::new(src, symbol)?;
+        let mut v: Vec<(usize, String)> = p.info.vars.values().filter(|v| !v.is_param).map(|v| (p.cst.nodes[v.decl].start, v.name.clone())).collect();
+        v.sort();
+        v.into_iter().map(|x| x.1).collect()
+    };
+    let mut cur = src.to_string();
+    let mut applied = 0;
+    for n in names {
+        // several uses: inline_var_all; one use: inline_temp
+        let alt = op_index("inline_temp");
+        for o in std::iter::once(op).chain(alt) {
+            let mut rng = Rng::new(7);
+            if let Some(s) = apply_op_focused(&cur, symbol, o, &mut rng, &n) {
+                cur = s;
+                applied += 1;
+                break;
+            }
+        }
+    }
+    (applied >= 2).then_some(cur)
+}
+
 pub fn base_weights() -> Vec<f64> {
-    OPS.iter().map(|o| o.weight).collect()
+    // (ablation: macro operators off)
+    let macros = std::env::var_os("MWDEC_NO_MACROS").is_none();
+    OPS.iter().map(|o| if !macros && o.name == "retype_all" { 0.0 } else { o.weight }).collect()
 }
 

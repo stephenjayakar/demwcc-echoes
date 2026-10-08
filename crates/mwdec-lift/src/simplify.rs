@@ -679,6 +679,11 @@ pub fn fold_ternary_constants(body: &mut Vec<Stmt>) {
     });
 }
 
+/// `(unsigned)x`: an unsigned compare of a count (`cmplwi n, 0; ble`) means an unsigned index.
+fn unsigned_cast(e: &Expr) -> bool {
+    matches!(e, Expr::Cast { ty: Type::Int { signed: false, .. }, .. })
+}
+
 fn is_ctr_dec(s: &Stmt, ctr: VarId) -> bool {
     matches!(s, Stmt::Assign { dst: Expr::Var(x), src: Expr::Binary { op: BinOp::Sub, l, r, .. } }
         if *x == ctr && matches!(**l, Expr::Var(y) if y == ctr) && r.as_int() == Some(1))
@@ -862,7 +867,7 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                     _ => unreachable!(),
                 };
                 let signed = match &g {
-                    Expr::Binary { op: BinOp::Le, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(true),
+                    Expr::Binary { op: BinOp::Le, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(!unsigned_cast(l)),
                     Expr::Binary { op: BinOp::Eq, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(false),
                     _ => None,
                 };
@@ -961,7 +966,7 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                                 });
                                 if let Some(n) = init {
                                     let signed = match cond {
-                                        Expr::Binary { op: BinOp::Gt, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(true),
+                                        Expr::Binary { op: BinOp::Gt, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(!unsigned_cast(l)),
                                         Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(false),
                                         _ => None,
                                     };

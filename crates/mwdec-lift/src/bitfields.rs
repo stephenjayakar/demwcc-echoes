@@ -410,10 +410,15 @@ fn top_down(e: &mut Expr, vars: &[Var], db: &TypeDb) {
 /// the SDK's `reg = gx->cmode0; SET_REG_FIELD(reg, ...); SET_REG_FIELD(reg, ...);`:
 /// `t1 = __rlwimi(x, a, ..); t2 = __rlwimi(__rlwimi(t1, b, ..), c, ..);` becomes
 /// `t1 = x; t1 = __rlwimi(t1, a, ..); t1 = __rlwimi(t1, b, ..); t1 = __rlwimi(t1, c, ..);`.
-pub fn insert_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
+/// `sdk`: the SDK compiler's unit (GC/1.2.5n): also words kept across branches, values split
+/// into bit pieces and words inserted whole (the SDK's `SET_REG_FIELD` sequences).
+pub fn insert_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>, sdk: bool) {
     insert_chains_inner(body, vars, is_temp);
-    join_chains(body, is_temp);
-    split_field_values(body);
+    if sdk {
+        hoist_inserted_words(body, vars, is_temp);
+        join_chains(body, is_temp);
+        split_field_values(body);
+    }
 }
 
 /// One variable whose different bits are inserted into several fields is split into its bit
@@ -467,6 +472,66 @@ fn split_field_values(body: &mut Vec<Stmt>) {
         args[1] = Expr::bin(BinOp::And, x, Expr::int((1i64 << width) - 1), ty);
         args[2] = Expr::int(fs);
     });
+}
+
+/// A register word built by inserts and then itself inserted into another word
+/// (`t = (mode >> 1) & 1; __rlwimi(t, mode, 1, 30, 30); SET_REG_FIELD(gx->genMode, 2, 14, t);`)
+/// is a variable set up first: `t = base; t = __rlwimi(t, ..); .. __rlwimi(w, t, ..)`.
+fn hoist_inserted_words(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
+    let base_id = vars.len();
+    let mut new_vars: Vec<Var> = vec![];
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            // the first insert chain used as an inserted value in this statement
+            let mut found: Option<Expr> = None;
+            if let Stmt::Assign { src, .. } | Stmt::Expr(src) = &b[i] {
+                src.walk(&mut |e| {
+                    if found.is_none() && is_rlwimi(e) {
+                        if let Expr::Call { args, .. } = e {
+                            let v = match &args[1] {
+                                Expr::Cast { e, .. } => &**e,
+                                v => v,
+                            };
+                            if is_rlwimi(v) {
+                                found = Some(v.clone());
+                            }
+                        }
+                    }
+                });
+            }
+            let Some(chain) = found else {
+                i += 1;
+                continue;
+            };
+            let r = base_id + new_vars.len();
+            new_vars.push(Var { name: format!("field{}", new_vars.len() + 1), ty: Type::Int { size: 4, signed: false }, kind: VarKind::Local });
+            let mut inserts = vec![];
+            let mut cur = chain.clone();
+            while is_rlwimi(&cur) {
+                let Expr::Call { callee, mut args, ret } = cur else { unreachable!() };
+                let inner = std::mem::replace(&mut args[0], Expr::Var(r));
+                inserts.push(Expr::Call { callee, args, ret });
+                cur = inner;
+            }
+            let mut setup = vec![Stmt::Assign { dst: Expr::Var(r), src: cur }];
+            for ins in inserts.into_iter().rev() {
+                setup.push(Stmt::Assign { dst: Expr::Var(r), src: ins });
+            }
+            if let Stmt::Assign { src, .. } | Stmt::Expr(src) = &mut b[i] {
+                src.rewrite(&mut |e| {
+                    if *e == chain {
+                        *e = Expr::Var(r);
+                    }
+                });
+            }
+            let n = setup.len();
+            b.splice(i..i, setup);
+            i += n;
+        }
+    });
+    is_temp.resize(base_id + new_vars.len(), false);
+    vars.extend(new_vars);
 }
 
 fn is_rlwimi(e: &Expr) -> bool {

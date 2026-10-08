@@ -258,7 +258,7 @@ fn try_array(e: &Expr, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, 
         Some(r) => r,
         // a byte element indexed by a plain integer (`p->mFlags[i]`)
         None if scalar_size(ty) == Some(1) && !is_ptr(&types::ty_of(index, vars)) && index.as_int().is_none() => (index.clone(), 1, 0),
-        None => return None,
+        None => return two_level(p, index, *offset, ty, vars, db, defs),
     };
     let off = *offset as i64 + k;
     if off < 0 || off > 0x100000 {
@@ -331,6 +331,45 @@ fn try_array(e: &Expr, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, 
         return finish(elem, &ot, inner, ty, db);
     }
     None
+}
+
+/// `p + (i * S + j * s + k)` with two scaled indices (S > s): an element of an array inside an
+/// element of an outer array (`p->a[i].b[j]`), resolved one level at a time.
+fn two_level(p: &Expr, index: &Expr, offset: i32, ty: &Type, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, Expr>) -> Option<Expr> {
+    fn terms(e: &Expr, out: &mut Vec<Expr>, k: &mut i64) {
+        match e {
+            Expr::Binary { op: BinOp::Add, l, r, .. } => {
+                terms(l, out, k);
+                terms(r, out, k);
+            }
+            e => match e.as_int() {
+                Some(c) => *k += c,
+                None => out.push(e.clone()),
+            },
+        }
+    }
+    let (mut ts, mut k) = (vec![], 0i64);
+    terms(index, &mut ts, &mut k);
+    if ts.len() != 2 {
+        return None;
+    }
+    let (a, b) = (split_index(&ts[0], vars, db)?, split_index(&ts[1], vars, db)?);
+    if a.2 != 0 || b.2 != 0 || a.1 == b.1 {
+        return None;
+    }
+    let (outer, inner_term) = if a.1 > b.1 { (&ts[0], &ts[1]) } else { (&ts[1], &ts[0]) };
+    let byte = |base: Expr, idx: Expr| Expr::AddrOf(Box::new(Expr::Index { base: Box::new(Expr::cast(t_ptr(t_int(1, false)), base)), index: Box::new(idx), ty: t_int(1, false) }));
+    let off = offset as i64 + k;
+    if !(0..=0x100000).contains(&off) {
+        return None;
+    }
+    let first = try_array(&Expr::Load { base: Box::new(byte(p.clone(), outer.clone())), offset: off as i32, ty: t_unk(0) }, vars, db, defs)?;
+    let (elem, rest) = match first {
+        Expr::Member { base, offset, ty: Type::Unknown { size: 0 } } if matches!(*base, Expr::Index { .. }) => (*base, offset),
+        e @ Expr::Index { .. } => (e, 0),
+        _ => return None,
+    };
+    try_array(&Expr::Load { base: Box::new(byte(Expr::AddrOf(Box::new(elem)), inner_term.clone())), offset: rest, ty: ty.clone() }, vars, db, defs)
 }
 
 /// Rewrite byte-offset element accesses into array indexing everywhere in `body`: accesses

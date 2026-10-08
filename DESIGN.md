@@ -57,7 +57,15 @@ For the function symbol in our compiled object vs the target object:
   symbol+addend), in the same section, with equivalent relocations inside the referenced data
   (jump tables, pointer tables); the target-to-ours mapping of such names must be one-to-one
   within the function;
-- branch targets inside the function equal.
+- branch targets inside the function equal;
+- placeholders (`fn_<address>`, functions dtk named by address because nobody has named them
+  yet) against one of our named functions (a template instance, an inline emitted out of line):
+  equal only when **proven by bytes**: our function is compiled in the same context (from the
+  sources that make the compiler emit it, `mwdec_emit::instantiate`) and compares exact with the
+  placeholder's code under these same rules, recursively up to depth 2 (nested placeholders need
+  their own proof), results cached per unit. Without the proof the relocation differs. Module
+  `mwdec_mwcc::placeholder` (the proof) and `mwdec::placeholders` (the compiles);
+  `MWDEC_NO_PLACEHOLDER=1` turns it off.
 
 This is stricter than objdiff (which ignores literal values and reloc targets). Implementation:
 `mwdec_mwcc::compare` / `compare_indexed`, which also classify a mismatch (`DiffClass`: size,

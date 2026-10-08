@@ -138,6 +138,18 @@ fn sdiv(m: u32, s: u32, plus_x: bool) -> Option<i64> {
 
 fn try_fold(e: &Expr, c: &Ctx, vars: &[Var]) -> Option<Expr> {
     match e {
+        // `x / d * 2^k`: the quotient's final shift and the multiply fold into one mask
+        // (`(q >> k) << k` is `q & -(1 << k)`)
+        Expr::Binary { op: BinOp::And, l, r, ty } if r.as_int().is_some_and(|m| {
+            let m = m as u32;
+            m != 0 && m != u32::MAX && (!m).wrapping_add(1).is_power_of_two() && !m & (!m).wrapping_add(1) == 0
+        }) => {
+            let m = r.as_int()? as u32;
+            let k = (!m).wrapping_add(1).trailing_zeros();
+            let q = try_fold(&Expr::bin(BinOp::Shr, (**l).clone(), Expr::int(k as i64), ty.clone()), c, vars)?;
+            let qt = types::ty_of(&q, vars);
+            Some(Expr::bin(BinOp::Mul, q, Expr::int(1i64 << k), qt))
+        }
         Expr::Binary { op: BinOp::Shr, l, r, .. } => {
             let s = r.as_int()? as u32;
             // unsigned simple

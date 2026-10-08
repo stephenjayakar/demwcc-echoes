@@ -16,6 +16,7 @@ pub mod complete;
 pub mod ctors;
 pub mod defctor;
 pub mod groups;
+pub mod iterloops;
 pub mod matcher;
 pub mod objlocals;
 pub mod post;
@@ -83,7 +84,8 @@ pub fn build_library_for(db: &TypeDb, target: Option<&ObjectFile>, cache: Option
     if let Some(o) = target {
         let classes = defctor::wanted(o.functions.iter().map(|f| f.name.as_str()), db);
         lib.default_ctors = defctor::build(db, &classes, cache.map(|c| &c.defctors), compile);
-        lib.copy_ctors = defctor::build_copies(db, &classes, cache.map(|c| &c.defctors), compile);
+        let pairs = defctor::wanted_pairs(o.functions.iter().map(|f| f.name.as_str()), db);
+        lib.copy_ctors = defctor::build_copies(db, &pairs, cache.map(|c| &c.defctors), compile);
     }
     lib
 }
@@ -94,7 +96,8 @@ pub fn build_library_for_function(db: &TypeDb, f: &mwdec_core::Function, cache: 
     let mut lib = build_library_rel(db, Some(&rel), cache, compile);
     let classes = defctor::wanted(std::iter::once(f.name.as_str()), db);
     lib.default_ctors = defctor::build(db, &classes, cache.map(|c| &c.defctors), compile);
-    lib.copy_ctors = defctor::build_copies(db, &classes, cache.map(|c| &c.defctors), compile);
+    let pairs = defctor::wanted_pairs(std::iter::once(f.name.as_str()), db);
+    lib.copy_ctors = defctor::build_copies(db, &pairs, cache.map(|c| &c.defctors), compile);
     lib
 }
 

@@ -169,6 +169,53 @@ compiler-generated, smallest first, `--scope`) -> `autoctx::HeaderIndex::build` 
 `search`, falling back to `draft_raw` (raw offsets) when the draft doesn't compile ->
 `attempts.jsonl`, `exact.jsonl`, `funcs/`, `miss/`. Attempts are tagged (`--tag`) and resumable.
 
+### Draft variants (`mwdec_lift::variants`)
+
+Some decisions of the lifter and the emitter are not settled by the machine code: a run of member
+stores or one whole-object copy, a folded inline or its expansion, a named local or a
+temporary, an initializer list or assignments in the body. Rather than guessing, a decision site
+asks the variant registry and the compiler picks:
+
+```rust
+// at the decision site (anything that runs during lift + inline folding + emit)
+if mwdec_lift::variants::alt(mwdec_lift::variants::MY_POINT) { /* alternative */ } else { /* default */ }
+```
+
+- Register the point as a `pub const MY_POINT: &str = "area.what"` in `variants.rs` and add it to
+  `variants::POINTS` with one line saying what the alternative does. Ask only where the
+  alternative would actually change the output (try the rewrite on a copy first).
+- Outside a draft, `alt` returns `false` (the default) and records nothing, so tools that call
+  lift/emit directly see the default draft.
+- The driver (`search_cmds::variant_drafts`) drafts once inside `variants::draft(&[], ..)`, which
+  returns the points the draft asked, then redrafts with each asked point flipped (at most
+  `MAX_VARIANT_POINTS`, one flip at a time), keeping distinct sources (`DraftReply::variants`
+  from the draft server). `eval` / `match` / `harvest` first run the default pipeline (default
+  vs plain draft, register repair); only if that is not exact are the variants compiled
+  (`search_cmds::repair_or_variant`: best variant, repaired too), and one replaces the default
+  only when strictly better, so a variant point can never cost an exact match.
+- Cost: one lift + emit per asked point, one compile per distinct variant; nothing for functions
+  whose draft asks no point. `MWDEC_NO_VARIANTS=1` turns variants off (ablations).
+- Points so far: `structcopy.setters` (member stores into a local from one object's members
+  become `v = o`), `structcopy.return_whole` (a returned object filled from one object behind
+  flag checks and early returns, e.g. an `optional_object` copy, becomes `return x;`),
+  `structcopy.no_temp`, `structcopy.no_return` (keep the member-wise forms `structcopy` would
+  rewrite). The older fixed alternatives (folded inlines vs plain, raw offsets, `const`
+  static-initializer globals, instantiation drafts) are separate candidates of the same choice.
+
+### Cheap no-loss check (`eval --drafts-only`, `tools/drafts_diff.py`)
+
+A full train eval takes hours under load, but a change to lift/emit only matters where it
+changes a draft. `mwdec eval --drafts-only` drafts without compiling (the draft server's lift +
+inline folding + emit) and gives every row a `draft_hash` over all draft texts the compile stage
+would see (default, plain, raw, alternatives, variants; deterministic).
+`python -I tools/drafts_diff.py --base <old mwdec.exe> --new <new mwdec.exe> [--list rows.jsonl]
+[--shards 2] [--out dir]` drafts every train <=128 B function (or the list) with both binaries,
+sharded by unit, evaluates only the functions whose hash differs with both binaries
+(`--budget-secs 0`) and prints gained/lost (exit 1 if anything was lost). `--base-env K=V` /
+`--new-env K=V` compare one binary with a feature switched off (`MWDEC_NO_VARIANTS=1`,
+`MWDEC_NO_STRUCTCOPY=1`, ...). Changes after drafting (register repair, choice among drafts,
+the search) are not visible in the hash: check those on the set of functions they act on.
+
 ## Caches
 
 Disk caches are content-addressed (inputs, flags, compiler and a version salt in the key) and

@@ -12,7 +12,9 @@
 //!   `...data.0`, `fn_...`, `init$12`, bare sections) the referenced **bytes** must be equal
 //!   (string pools: the NUL-terminated string at symbol+addend), in the same section, with
 //!   equivalent relocations inside the referenced data (jump tables, pointer tables); bss
-//!   targets only need the same section; unnamed code targets compare by masked code;
+//!   targets only need the same section; unnamed code targets compare by masked code, except a
+//!   target placeholder (`fn_<addr>`) against one of our named functions, which needs a proof by
+//!   bytes ([`crate::placeholder`]);
 //! - the mapping between target and our generated targets is one-to-one within the function
 //!   (two different target literals can't both be one of ours, and vice versa).
 //!
@@ -155,6 +157,8 @@ pub struct ObjIndex<'a> {
     funcs_by_sec: HashMap<&'a str, Vec<&'a SymbolDef>>,
     functions: HashMap<&'a str, &'a Function>,
     externs: Option<&'a ExternIndex>,
+    /// Our side only: compiles definitions of functions a target placeholder may be.
+    prover: Option<&'a dyn crate::placeholder::PlaceholderProver>,
 }
 
 type Loc<'a> = (&'a Section, u32, u32, Option<&'a SymbolDef>);
@@ -174,7 +178,14 @@ impl<'a> ObjIndex<'a> {
         }
         let sections = obj.sections.iter().map(|s| (s.name.as_str(), s)).collect();
         let functions = obj.functions.iter().map(|f| (f.name.as_str(), f)).collect();
-        ObjIndex { obj, by_name, sections, funcs_by_sec, functions, externs: None }
+        ObjIndex { obj, by_name, sections, funcs_by_sec, functions, externs: None, prover: None }
+    }
+
+    /// Resolve target placeholders against our named functions through `p` (see
+    /// [`crate::placeholder`]).
+    pub fn with_prover(mut self, p: Option<&'a dyn crate::placeholder::PlaceholderProver>) -> Self {
+        self.prover = p;
+        self
     }
 
     /// Like [`ObjIndex::new`], resolving symbols undefined here through `externs`.
@@ -436,6 +447,14 @@ fn targets_equiv(t: &ObjIndex, tn: &str, ta: i64, o: &ObjIndex, on: &str, oa: i6
             if strip_dtk_suffix(&a.name) == strip_dtk_suffix(&b.name) {
                 return TEq::Same;
             }
+            // a target placeholder vs one of our named functions: proven by compiling ours
+            if crate::placeholder::is_placeholder(strip_dtk_suffix(&a.name)) && !is_generated_name(&b.name) {
+                return if prove_placeholder(t, a, o, Some(b), &b.name) {
+                    TEq::Same
+                } else {
+                    TEq::Diff(DiffClass::TargetName, format!("placeholder not proven: {}", desc()))
+                };
+            }
             if is_generated_name(&a.name) || is_generated_name(&b.name) {
                 let same = a.code.len() == b.code.len()
                     && masked_words(a) == masked_words(b)
@@ -448,6 +467,13 @@ fn targets_equiv(t: &ObjIndex, tn: &str, ta: i64, o: &ObjIndex, on: &str, oa: i6
                 };
             }
             return TEq::Diff(DiffClass::TargetName, format!("code {}", desc()));
+        }
+        (Some((a, 0)), None) if oa == 0 && crate::placeholder::is_placeholder(strip_dtk_suffix(&a.name)) && !is_generated_name(on) && o.prover.is_some() => {
+            return if prove_placeholder(t, a, o, None, on) {
+                TEq::Same
+            } else {
+                TEq::Diff(DiffClass::TargetName, format!("placeholder not proven: {}", desc()))
+            };
         }
         (Some(_), None) | (None, Some(_)) if generated && strip_dtk_suffix(tn) != strip_dtk_suffix(on) => {
             return TEq::Diff(
@@ -542,6 +568,55 @@ fn targets_equiv(t: &ObjIndex, tn: &str, ta: i64, o: &ObjIndex, on: &str, oa: i6
         }
     }
     TEq::Same
+}
+
+/// Is the target placeholder function `tf` our function `symbol`? Ours is `local` (defined in our
+/// object) or compiled by the prover; the two must compare exact with the strict comparator.
+fn prove_placeholder(t: &ObjIndex, tf: &Function, o: &ObjIndex, local: Option<&Function>, symbol: &str) -> bool {
+    if !crate::placeholder::enabled() {
+        return false;
+    }
+    let key = (strip_dtk_suffix(&tf.name).to_string(), symbol.to_string());
+    if let Some(p) = o.prover {
+        if let Some(v) = crate::placeholder::remembered(p, &key) {
+            return v;
+        }
+    }
+    let verdict = match local {
+        Some(of) => crate::placeholder::nested(|| {
+            let d = compare_indexed(t, tf, o, of);
+            if std::env::var("MWDEC_PLACEHOLDER_DEBUG").is_ok() {
+                eprintln!("placeholder {} vs local {symbol}: {:?}", tf.name, d.result.notes);
+            }
+            d.result.exact
+        })
+        .unwrap_or(false),
+        None => {
+            let Some(p) = o.prover else { return false };
+            let Some(obj) = p.definition(symbol) else {
+                if std::env::var("MWDEC_PLACEHOLDER_DEBUG").is_ok() {
+                    eprintln!("placeholder {} vs {symbol}: no definition", tf.name);
+                }
+                crate::placeholder::remember(p, key, false);
+                return false;
+            };
+            let Some(of) = obj.functions.iter().find(|f| f.name == symbol) else { return false };
+            let mut oi = ObjIndex::new(&obj).with_prover(Some(p));
+            oi.externs = o.externs;
+            crate::placeholder::nested(|| {
+                let d = compare_indexed(t, tf, &oi, of);
+                if std::env::var("MWDEC_PLACEHOLDER_DEBUG").is_ok() {
+                    eprintln!("placeholder {} vs {symbol}: {:?}", tf.name, d.result.notes);
+                }
+                d.result.exact
+            })
+            .unwrap_or(false)
+        }
+    };
+    if let Some(p) = o.prover {
+        crate::placeholder::remember(p, key, verdict);
+    }
+    verdict
 }
 
 /// Longest common subsequence length (two-row DP; positional fallback for huge inputs).

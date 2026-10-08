@@ -219,6 +219,15 @@ fn pairs_in(b: &[Stmt], vars: &[Var], db: &TypeDb, defs: &HashMap<VarId, Expr>) 
                     let Expr::Var(l) = src else { continue };
                     whole_object(&defs[l], &t, vars, db).unwrap()
                 }
+                // one word read from another object of exactly the argument's size (`CColor` as a
+                // `GXColor`): that object reinterpreted (`*(const GXColor*)&color`)
+                None if reinterpreted(src, tsize, vars, db).is_some() => reinterpreted(src, tsize, vars, db).map(|base| Expr::Member { base: Box::new(base), offset: 0, ty: t.clone() }).unwrap(),
+                // ... the same through a register holding that read
+                None if matches!(src, Expr::Var(l) if defs.get(l).and_then(|d| reinterpreted(d, tsize, vars, db)).is_some()) => {
+                    let Expr::Var(l) = src else { continue };
+                    let base = reinterpreted(&defs[l], tsize, vars, db).unwrap();
+                    Expr::Member { base: Box::new(base), offset: 0, ty: t.clone() }
+                }
                 // a scalar stack local holding the object's only member (checked in `forward`)
                 None => match src {
                     Expr::Var(l) if matches!(vars[*l].kind, VarKind::Stack { .. } | VarKind::Local) && scalar_size(&vars[*l].ty) == Some(tsize) && *l != sv => src.clone(),
@@ -229,6 +238,57 @@ fn pairs_in(b: &[Stmt], vars: &[Var], db: &TypeDb, defs: &HashMap<VarId, Expr>) 
         out.push((i, j, sv, l));
     }
     out
+}
+
+/// `src` reads all `size` bytes of a stable object at offset 0 (a member load covering an
+/// object of the same size): that object.
+fn reinterpreted(src: &Expr, size: u32, vars: &[Var], db: &TypeDb) -> Option<Expr> {
+    let Expr::Member { base, offset: 0, ty } = src else { return None };
+    if scalar_size(ty) != Some(size) || !stable(base, vars) {
+        return None;
+    }
+    let obj = types::ty_of(base, vars);
+    let obj = match strip_cv(&obj) {
+        Type::Ref(x) | Type::Ptr(x) => strip_cv(x).clone(),
+        t => t.clone(),
+    };
+    (named(&obj).is_some() && types::size_of(Some(db), &obj) == Some(size)).then(|| (**base).clone())
+}
+
+/// Does `a` read the same memory as `b` (the same base and offset; the access type aside)?
+fn same_place(a: &Expr, b: &Expr) -> bool {
+    match (strip_casts(a), strip_casts(b)) {
+        (Expr::Member { base: x, offset: o, .. }, Expr::Member { base: y, offset: p, .. }) | (Expr::Load { base: x, offset: o, .. }, Expr::Load { base: y, offset: p, .. }) => {
+            o == p && x == y
+        }
+        (x, y) => x == y,
+    }
+}
+
+/// By-value class arguments copied twice: a frame store nothing reads holds the argument's
+/// value (an object copied once more before the argument copy, as an inline accessor returning
+/// the class by value does). An explicit copy, `f(T(x))`, makes that temporary again.
+/// Consumed dead stores are removed from `dead`.
+pub fn copy_temporaries(body: &mut Vec<Stmt>, dead: &mut Vec<DeadStackStore>, db: &TypeDb) {
+    if dead.is_empty() {
+        return;
+    }
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Call { callee, args, .. } = e else { return };
+        let Some(sig) = call_params(callee).cloned() else { return };
+        for (n, a) in args.iter_mut().enumerate() {
+            let Some(p) = sig.params.get(n) else { continue };
+            if !is_byval(db, &p.ty) || !a.is_lvalue() {
+                continue;
+            }
+            let t = strip_cv(&p.ty).clone();
+            let size = types::size_of(Some(db), &t).unwrap_or(0);
+            if let Some(k) = dead.iter().position(|d| d.size == size && same_place(&d.value, a)) {
+                dead.remove(k);
+                *a = Expr::Construct { class: t, ctor: None, args: vec![a.clone()] };
+            }
+        }
+    });
 }
 
 /// Forward by-value argument copies through stack temporaries.
