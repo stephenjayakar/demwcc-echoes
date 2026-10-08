@@ -27,6 +27,30 @@ struct G {
     dtor_class: Option<String>,
 }
 
+fn each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
+    for s in body {
+        f(s);
+        match s {
+            Stmt::If { then, els, .. } => {
+                each_stmt(then, f);
+                each_stmt(els, f);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => each_stmt(body, f),
+            Stmt::For { init, step, body, .. } => {
+                each_stmt(init, f);
+                each_stmt(step, f);
+                each_stmt(body, f);
+            }
+            Stmt::Switch { cases, .. } => {
+                for c in cases {
+                    each_stmt(&c.body, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn strip_casts(e: &Expr) -> &Expr {
     match e {
         Expr::Cast { e, .. } => strip_casts(e),
@@ -64,6 +88,9 @@ impl<'a> Em<'a> {
             return None;
         }
         let db = self.db?;
+        if let Some(d) = self.sinit_string_object() {
+            return Some(d);
+        }
         // single-definition register locals are inlined into the values
         let mut defs: HashMap<VarId, Expr> = HashMap::new();
         let mut ndefs: HashMap<VarId, usize> = HashMap::new();
@@ -323,6 +350,152 @@ impl<'a> Em<'a> {
         out
     }
 
+    /// One registered object built from a string literal by an inlined constructor that measures
+    /// it (a loop): `T g("literal");` with `T`'s constructor from a character pointer.
+    fn sinit_string_object(&mut self) -> Option<String> {
+        let db = self.db?;
+        let ir = self.ir;
+        let mut has_loop = false;
+        let mut regs: Vec<(String, String)> = vec![];
+        let mut strs: Vec<Vec<u8>> = vec![];
+        fn func_addr(e: &Expr) -> Option<&str> {
+            match e {
+                Expr::FuncAddr { symbol } => Some(symbol),
+                Expr::Cast { e, .. } => func_addr(e),
+                _ => None,
+            }
+        }
+        each_stmt(&ir.body, &mut |s| {
+            if matches!(s, Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. }) {
+                has_loop = true;
+            }
+            if let Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }) = s {
+                if symbol == "__register_global_object" {
+                    if let (Some((g, _, 0)), Some(d)) = (args.first().and_then(global_ptr), args.get(1).and_then(func_addr)) {
+                        regs.push((g, d.to_string()));
+                    }
+                }
+            }
+        });
+        Stmt::walk_exprs(&ir.body, &mut |x| {
+            if let Expr::Str { bytes } = x {
+                if !strs.contains(bytes) {
+                    strs.push(bytes.clone());
+                }
+            }
+        });
+        let ([(g, dtor)], [lit], true) = (regs.as_slice(), strs.as_slice(), has_loop) else { return None };
+        let cls = sig::sig_of(dtor, Some(db)).this_class?;
+        let base = strip_template_args(&cls);
+        let last = sig::split_scope(&base).1.to_string();
+        let char_ptr = |t: &Type| matches!(strip_cv(t), Type::Ptr(x) if matches!(strip_cv(x), Type::Char | Type::Int { size: 1, .. } | Type::WChar | Type::Int { size: 2, .. }) || matches!(strip_cv(x), Type::Named(n) if n.contains("CharTp") || n == "T"));
+        // the constructor was inlined (the loop is its own): an inline one taking the pointer,
+        // other parameters being tag objects (`basic_string(literal_t, const char*)`)
+        let d = db.decls.get(&format!("{base}::{last}"))?.iter().find(|d| d.is_inline_defined && d.params.iter().filter(|p| char_ptr(&p.ty)).count() == 1)?;
+        let mut args = vec![];
+        for p in &d.params {
+            if char_ptr(&p.ty) {
+                args.push(float::c_string(lit));
+                continue;
+            }
+            let Type::Named(tag) = strip_cv(&p.ty) else { return None };
+            let tag = strip_template_args(tag);
+            let q = if tag.contains("::") { tag.clone() } else { format!("{}::{tag}", types::split_closers(&cls)) };
+            let tc = sig::find_class(db, &q).or_else(|| sig::find_class(db, &tag))?;
+            if !tc.fields.is_empty() {
+                return None;
+            }
+            args.push(format!("{q}()"));
+        }
+        let (name, t) = match db.globals.get(g) {
+            Some((qn, t)) => (strip_unnamed_ns(qn), t.clone()),
+            None => (symbol_name(g), Type::Named(cls.clone())),
+        };
+        let konst = if self.opts.sinit_const && !db.globals.contains_key(g) { "const " } else { "" };
+        let d = format!("{konst}{}({});", decl(&t, &name), args.join(", "));
+        Some(if g.contains("@unnamed@") { format!("namespace {{ {d} }}
+") } else { format!("{d}
+") })
+    }
+
+    /// A static member function returning the static member `symbol` (`static const T& X() {
+    /// return sX; }`): (`Class::X`, T).
+    fn static_accessor(&self, symbol: &str) -> Option<(String, Type)> {
+        let db = self.db?;
+        let (qn, ty) = db.globals.get(symbol).cloned().or_else(|| {
+            let s = sig::demangle(symbol)?;
+            Some((s, Type::Unknown { size: 0 }))
+        })?;
+        let (cls, field) = sig::split_scope(&qn);
+        let cls = cls?.to_string();
+        let body = format!("return {field} ;");
+        let prefix = format!("{}::", strip_template_args(&cls));
+        for (k, ds) in db.decls.range(prefix.clone()..) {
+            let Some(m) = k.strip_prefix(&prefix) else { break };
+            if m.contains("::") {
+                continue;
+            }
+            if let Some(d) = ds.iter().find(|d| d.is_static && d.params.is_empty() && d.inline_body.as_deref() == Some(body.as_str())) {
+                let pt = match strip_cv(&d.ret) {
+                    Type::Ref(x) => strip_cv(x).clone(),
+                    _ => continue,
+                };
+                let _ = &ty;
+                return Some((format!("{cls}::{m}"), pt));
+            }
+        }
+        None
+    }
+
+    /// `class D : public B { public: virtual ~D(); <B's pure virtuals, declared>; };` for an object
+    /// of the undeclared class `dc` whose stores are only vtable pointers (B's, then D's).
+    fn vtable_stand_in(&mut self, dc: &str, fs: &[(i32, Type, Expr)]) -> Option<()> {
+        let db = self.db?;
+        let mut base: Option<String> = None;
+        for (off, _, v) in fs {
+            let mut vt = None;
+            v.walk(&mut |x| {
+                if let Expr::Global { symbol, .. } = x {
+                    if let Some(c) = symbol.strip_prefix("__vt__") {
+                        vt = Some(c.to_string());
+                    }
+                }
+            });
+            let vt = vt?;
+            if *off != 0 {
+                return None;
+            }
+            // `__vt__15IWeaponRenderer` -> `IWeaponRenderer` (a plain class name)
+            let digits: String = vt.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let cls = vt[digits.len()..].to_string();
+            if digits.parse::<usize>().ok() != Some(cls.len()) {
+                return None;
+            }
+            if cls != dc && base.is_none() {
+                base = Some(cls);
+            }
+        }
+        let base = base?;
+        sig::find_class(db, &base)?;
+        let mut members = vec![format!("virtual ~{dc}();")];
+        for (k, ds) in db.decls.range(format!("{base}::")..) {
+            let Some(m) = k.strip_prefix(&format!("{base}::")) else { break };
+            if m.contains("::") || m.starts_with('~') {
+                continue;
+            }
+            for d in ds.iter().filter(|d| d.is_pure) {
+                let ps: Vec<String> = d.params.iter().map(|p| type_str(&p.ty)).collect();
+                members.push(format!("virtual {} {m}({}){};", type_str(&d.ret), ps.join(", "), if d.is_const { " const" } else { "" }));
+            }
+        }
+        self.type_defs.push(format!("class {dc} : public {base} {{
+public:
+    {}
+}};", members.join("
+    ")));
+        Some(())
+    }
+
     fn sinit_def(&mut self, g: &G, k: usize) -> Option<String> {
         let db = self.db?;
         let declared = db.globals.get(&g.symbol).cloned().or_else(|| g.dtor_class.as_ref().map(|c| (symbol_name(&g.symbol), Type::Named(c.clone()))));
@@ -331,6 +504,13 @@ impl<'a> Em<'a> {
             None => symbol_name(&g.symbol),
         };
         let wrap = |d: String| if g.symbol.contains("@unnamed@") { format!("namespace {{ {d} }}") } else { d };
+        // an object of a class the context doesn't have (defined in the unit), whose inlined
+        // constructor only stores vtable pointers: a stand-in derived from the first vtable's class
+        if let (Some(dc), Init::Fields(fs)) = (&g.dtor_class, &g.init) {
+            if sig::find_class(db, dc).is_none() && !dc.contains("::") && !dc.contains('<') {
+                return self.vtable_stand_in(dc, fs).map(|()| wrap(format!("{dc} {name};")));
+            }
+        }
         // one store of a whole scalar global
         let whole_scalar = match (&g.init, &declared) {
             (Init::Fields(fs), Some((_, t))) if fs.len() == 1 && fs[0].0 == 0 && !mwdec_lift::types::is_aggregate(Some(db), t) => Some(Init::Value(fs[0].2.clone())),
@@ -376,6 +556,15 @@ impl<'a> Em<'a> {
                 if matches!(t, Type::Unknown { .. } | Type::Void) {
                     return None;
                 }
+                // the address of a static object is a constant (no initializer code): stored
+                // here, it came through a function, e.g. the class's static accessor
+                if let Expr::AddrOf(x) = strip_casts(v) {
+                    if let Expr::Global { symbol, .. } = &**x {
+                        if let Some((acc, pt)) = self.static_accessor(symbol) {
+                            return Some(wrap(format!("{} = &{acc}();", decl(&Type::Ptr(Box::new(Type::Const(Box::new(pt)))), &name))));
+                        }
+                    }
+                }
                 let val = self.expr(v, 0);
                 Some(wrap(format!("{} = {val};", decl(&t, &name))))
             }
@@ -389,9 +578,41 @@ impl<'a> Em<'a> {
                     let a = self.args(&vals, Some(&cs));
                     return Some(wrap(format!("{}({a});", decl(t, &name))));
                 }
-                // a default constructor (setting the members itself)
                 let base = strip_template_args(&cls);
                 let last = sig::split_scope(&base).1.to_string();
+                // (alternative drafts) the k-th constructor taking one scalar per stored member,
+                // the stored values in member order (`CColor c(0xffffff7f)` whose inline body
+                // sets the members itself)
+                if self.opts.sinit_variant > 0 {
+                    let mut fs: Vec<&(i32, Type, Expr)> = fs.iter().collect();
+                    fs.sort_by_key(|f| f.0);
+                    let scalar = |t: &Type| {
+                        let r = mwdec_lift::types::resolve(Some(db), strip_cv(t)).into_owned();
+                        !matches!(r, Type::Ref(_) | Type::Ptr(_)) && !mwdec_lift::types::is_aggregate(Some(db), &r)
+                    };
+                    let ctors: Vec<&mwdec_core::DeclInfo> = db
+                        .decls
+                        .get(&format!("{base}::{last}"))
+                        .map(|v| v.iter().filter(|d| d.params.len() == fs.len() && d.template_params.is_empty() && d.access == mwdec_core::Access::Public && d.params.iter().all(|p| scalar(&p.ty))).collect())
+                        .unwrap_or_default();
+                    if let Some(d) = ctors.get(self.opts.sinit_variant as usize - 1) {
+                    let cs = mwdec_core::FuncSig {
+                        qualified_name: format!("{base}::{last}"),
+                        mangled: None,
+                        ret: Type::Void,
+                        params: d.params.iter().map(|p| mwdec_core::Param { name: p.name.clone(), ty: p.ty.clone() }).collect(),
+                        this_class: Some(cls.clone()),
+                        is_const: false,
+                        is_static: false,
+                        is_virtual: false,
+                        variadic: false,
+                    };
+                    let vals: Vec<Expr> = fs.iter().map(|f| f.2.clone()).collect();
+                    let a = self.args(&vals, Some(&cs));
+                    return Some(wrap(format!("{}({a});", decl(t, &name))));
+                    }
+                }
+                // a default constructor (setting the members itself)
                 if db.decls.get(&format!("{base}::{last}")).is_some_and(|ds| ds.iter().any(|d| d.params.is_empty())) {
                     return Some(wrap(format!("{};", decl(t, &name))));
                 }

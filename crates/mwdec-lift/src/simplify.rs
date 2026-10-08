@@ -75,7 +75,39 @@ fn bool_idiom(e: &Expr) -> Option<Expr> {
     }
 }
 
+/// A value zero-extended from fewer than 32 bits (unsigned char/short, bool): the difference of
+/// two such values is negative exactly when the first is smaller.
+fn narrow_unsigned(e: &Expr, vars: &[Var]) -> bool {
+    let t = match e {
+        Expr::Load { ty, .. } | Expr::Member { ty, .. } => ty,
+        Expr::Var(v) => &vars[*v].ty,
+        Expr::Cast { e, .. } => return narrow_unsigned(e, vars),
+        _ => return false,
+    };
+    matches!(strip_cv(t).int_info(), Some((s, false)) if s < 4)
+}
+
+/// `(u32)(a - b) >> 31` with `a`, `b` narrow unsigned values == `a < b` (MWCC's value-context
+/// compare of bytes/halfwords: `subf ; srwi 31`).
+fn narrow_lt_idiom(e: &Expr, vars: &[Var]) -> Option<Expr> {
+    let Expr::Binary { op: BinOp::Shr, l, r, .. } = e else { return None };
+    if r.as_int() != Some(31) {
+        return None;
+    }
+    let Expr::Cast { ty, e: d } = &**l else { return None };
+    if strip_cv(ty).int_info() != Some((4, false)) {
+        return None;
+    }
+    match &**d {
+        Expr::Binary { op: BinOp::Sub, l: a, r: b, .. } if narrow_unsigned(a, vars) && narrow_unsigned(b, vars) => Some(Expr::cmp(BinOp::Lt, (**a).clone(), (**b).clone())),
+        _ => None,
+    }
+}
+
 fn simp(e: &mut Expr, vars: &[Var]) {
+    if let Some(n) = narrow_lt_idiom(e, vars) {
+        *e = n;
+    }
     if let Some(n) = bool_idiom(e) {
         *e = n;
         return;
@@ -120,7 +152,16 @@ fn simp(e: &mut Expr, vars: &[Var]) {
         if r.as_int() == Some(1) {
             if let Expr::Binary { op: BinOp::Shr, l: a, r: s, .. } = uncast(l) {
                 if s.as_int() == Some(31) {
-                    *e = Expr::cmp(BinOp::Ge, Expr::cast(t_s32(), uncast(a).clone()), Expr::int(0));
+                    // word-size casts go, a sign extension (`(signed char)x`, `extsb`) stays
+                    let mut x: &Expr = a;
+                    while let Expr::Cast { ty, e: inner } = x {
+                        if matches!(strip_cv(ty), Type::Int { size: 4, .. } | Type::Long { .. } | Type::Unknown { size: 4 }) {
+                            x = inner;
+                        } else {
+                            break;
+                        }
+                    }
+                    *e = Expr::cmp(BinOp::Ge, Expr::cast(t_s32(), x.clone()), Expr::int(0));
                     return;
                 }
             }

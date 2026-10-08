@@ -34,11 +34,14 @@ pub struct EmitOptions {
     /// Static initializers: define the globals the context doesn't declare `const` (a const
     /// object's initialization is scheduled differently).
     pub sinit_const: bool,
+    /// Static initializers: alternative k (1-based) for objects whose stores match no
+    /// constructor initializer list: the k-th constructor taking one scalar per stored member.
+    pub sinit_variant: u8,
 }
 
 impl Default for EmitOptions {
     fn default() -> Self {
-        EmitOptions { indent: "    ".into(), raw_offsets: false, warnings_comment: true, null: "nullptr".into(), c_mode: false, sinit_const: false }
+        EmitOptions { indent: "    ".into(), raw_offsets: false, warnings_comment: true, null: "nullptr".into(), c_mode: false, sinit_const: false, sinit_variant: 0 }
     }
 }
 
@@ -100,7 +103,8 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
         let body = fixed.body.clone();
         mwdec_lift::idioms::untype_undeclarable(&body, &mut fixed.vars, db);
         let forwarded = mwdec_lift::postinline::forward_inline_args(&mut fixed.body, &fixed.vars);
-        if fixed.vars != ir.vars || forwarded > 0 {
+        let copies = mwdec_lift::structcopy::apply(&mut fixed.body, &fixed.vars, db);
+        if fixed.vars != ir.vars || forwarded > 0 || copies > 0 {
             &fixed
         } else {
             ir
@@ -153,7 +157,9 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
     }
     let mut em = new_em();
     em.function();
-    let preamble = em.type_defs.iter().cloned().chain(em.externs.iter().cloned()).chain(em.fn_decls.values().map(|(_, d)| d.clone())).chain(string_pool_decl(ir)).collect::<Vec<_>>().join("\n");
+    em.standin_ret_def();
+    let preamble = em.type_defs.iter().cloned().chain(em.externs.iter().cloned()).chain(em.fn_decls.values().map(|(_, d)| d.clone())).chain(string_pool_decl(ir)).collect::<Vec<_>>().join("
+");
     Emitted { preamble: if preamble.is_empty() { preamble } else { preamble + "\n" }, body: em.out }
 }
 
@@ -974,6 +980,25 @@ impl<'a> Em<'a> {
     }
 
     /// `struct Last [: public Base] { nested...; methods...; pad };`
+    /// The stand-in class of a guessed struct return (`mwdec_lift::idioms::standin_sret`): one
+    /// member per constructor parameter, a constructor storing them.
+    fn standin_ret_def(&mut self) {
+        let Some(n) = named(&self.ir.sig.ret).filter(|n| n.starts_with(mwdec_lift::idioms::STANDIN_RET)).map(|n| n.to_string()) else { return };
+        let mut sig = None;
+        Stmt::walk_exprs(&self.ir.body, &mut |e| {
+            if let Expr::Construct { class, ctor: Some(c), .. } = e {
+                if named(class) == Some(n.as_str()) && sig.is_none() {
+                    sig = Some(c.clone());
+                }
+            }
+        });
+        let Some(sig) = sig else { return };
+        let members: Vec<String> = sig.params.iter().enumerate().map(|(i, p)| format!("{};", decl(&p.ty, &format!("m{i}")))).collect();
+        let params: Vec<String> = sig.params.iter().enumerate().map(|(i, p)| decl(&p.ty, &format!("a{i}"))).collect();
+        let inits: Vec<String> = (0..sig.params.len()).map(|i| format!("m{i}(a{i})")).collect();
+        self.type_defs.push(format!("struct {n} {{ {} {n}({}) : {} {{}} }};", members.join(" "), params.join(", "), inits.join(", ")));
+    }
+
     fn render_synth(&self, n: &str, all: &[String]) -> String {
         let last = sig::split_scope(n).1;
         let s = self.synth.get(n).cloned().unwrap_or_default();
@@ -1065,6 +1090,30 @@ impl<'a> Em<'a> {
             self.stmt(&stmts[i], depth);
             i += 1;
         }
+    }
+
+    /// `if (p) p->T(args);` with `p` not a frame object: the expansion of `new (p) T(args)`.
+    /// Returns the object pointer, the arguments and the constructor.
+    fn placement_new<'s>(&self, cond: &Expr, s: &'s Stmt) -> Option<(&'s Expr, &'s [Expr], &'s mwdec_core::FuncSig)> {
+        let Stmt::Expr(Expr::Call { callee: Callee::Method { sig: sg, this, .. }, args, .. }) = s else { return None };
+        if !sig::is_ctor(sg) || sg.this_class.is_none() {
+            return None;
+        }
+        let tested = match cond {
+            Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) => &**l,
+            e => e,
+        };
+        fn strip(mut e: &Expr) -> &Expr {
+            while let Expr::Cast { e: x, .. } = e {
+                e = x;
+            }
+            e
+        }
+        // a frame object constructed in place is a declaration, not a placement new
+        if strip(tested) != strip(this) || matches!(strip(this), Expr::AddrOf(_)) || pointee(&ty_of(this, self.vars())).is_none() {
+            return None;
+        }
+        Some((&**this, args.as_slice(), sg))
     }
 
     fn stmt(&mut self, s: &Stmt, depth: usize) {
@@ -1204,6 +1253,13 @@ impl<'a> Em<'a> {
                 self.declared.insert(*v);
                 let var = &self.ir.vars[*v];
                 let (t, name) = (var.ty.clone(), var.name.clone());
+                // a frame temporary bound to a reference (`const T& r = f();`)
+                if let (VarKind::Stack { .. }, Type::Ref(inner)) = (&var.kind, &t) {
+                    let d = decl(&t, &name);
+                    let val = self.coerce(src, strip_cv(inner));
+                    let _ = writeln!(self.out, "{ind}{d} = {val};");
+                    return;
+                }
                 let d = match &t {
                     Type::Unknown { size } if *size != 4 && *size != 2 && *size != 1 && *size != 8 => decl(&Type::Array(Box::new(Type::Int { size: 1, signed: false }), *size), &name),
                     _ => self.local_decl(*v),
@@ -1274,6 +1330,14 @@ impl<'a> Em<'a> {
                 let v = self.coerce(src, &dt);
                 self.member_store = false;
                 let _ = writeln!(self.out, "{ind}{d} = {v};");
+            }
+            // `new (p) T(args)`: placement new constructs only after testing `p` for null
+            Stmt::If { cond, then, els } if !self.opts.c_mode && els.is_empty() && then.len() == 1 && self.placement_new(cond, &then[0]).is_some() => {
+                let (this, args, sg) = self.placement_new(cond, &then[0]).unwrap();
+                let cls = type_str(&Type::Named(strip_unnamed_ns(sg.this_class.as_deref().unwrap_or_default())));
+                let p = self.expr(this, 0);
+                let a = self.args(args, Some(sg));
+                let _ = writeln!(self.out, "{ind}new ({p}) {cls}({a});");
             }
             Stmt::If { cond, then, els } => {
                 let c = self.cond(cond);
@@ -1368,6 +1432,7 @@ impl<'a> Em<'a> {
             Stmt::Label(l) => {
                 let _ = writeln!(self.out, "block_{l}:;");
             }
+            Stmt::Comment(c) if c.starts_with(mwdec_lift::idioms::INIT_MARK) => {}
             Stmt::Comment(c) => {
                 let _ = writeln!(self.out, "{ind}// {c}");
             }
@@ -2454,6 +2519,11 @@ impl<'a> Em<'a> {
                 }
             }
             return reinterpret_global(st, &t, &dt);
+        }
+        if let Some(a) = self.ir.globals.iter().find(|g| g.symbol == symbol).and_then(|g| g.abs_addr) {
+            // a variable at a fixed address (hardware registers), the project's own syntax
+            self.externs.insert(format!("{} : {a:#010X};", decl(&dt, &name)));
+            return reinterpret_global(name, &t, &dt);
         }
         if let Some((ns, n)) = self.undeclared_ns_scope(symbol) {
             let mut d = format!("extern {};", decl(&dt, &n));

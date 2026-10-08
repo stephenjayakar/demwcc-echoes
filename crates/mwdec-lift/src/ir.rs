@@ -263,6 +263,9 @@ pub struct GlobalRef {
     /// Initial bytes of an object defined in an initialized data section of the target object
     /// (without relocations), for a definition the emitter writes itself (function statics).
     pub init: Option<Vec<u8>>,
+    /// A variable the draft declares at a fixed address itself (`volatile u32 X[N] : 0xCC006400;`,
+    /// the SDK's hardware register arrays the context doesn't declare).
+    pub abs_addr: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -290,6 +293,26 @@ pub struct IrFunction {
     /// The target's string pool from its start up to the last string this function uses, when
     /// that string isn't at offset 0 (earlier functions of the unit put strings before it).
     pub string_pool: Vec<Vec<u8>>,
+    /// Frame stores nothing reads, dropped from `body` (see [`DeadStackStore`]).
+    pub dead_stores: Vec<DeadStackStore>,
+}
+
+/// A store into a frame slot that nothing reads or takes the address of, dropped from the
+/// body. MWCC leaves these behind when it inlines a function with a by-value class parameter
+/// (the argument is copied into the parameter object, the body then uses the value from a
+/// register: `void Set(TUniqueId id) { m = id; }`) or a by-value class return (`CVector3f
+/// GetTranslation() const`, its components used directly); the source has no statement for
+/// them, so the draft drops them, but their presence tells which inline the source called.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeadStackStore {
+    /// r1-relative offset and byte size of the store.
+    pub offset: i32,
+    pub size: u32,
+    /// The stored value, in the function's terms (a register temp is replaced by its
+    /// definition in the same block when it has no side effects).
+    pub value: Expr,
+    /// Index in `IrFunction::dead_stores` (frame-offset order per lifting stage).
+    pub order: usize,
 }
 
 impl IrFunction {

@@ -842,9 +842,10 @@ pub fn index(lib: &InlineLib) -> Index {
 
 pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     // members' own constructors' stores at the start of a constructor body are implicit
-    let stripped = if std::env::var("MWDI_NO_CTORS").is_ok() { 0 } else { crate::defctor::strip(ir, db, &lib.default_ctors) };
+    let (stripped, pending) = if std::env::var("MWDI_NO_CTORS").is_ok() { (0, Default::default()) } else { crate::defctor::strip(ir, db, &lib.default_ctors) };
+    let stripped = stripped + crate::defctor::copy_ctor_inits(ir, db, &lib.copy_ctors);
     if lib.templates.is_empty() {
-        return stripped;
+        return stripped + crate::defctor::finish(ir, db, &pending);
     }
     let idx = index(lib);
     let mut total = stripped + if std::env::var("MWDI_NO_CTORS").is_ok() { 0 } else { crate::ctors::strip_member_ctor_stores(ir, db) };
@@ -881,6 +882,8 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
             }
         }
     }
+    // members built explicitly, now that their values are folded calls
+    total += crate::defctor::finish(ir, db, &pending);
     if total > 0 {
         crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
         crate::post::name_shared_objects(&mut ir.body, &mut ir.vars);

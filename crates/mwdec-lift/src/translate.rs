@@ -87,6 +87,8 @@ enum Ca {
     Srawi(Expr, u8),
     /// CA from `subfc t, a, b` (= b >=u a), for the branchless `a <= b` idiom
     Subfc(Expr, Expr),
+    /// CA from `addc t, a, b` (the low-word add of a 64-bit addition)
+    Addc(Expr, Expr),
     Unknown,
 }
 
@@ -141,6 +143,9 @@ pub struct Lifter<'a> {
     pub force_sret: bool,
     /// Never guess a struct return.
     pub no_sret_guess: bool,
+    /// The unit's compiler gives every parameter a stack slot below the locals whenever the
+    /// frame has a local area (GC/1.2.5n), so local offsets tell the parameter count.
+    pub param_home_slots: bool,
     pub params: Vec<VarId>,
     pub decl_params: Vec<String>,
     entry_vals: HashMap<Reg, Expr>,
@@ -294,6 +299,7 @@ impl<'a> Lifter<'a> {
             sret_var: None,
             force_sret: false,
             no_sret_guess: false,
+            param_home_slots: false,
             params: vec![],
             decl_params: vec![],
             entry_vals: HashMap::new(),
@@ -385,7 +391,14 @@ impl<'a> Lifter<'a> {
                     self.entry_vals.insert(fpr(r), Expr::Var(v));
                 }
                 ArgLoc::GprPair(r) => {
-                    self.entry_vals.insert(gpr(r), Expr::Var(v));
+                    // high word in the first register of the pair (typed as the 64-bit integer
+                    // a typedef like `OSTime` stands for, so its halves are recognized)
+                    let rt = types::resolve(self.db, &self.vars[v].ty).into_owned();
+                    if crate::wide::is_wide(&rt) && !crate::wide::is_wide(&self.vars[v].ty) {
+                        self.vars[v].ty = rt;
+                    }
+                    self.entry_vals.insert(gpr(r), crate::wide::hi32(Expr::Var(v)));
+                    self.entry_vals.insert(gpr(r + 1), crate::wide::lo32(Expr::Var(v)));
                 }
                 ArgLoc::Stack => {
                     let val = if by_addr { Expr::AddrOf(Box::new(Expr::Var(v))) } else { Expr::Var(v) };
@@ -499,7 +512,8 @@ impl<'a> Lifter<'a> {
         // address of the pointer-to-member object in r12 (arguments: this, &pmf, r4.., f1..)
         if r.target == "__ptmf_scall" || r.target == "__ptmf_scall4" {
             let mut params = vec![ArgLoc::Gpr(3), ArgLoc::Gpr(12)];
-            if let Some(g) = (4..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q))) {
+            let set = (4..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q)));
+            if let Some(g) = set.max(self.passed_through(k).filter(|&r| r >= 4)) {
                 params.extend((4..=g).map(ArgLoc::Gpr));
             }
             if let Some(fm) = (1..=8u8).rev().find(|q| self.reg_set_for_call(k, fpr(*q))) {
@@ -585,6 +599,36 @@ impl<'a> Lifter<'a> {
             }
         }
         Some((s, lay, has_this))
+    }
+
+    /// Highest argument GPR (r3..r10) that still holds its incoming value at the first call `k`
+    /// and that the register allocator kept free for it: untouched from the function entry to the
+    /// call, while some short-lived value computed before the call took a higher volatile register
+    /// (temporaries get the lowest free one). Such a register is an argument passed through to
+    /// the call unchanged (`salHooks.malloc(len)`, `(this->*pmf)(mgr)`).
+    fn passed_through(&self, k: usize) -> Option<u8> {
+        let mut touched: HashSet<Reg> = HashSet::new();
+        let mut higher: Vec<u8> = vec![];
+        for j in 0..k {
+            if self.frame.skip.contains(&j) {
+                continue;
+            }
+            let i = &self.insns[j];
+            if i.is_call() || i.is_bctrl() {
+                return None;
+            }
+            let (d, u) = defs_uses(i);
+            for r in d.iter().chain(u.iter()) {
+                touched.insert(*r);
+            }
+            for &r in &d {
+                if (4..=11).contains(&r) && !self.reg_set_for_call(k, r) {
+                    higher.push(r as u8);
+                }
+            }
+        }
+        let top = *higher.iter().max()?;
+        (3..top.min(11)).rev().find(|&r| r <= 10 && !touched.contains(&gpr(r)) && higher.iter().any(|&d| d > r))
     }
 
     /// Was `reg` written in the same block before instruction k (after the previous call), or is it
@@ -731,6 +775,9 @@ impl<'a> Lifter<'a> {
             let mut u = vec![if i.is_blrl() { LR } else { CTR }];
             if self.reg_written_in_block(k, gpr(3)) {
                 u.push(gpr(3));
+            }
+            if let Some(m) = self.passed_through(k) {
+                u.extend((3..=m).map(gpr).filter(|r| !g.contains(r)));
             }
             u.extend(g);
             u.extend(f);
@@ -1248,6 +1295,10 @@ impl<'a> Lifter<'a> {
         let mut psq: HashSet<i32> = HashSet::new();
         // addresses passed in r3 (a struct return) to calls whose signature is not known yet
         let mut indirect: HashSet<i32> = HashSet::new();
+        // addresses receiving a struct return (always an object of their own)
+        let mut sret_addr: HashSet<i32> = HashSet::new();
+        // addresses that are the receiver of a method call
+        let mut receiver_addr: HashSet<i32> = HashSet::new();
         for (k, i) in self.insns.iter().enumerate() {
             if self.frame.skip.contains(&k) {
                 continue;
@@ -1275,8 +1326,14 @@ impl<'a> Lifter<'a> {
                     if let Some(sz) = self.addr_object_size(k, i.rd()) {
                         let e = obj_size.entry(i.simm() as i32).or_insert(0);
                         *e = (*e).max(sz);
+                        if self.addr_is_sret(k, i.rd()) {
+                            sret_addr.insert(i.simm() as i32);
+                        }
                     } else if i.rd() == 3 && self.addr_to_indirect_call(k, i.rd()) {
                         indirect.insert(i.simm() as i32);
+                    }
+                    if self.addr_is_receiver(k, i.rd()) {
+                        receiver_addr.insert(i.simm() as i32);
                     }
                     continue;
                 }
@@ -1307,6 +1364,20 @@ impl<'a> Lifter<'a> {
         }
         addr.sort();
         addr.dedup();
+        // addresses inside a class object whose address is taken too (a member passed by
+        // reference) are parts of that object, not objects of their own: unless they are
+        // themselves objects reaching past its end, struct returns, or method receivers (an
+        // inlined member destructor of a temporary stays apart so the temporary can fold)
+        let mut starts: Vec<i32> = vec![];
+        let mut covered_to = i32::MIN;
+        for &o in &addr {
+            if o < covered_to && !sret_addr.contains(&o) && !receiver_addr.contains(&o) && obj_size.get(&o).map_or(true, |&sz| o + sz as i32 <= covered_to) {
+                continue;
+            }
+            starts.push(o);
+            covered_to = covered_to.max(obj_size.get(&o).map_or(i32::MIN, |&sz| o + sz as i32));
+        }
+        let addr = starts;
         let top = self.frame.saves_lo.min(self.frame.info.size as i32);
         let mut regions = vec![];
         for (n, &o) in addr.iter().enumerate() {
@@ -1405,6 +1476,43 @@ impl<'a> Lifter<'a> {
             return None;
         }
         Some((lo8 - 4, hi8))
+    }
+
+    /// Whether the address `addi rd, r1, X` at instruction `k` is the struct-return pointer of
+    /// the next call.
+    fn addr_is_sret(&self, k: usize, rd: u8) -> bool {
+        self.addr_call_role(k, rd, |lay| lay.sret == Some(rd))
+    }
+
+    /// Whether the address `addi rd, r1, X` at instruction `k` is the receiver (`this`) of the
+    /// next call.
+    fn addr_is_receiver(&self, k: usize, rd: u8) -> bool {
+        self.addr_call_role(k, rd, |lay| lay.this == Some(rd))
+    }
+
+    fn addr_call_role(&self, k: usize, rd: u8, role: impl Fn(&Layout) -> bool) -> bool {
+        let mut b = self.cfg.block_of[k];
+        let mut from = k + 1;
+        // through a null test of the address (`addic. rd, r1, X; beq`) into its fall-through
+        for _ in 0..2 {
+            for j in from..self.cfg.blocks[b].end {
+                let i = &self.insns[j];
+                if i.is_call() || (i.is_jump() && i.reloc.is_some()) {
+                    return self.call_layouts.get(&j).map_or(false, |(_, lay, _)| role(lay));
+                }
+                if i.is_bctrl() || defs_uses(i).0.contains(&gpr(rd)) {
+                    return false;
+                }
+            }
+            match self.cfg.blocks[b].term {
+                Term::Cond { fall, .. } => {
+                    b = fall;
+                    from = self.cfg.blocks[b].start;
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Whether the address `addi rd, r1, X` at instruction `k` is passed to an indirect
@@ -1523,6 +1631,7 @@ impl<'a> Lifter<'a> {
                 section: d.map(|d| d.section.clone()),
                 local_def,
                 init,
+                abs_addr: None,
             },
         );
     }
@@ -1643,7 +1752,8 @@ impl<'a> Lifter<'a> {
             // an extern only ever addressed absolutely (`@ha`/`@l`), never small-data relative:
             // the compiler only does that for an object larger than the small-data limit, so a
             // scalar declaration would turn its accesses into SDA ones
-            None if self.far_only(sym) => t_unk(FAR_EXTERN_SIZE),
+            // (static initializers define their objects from the constructor calls instead)
+            None if self.far_only(sym) && !self.f.name.starts_with("__sinit_") => t_unk(FAR_EXTERN_SIZE),
             None => t_unk(0),
         }
     }
@@ -1773,7 +1883,8 @@ impl<'a> Lifter<'a> {
         }
         match self.vars[v].kind {
             VarKind::This | VarKind::StructRet | VarKind::Hidden => false,
-            VarKind::Param { .. } => self.web_var.values().any(|&w| w == v),
+            // (a reference parameter's object is reassigned by stores through it)
+            VarKind::Param { .. } => self.web_var.values().any(|&w| w == v) || self.entry_vals.values().any(|e| matches!(e, Expr::AddrOf(x) if matches!(**x, Expr::Var(w) if w == v))),
             _ => true,
         }
     }
@@ -1965,6 +2076,30 @@ impl<'a> Lifter<'a> {
 
     /// C functions whose prototype the context doesn't have: parameters are the argument
     /// registers read before being written.
+    /// Lowest r1 offset of a local stack object (an address taken or a slot accessed), outside
+    /// the linkage area and the register save area.
+    fn lowest_local_offset(&self) -> Option<i32> {
+        if self.frame.info.size == 0 {
+            return None;
+        }
+        let mut lo: Option<i32> = None;
+        for (k, i) in self.insns.iter().enumerate() {
+            if self.frame.skip.contains(&k) || i.reloc.is_some() || i.ra() != 1 {
+                continue;
+            }
+            use ppc750cl::Opcode::*;
+            let off = match i.op() {
+                Addi => i.simm() as i32,
+                Lwz | Lhz | Lha | Lbz | Stw | Sth | Stb | Lfs | Lfd | Stfs | Stfd => i.disp(),
+                _ => continue,
+            };
+            if off >= 8 && off < self.frame.saves_lo && !self.frame.save_slots.contains_key(&off) {
+                lo = Some(lo.map_or(off, |l: i32| l.min(off)));
+            }
+        }
+        lo
+    }
+
     fn infer_c_params(&mut self) {
         if sig::demangle(&self.f.name).is_some() || !self.sig.params.is_empty() {
             return;
@@ -1987,8 +2122,17 @@ impl<'a> Lifter<'a> {
                 live.insert(r);
             }
         });
-        let gmax = (3..=10u8).rev().find(|r| live.contains(&gpr(*r)));
+        let mut gmax = (3..=10u8).rev().find(|r| live.contains(&gpr(*r)));
         let fmax = (1..=8u8).rev().find(|r| live.contains(&fpr(*r)));
+        // unused trailing parameters still own a home slot: the lowest local sits above them
+        if self.param_home_slots && fmax.is_none() {
+            if let Some(lo) = self.lowest_local_offset() {
+                let slots = ((lo - 8) / 4) as u8;
+                if (1..=8).contains(&slots) && gmax.map_or(true, |g| g - 2 < slots) {
+                    gmax = Some(2 + slots);
+                }
+            }
+        }
         if let Some(g) = gmax {
             for _ in 3..=g {
                 self.sig.params.push(mwdec_core::Param { name: None, ty: t_s32() });
@@ -2194,10 +2338,11 @@ impl<'a> Lifter<'a> {
             self.def_wide(st, k, e);
             return None;
         }
-        let Some((sig, lay, has_this)) = self.call_layouts.get(&k).cloned() else {
+        let Some((mut sig, mut lay, has_this)) = self.call_layouts.get(&k).cloned() else {
             self.warn(format!("call without layout at {:#x}", i.off));
             return None;
         };
+        self.wide_args_unprototyped(st, &sym, &mut sig, &mut lay);
         let mut args = vec![];
         for (n, p) in lay.params.iter().enumerate() {
             let pt = sig.params[n].ty.clone();
@@ -2230,7 +2375,8 @@ impl<'a> Lifter<'a> {
                 ArgLoc::GprPair(r) => {
                     // 64-bit argument: high word in r, low word in r+1
                     let signed = is_signed(&pt).unwrap_or(true);
-                    crate::wide::pair(self.get(st, gpr(*r)), self.get(st, gpr(*r + 1)), signed, &self.vars)
+                    let (h, l) = (self.get(st, gpr(*r)), self.get(st, gpr(*r + 1)));
+                    self.pair_of(h, l, signed)
                 }
                 ArgLoc::Stack => {
                     let offs = self.stack_arg_offsets(&sig, &lay);
@@ -2420,6 +2566,119 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// A callee without a prototype passed a 64-bit value: an odd-aligned register pair holding
+    /// the halves of one 64-bit value is one argument, and a stale low half in the even register
+    /// before it is the alignment gap, not an argument.
+    fn wide_args_unprototyped(&mut self, st: &St, sym: &str, sig: &mut FuncSig, lay: &mut Layout) {
+        if sig::demangle(sym).is_some() || self.db.map_or(false, |db| db.decls.contains_key(sym) || db.functions.contains_key(sym)) || lay.this.is_some() || lay.sret.is_some() {
+            return;
+        }
+        if sig.params.len() != lay.params.len() || sig.params.iter().any(|p| p.name.is_some() || p.ty != t_s32()) && !sig.params.iter().all(|p| matches!(p.ty, Type::Float { .. }) || p.ty == t_s32()) {
+            return;
+        }
+        let mut n = 0;
+        while n + 1 < lay.params.len() {
+            if let (ArgLoc::Gpr(r), ArgLoc::Gpr(r2)) = (lay.params[n].clone(), lay.params[n + 1].clone()) {
+                let (h, l) = (self.get(st, gpr(r)), self.get(st, gpr(r2)));
+                // (two constants only with a stale low half in the gap register before them)
+                let gap_stale = r >= 5 && n > 0 && lay.params[n - 1] == ArgLoc::Gpr(r - 1) && {
+                    let prev = self.get(st, gpr(r - 1));
+                    let prev = self.resolve_temps(&prev);
+                    crate::wide::as_lo(&prev, &self.vars).is_some()
+                };
+                if r % 2 == 1 && r2 == r + 1 && (gap_stale || !(h.as_int().is_some() && l.as_int().is_some())) {
+                    let x = self.pair_resolved(h.clone(), l.clone()).filter(|_| {
+                        // only halves recognizably taken from one 64-bit value
+                        let (h, l) = (self.resolve_temps(&h), self.resolve_temps(&l));
+                        crate::wide::as_hi(&h, &self.vars).is_some() || (gap_stale && h.as_int().is_some() && l.as_int().is_some()) || (crate::wide::as_lo(&l, &self.vars).is_some() && h.as_int().is_some())
+                    });
+                    if let Some(x) = x {
+                        let xt = types::ty_of(&x, &self.vars);
+                        lay.params.splice(n..n + 2, [ArgLoc::GprPair(r)]);
+                        sig.params.splice(n..n + 2, [mwdec_core::Param { name: None, ty: if crate::wide::is_wide(&xt) { xt } else { Type::Int { size: 8, signed: true } } }]);
+                        if n > 0 && lay.params[n - 1] == ArgLoc::Gpr(r - 1) && r - 1 >= 4 {
+                            let prev = self.get(st, gpr(r - 1));
+                            let prev = self.resolve_temps(&prev);
+                            if crate::wide::as_lo(&prev, &self.vars).is_some() {
+                                lay.params.remove(n - 1);
+                                sig.params.remove(n - 1);
+                                n -= 1;
+                            }
+                        }
+                    }
+                }
+            }
+            n += 1;
+        }
+    }
+
+    /// Value through single-assignment temps (other than call results).
+    fn resolve_temps(&self, e: &Expr) -> Expr {
+        let mut e = e.clone();
+        for _ in 0..8 {
+            let mut changed = false;
+            e.rewrite(&mut |x| {
+                if let Expr::Var(v) = x {
+                    // (never a call: its value is the temp itself)
+                    if let Some(d) = self.temp_def.get(v).filter(|d| !d.has_call()) {
+                        *x = d.clone();
+                        changed = true;
+                    }
+                }
+            });
+            if !changed {
+                break;
+            }
+        }
+        e
+    }
+
+    /// A 64-bit value from its register halves, looking through temps; `None` when the halves
+    /// aren't recognizably one value.
+    fn pair_resolved(&self, hi: Expr, lo: Expr) -> Option<Expr> {
+        let p = crate::wide::pair(hi.clone(), lo.clone(), true, &self.vars);
+        if crate::wide::is_merged_pair(&p) {
+            return Some(p);
+        }
+        let (h, l) = (self.resolve_temps(&hi), self.resolve_temps(&lo));
+        let p = crate::wide::pair(h.clone(), l.clone(), true, &self.vars);
+        if crate::wide::is_merged_pair(&p) {
+            return Some(p);
+        }
+        // the halves of a 64-bit sum/difference: hi32(x op y) and lo32(x) op lo32(y)
+        let mut h0 = hi;
+        while let Expr::Var(v) = &h0 {
+            match self.temp_def.get(v) {
+                Some(d) if !d.has_call() => h0 = d.clone(),
+                _ => break,
+            }
+        }
+        let s = crate::wide::as_hi(&h0, &self.vars)?;
+        let sdef = match &s {
+            Expr::Var(v) => self.temp_def.get(v).map(|d| self.resolve_temps(d)).unwrap_or(s.clone()),
+            _ => self.resolve_temps(&s),
+        };
+        let Expr::Binary { op: op @ (BinOp::Add | BinOp::Sub), l: x, r: y, .. } = &sdef else { return None };
+        let Expr::Binary { op: lop, l: lx, r: ly, .. } = &l else { return None };
+        let lo_of = |e: &Expr, w: &Expr| {
+            crate::wide::as_lo(e, &self.vars).as_ref() == Some(w)
+                || matches!(e, Expr::Cast { e: inner, .. } if &**inner == w)
+                // the low word of a 64-bit object read separately
+                || matches!((e, w), (Expr::Load { base: b1, offset: o1, ty: t1 }, Expr::Load { base: b2, offset: o2, .. }) if b1 == b2 && *o1 == *o2 + 4 && scalar_size(t1) == Some(4))
+                || matches!((e, w), (Expr::Member { base: b1, offset: o1, ty: t1 }, Expr::Member { base: b2, offset: o2, .. }) if b1 == b2 && *o1 == *o2 + 4 && scalar_size(t1) == Some(4))
+        };
+        let ok = lop == op && ((lo_of(lx, x) && lo_of(ly, y)) || (*op == BinOp::Add && lo_of(lx, y) && lo_of(ly, x)));
+        ok.then_some(s.clone())
+    }
+
+    /// [`wide::pair`], also recognizing halves computed through temps.
+    fn pair_of(&self, hi: Expr, lo: Expr, signed: bool) -> Expr {
+        match self.pair_resolved(hi.clone(), lo.clone()) {
+            Some(p) => p,
+            None => crate::wide::pair(hi, lo, signed, &self.vars),
+        }
+    }
+
     fn coerce_arg(&self, v: Expr, _pt: &Type) -> Expr {
         v
     }
@@ -2433,7 +2692,8 @@ impl<'a> Lifter<'a> {
                 ArgLoc::Gpr(r) => a2.push(self.get(st, gpr(*r))),
                 ArgLoc::Fpr(r) => a2.push(self.get(st, fpr(*r))),
                 ArgLoc::GprPair(r) => {
-                    let p = crate::wide::pair(self.get(st, gpr(*r)), self.get(st, gpr(*r + 1)), true, &self.vars);
+                    let (h, l) = (self.get(st, gpr(*r)), self.get(st, gpr(*r + 1)));
+                    let p = self.pair_of(h, l, true);
                     a2.push(p)
                 }
                 ArgLoc::Stack => {
@@ -2571,7 +2831,7 @@ impl<'a> Lifter<'a> {
             // plain function-pointer call: arguments are the registers set up for it, or our own
             // incoming parameters still untouched in r3.. (the compiler kept them live)
             let live = |r: u8, l: &Self| -> bool {
-                if l.reg_set_for_call(k, gpr(r)) {
+                if l.reg_set_for_call(k, gpr(r)) || l.passed_through(k).is_some_and(|m| r <= m && l.entry_vals.contains_key(&gpr(r))) {
                     return true;
                 }
                 let b = l.cfg.block_of[k];
@@ -2662,7 +2922,21 @@ impl<'a> Lifter<'a> {
     fn ret_value(&mut self, st: &St, r: Reg) -> Expr {
         if r == gpr(3) && crate::wide::is_wide(&types::resolve(self.db, &self.ret_ty)) {
             let signed = !matches!(strip_cv(&types::resolve(self.db, &self.ret_ty)), Type::Int { signed: false, .. });
-            return crate::wide::pair(self.get(st, gpr(3)), self.get(st, gpr(4)), signed, &self.vars);
+            let (h, l) = (self.get(st, gpr(3)), self.get(st, gpr(4)));
+            return self.pair_of(h, l, signed);
+        }
+        // an undeclared return: r3:r4 holding the halves of one computed 64-bit value
+        if r == gpr(3) && (sig::ret_unknown(&self.sig) || matches!(self.sig.ret, Type::Unknown { .. })) && matches!(self.ret_ty, Type::Unknown { size: 0 | 4 }) {
+            let (h, l) = (self.get(st, gpr(3)), self.get(st, gpr(4)));
+            if !(h.as_int().is_some() && l.as_int().is_some()) {
+                if let Some(x) = self.pair_resolved(h, l) {
+                    let xt = types::ty_of(&x, &self.vars);
+                    if crate::wide::is_wide(&xt) {
+                        self.ret_ty = xt;
+                        return x;
+                    }
+                }
+            }
         }
         self.get(st, r)
     }
@@ -3041,7 +3315,7 @@ impl<'a> Lifter<'a> {
                 };
                 st.ca = match ins.op {
                     Subfc => Ca::Subfc(self.get(st, gpr(i.ra())), self.get(st, gpr(i.rb()))),
-                    Addc => Ca::Unknown,
+                    Addc => Ca::Addc(self.get(st, gpr(i.ra())), self.get(st, gpr(i.rb()))),
                     _ => std::mem::replace(&mut st.ca, Ca::Unknown),
                 };
                 self.def(st, k, gpr(i.rd()), v);
@@ -3106,6 +3380,27 @@ impl<'a> Lifter<'a> {
                         }
                     }
                     (Addze, Ca::Srawi(x, n)) => arith(BinOp::Div, as_signed(x.clone(), &self.vars), Expr::int(1i64 << n), &self.vars),
+                    // high word of a 64-bit addition / subtraction: the halves of two 64-bit values
+                    (Adde, Ca::Addc(alo, blo)) | (Subfe, Ca::Subfc(alo, blo)) => {
+                        let b2 = self.get(st, gpr(i.rb()));
+                        let (x, y) = (self.pair_resolved(a.clone(), alo.clone()), self.pair_resolved(b2, blo.clone()));
+                        match (x, y) {
+                            (Some(x), Some(y)) => {
+                                let wt = Type::Int { size: 8, signed: true };
+                                let s = if ins.op == Adde { Expr::bin(BinOp::Add, x, y, wt.clone()) } else { Expr::bin(BinOp::Sub, y, x, wt.clone()) };
+                                // the 64-bit result is computed here (later uses must not
+                                // re-evaluate its operands)
+                                let t = self.new_var(format!("temp_{}", reg_name(gpr(i.rd()))), wt, VarKind::Local, true);
+                                st.out.push(Stmt::Assign { dst: Expr::Var(t), src: s.clone() });
+                                self.temp_def.insert(t, s);
+                                crate::wide::hi32(Expr::Var(t))
+                            }
+                            _ => {
+                                self.warn(format!("carry op {} at {:#x}", i.text(), i.off));
+                                Expr::Unknown { text: i.text(), ty: t_unk(4) }
+                            }
+                        }
+                    }
                     _ => {
                         self.warn(format!("carry op {} at {:#x}", i.text(), i.off));
                         Expr::Unknown { text: i.text(), ty: t_unk(4) }
@@ -3217,6 +3512,21 @@ impl<'a> Lifter<'a> {
                 let s = self.get(st, gpr(i.rs()));
                 let a = self.get(st, gpr(i.ra()));
                 let (mut sh, mb, me) = (ins.field_sh(), ins.field_mb(), ins.field_me());
+                // inserting one CR bit copied out with `mfcr` (a compare stored into a one-bit
+                // field): the compare's value shifted into place
+                let s = match &s {
+                    Expr::Unknown { text, .. } if mb == me => match text.strip_prefix("mfcr:").and_then(|x| x.parse::<usize>().ok()) {
+                        Some(k) => match self.mfcr_vals.get(&k).and_then(|c| c[(mb as usize + sh as usize) % 32].clone()) {
+                            Some(b) => {
+                                sh = 31 - mb;
+                                b
+                            }
+                            None => s,
+                        },
+                        None => s,
+                    },
+                    _ => s,
+                };
                 // inserting a compare result (`subf; cntlzw` rotated so its bit 5 lands in a
                 // one-bit field): the value is `__cntlzw(x) >> 5` (`a == b`) shifted into place
                 let is_clz = |e: &Expr| matches!(e, Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if symbol == "__cntlzw");

@@ -82,6 +82,12 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_e
             // a static initializer of `const` globals schedules their stores differently
             if f.name.starts_with("__sinit_") && ui.db.is_some() {
                 r.alts.extend(super::search_cmds::draft_sinit_const(ui, f).ok().filter(|p| *p != s));
+                for k in 1..=3 {
+                    match super::search_cmds::draft_sinit_variant(ui, f, k) {
+                        Ok(v) if v != s && !r.alts.contains(&v) => r.alts.push(v),
+                        _ => break,
+                    }
+                }
             }
             r.src = Some(s);
         }

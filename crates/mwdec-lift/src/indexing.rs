@@ -150,6 +150,22 @@ pub fn raw_index(body: &mut [Stmt], vars: &[Var]) {
     Stmt::rewrite_exprs(body, &mut |e| {
         let Expr::Load { base, offset, ty } = &*e else { return };
         if *offset == 0 {
+            // `slwi; addi c; lwzx` (index and constant summed before the indexed access): an
+            // element of an array of the access type, `((T*)p)[(i << (s - log2 sz)) + c / sz]`
+            let Some((p, off)) = byte_add_parts(base) else { return };
+            let Some((i, k, c)) = split_offset(off) else { return };
+            let Some(sz) = scalar_size(ty).filter(|z| matches!(z, 2 | 4 | 8)).map(|z| z as i64) else { return };
+            if c <= 0 || c % sz != 0 || k <= sz || k % sz != 0 || !((k / sz) as u64).is_power_of_two() {
+                return;
+            }
+            let ety = if matches!(strip_cv(ty), Type::Unknown { .. }) { t_int(sz as u8, true) } else { ty.clone() };
+            let pt = types::ty_of(p, vars);
+            if !is_ptr(&pt) && !matches!(strip_cv(&pt), Type::Int { size: 4, .. } | Type::Unknown { size: 4 }) {
+                return;
+            }
+            let sh = (k / sz).trailing_zeros() as i64;
+            let idx = Expr::bin(BinOp::Add, Expr::bin(BinOp::Shl, i, Expr::int(sh), t_s32()), Expr::int(c / sz), t_s32());
+            *e = Expr::Index { base: Box::new(Expr::cast(t_ptr(ety.clone()), p.clone())), index: Box::new(idx), ty: ety };
             return;
         }
         let Some((p, off)) = byte_add_parts(base) else { return };
@@ -234,7 +250,7 @@ pub fn undo_strength_reduction(body: &mut Vec<Stmt>, vars: &[Var]) {
                 continue;
             }
             // rewrite: drop the increment, replace v by i * K
-            let repl = Expr::bin(BinOp::Mul, Expr::Var(i), Expr::int(kk), t_s32());
+            let repl = if kk == 1 { Expr::Var(i) } else { Expr::bin(BinOp::Mul, Expr::Var(i), Expr::int(kk), t_s32()) };
             if let Stmt::For { body: lb, .. } = &mut b[k] {
                 fn drop_inc(b: &mut Vec<Stmt>, v: VarId) -> bool {
                     match b.last_mut() {

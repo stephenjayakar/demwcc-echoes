@@ -82,6 +82,69 @@ pub fn constructs_into_param0(ir: &IrFunction) -> bool {
     found
 }
 
+/// Name prefix of the stand-in class a guessed struct return gets when no known class fits
+/// (the emitter defines it from the constructor signature on the `return`).
+pub const STANDIN_RET: &str = "__mwdec_ret";
+
+/// A guessed struct return of unknown class filled member by member at the end of the function
+/// (`__return->x0 = a; __return->x4 = b; ...; return;`, stores tiling the object from offset 0)
+/// becomes `return S(a, b, ...)` of a stand-in class whose constructor stores each member: the
+/// compiler builds such a temporary directly in the caller's object, as the target does.
+pub fn standin_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
+    let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return false };
+    if !matches!(pointee(&ir.vars[sret].ty), Some(Type::Unknown { .. })) {
+        return false;
+    }
+    let mut body = ir.body.clone();
+    if matches!(body.last(), Some(Stmt::Return(None))) {
+        body.pop();
+    }
+    let first = body.iter().position(|s| stmt_mentions(s, sret)).unwrap_or(body.len());
+    let mut fields: Vec<(i32, Type, Expr)> = vec![];
+    for s in &body[first..] {
+        match s {
+            Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if matches!(&**base, Expr::Var(v) if *v == sret) && !src.uses_var(sret) && !src.has_call() => {
+                if fields.iter().any(|f| f.0 == *offset) {
+                    return false;
+                }
+                fields.push((*offset, ty.clone(), src.clone()));
+            }
+            _ => return false,
+        }
+    }
+    if fields.is_empty() {
+        return false;
+    }
+    fields.sort_by_key(|f| f.0);
+    let mut at = 0i32;
+    for (o, t, _) in &fields {
+        let Some(sz) = types::size_of(db, t).filter(|&z| z > 0) else { return false };
+        if *o != at || !matches!(strip_cv(t), Type::Int { .. } | Type::Float { .. } | Type::Ptr(_)) {
+            return false;
+        }
+        at += sz as i32;
+    }
+    let name = format!("{STANDIN_RET}_{}", ir.symbol.split("__").next().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>());
+    let class = Type::Named(name.clone());
+    let ctor = mwdec_core::FuncSig {
+        qualified_name: format!("{name}::{name}"),
+        mangled: None,
+        ret: Type::Void,
+        params: fields.iter().map(|(_, t, _)| mwdec_core::Param { name: None, ty: t.clone() }).collect(),
+        this_class: Some(name.clone()),
+        is_const: false,
+        is_static: false,
+        is_virtual: false,
+        variadic: false,
+    };
+    body.truncate(first);
+    body.push(Stmt::Return(Some(Expr::Construct { class: class.clone(), ctor: Some(ctor), args: fields.into_iter().map(|f| f.2).collect() })));
+    ir.body = body;
+    ir.vars[sret].ty = t_ptr(class.clone());
+    ir.sig.ret = class;
+    true
+}
+
 /// A guessed struct return (`StructRet` pointing at an unknown type) takes the class of the
 /// object constructed into it.
 fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) {
@@ -174,8 +237,23 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
         dtor_unwrap(ir, this);
     }
     let vars = ir.vars.clone();
-    forward_stack_objects(&mut ir.body, &vars);
-    drop_dead_stack_stores(&mut ir.body, &vars);
+    if let Some(db) = db {
+        drop_frame_object_dtor_calls(&mut ir.body, &vars, db);
+    }
+    let kept = forward_stack_objects(&mut ir.body, &vars);
+    for &v in &kept {
+        // bound to a reference instead: its temporary is created before the objects of the
+        // statement that uses it (see `forward_breaks_layout`)
+        let t = ir.vars[v].ty.clone();
+        if named(&t).is_some() {
+            ir.vars[v].ty = Type::Ref(Box::new(Type::Const(Box::new(t))));
+        }
+    }
+    let more = drop_dead_stack_stores_kept(&mut ir.body, &vars);
+    ir.dead_stores.extend(more);
+    for (n, d) in ir.dead_stores.iter_mut().enumerate() {
+        d.order = n;
+    }
     if let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) {
         let rt = ir.sig.ret.clone();
         fold_struct_return(&mut ir.body, sret, &rt, db);
@@ -647,8 +725,35 @@ fn ctor_init_list(ir: &mut IrFunction, this: VarId, db: Option<&TypeDb>) {
     let mut last_call: i32 = -1;
     while k < ir.body.len() {
         let is_call = matches!(&ir.body[k], Stmt::Expr(_));
+        // `*this = other` at the start of a constructor (member-wise copy of an object of the
+        // same class): each member initialized from the other's (`operator=` may not exist or do
+        // something else)
+        if inits.is_empty() {
+            if let Some(es) = whole_self_copy(&ir.body[k], this, &own, db, &ir.vars) {
+                ir.body.remove(k);
+                inits.extend(es);
+                continue;
+            }
+        }
         let take = match &ir.body[k] {
             st @ Stmt::Expr(_) => ctor_init_of(st, this, &own, db),
+            // leading bitfield stores: initializer-list entries (written through its whole word,
+            // a field within one byte is one: a body assignment accesses just that byte)
+            Stmt::Assign { dst: Expr::BitField { base, shift, width, .. }, src } if !src.uses_var(this) && !src.has_call() => db.and_then(|db| {
+                let Expr::Load { base: b, offset, ty } = &**base else { return None };
+                let unit = types::size_of(Some(db), ty)?;
+                if !is_this(b, this) || !matches!(unit, 1 | 2 | 4) {
+                    return None;
+                }
+                let mask = (((1u64 << *width) - 1) << *shift) as u32;
+                let (path, ft) = types::bitfield_at(db, &own, *offset, unit, mask)?;
+                match path.as_slice() {
+                    [types::PathElem::Field(n, owner)] if sig::norm_name(owner) == sig::norm_name(&own) && !inits.iter().any(|i: &Init| i.target == InitTarget::Member(n.clone())) => {
+                        Some(Init { target: InitTarget::Member(n.clone()), ctor: None, args: vec![src.clone()], member_ty: Some(ft) })
+                    }
+                    _ => None,
+                }
+            }),
             // leading plain member stores: initializer-list entries (member order is the store
             // order MWCC emits for an init list)
             Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if is_this(base, this) && !src.uses_var(this) && !src.has_call() => db.and_then(|db| {
@@ -830,6 +935,11 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
         }
         ir.body.remove(k);
         k -= drop_consumed_temps(&mut ir.body, k, &orig_args, &vars);
+        // where the construction ran, for members set before it whose values are still
+        // expanded inlines (folded later, see `INIT_MARK`)
+        if let (true, InitTarget::Member(n)) = (k > 0, &init.target) {
+            ir.body.insert(k, Stmt::Comment(format!("{INIT_MARK}{n}")));
+        }
         // members declared before this one that the body set before its construction: their
         // initializers ran first (`w(in.ReadFloat()), v(in)`)
         let off = match (&init.target, db.and_then(|db| sig::find_class(db, own))) {
@@ -840,7 +950,11 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
             let mut j = 0;
             while j < k {
                 if let Some(e) = earlier_member_init(&ir.body[j], this, own, db, o, inits) {
-                    if let Some(a) = spellable_in_init(&e.args[0], false, None, &ir.body[..j], &vars, this, db, true) {
+                    // (only parameters: a register local may hold a value read before a later
+                    // store changed its source)
+                    let mut params_only = true;
+                    e.args[0].walk(&mut |x| params_only &= !matches!(x, Expr::Var(v) if !matches!(vars[*v].kind, VarKind::Param { .. })));
+                    if let Some(a) = spellable_in_init(&e.args[0], false, None, &ir.body[..j], &vars, this, db, true).filter(|_| params_only) {
                         ir.body.remove(j);
                         k -= 1;
                         inits.push(Init { args: vec![a], ..e });
@@ -855,6 +969,39 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
         }
     }
 }
+
+/// Initializer-list entries for `*this = other` with `other` an object of the constructor's own
+/// class (no bases, no vtable): one per member.
+fn whole_self_copy(st: &Stmt, this: VarId, own: &str, db: Option<&TypeDb>, vars: &[Var]) -> Option<Vec<Init>> {
+    let Stmt::Assign { dst: Expr::Load { base, offset: 0, ty }, src } = st else { return None };
+    if !is_this(base, this) {
+        return None;
+    }
+    let db = db?;
+    let c = sig::find_class(db, own)?;
+    let same = |t: &Type| types::class_of(Some(db), t).is_some_and(|k| sig::norm_name(&k.name) == sig::norm_name(own));
+    if !same(ty) || !c.bases.is_empty() || c.vptr_offset.is_some() || c.is_union || c.fields.is_empty() || c.fields.iter().any(|f| f.bitfield.is_some()) {
+        return None;
+    }
+    // the other object's member at `off`
+    let member: Box<dyn Fn(i32, &Type) -> Expr> = match src {
+        Expr::Load { base, offset, ty } if same(ty) && !base.uses_var(this) => {
+            let (b, o) = ((**base).clone(), *offset);
+            Box::new(move |off, t| Expr::Load { base: Box::new(b.clone()), offset: o + off, ty: t.clone() })
+        }
+        // a reference parameter (the object itself)
+        Expr::Var(v) if matches!(vars[*v].kind, VarKind::Param { .. }) && same(strip_cv(&vars[*v].ty)) => {
+            let v = *v;
+            Box::new(move |off, t| Expr::Member { base: Box::new(Expr::Var(v)), offset: off, ty: t.clone() })
+        }
+        _ => return None,
+    };
+    Some(c.fields.iter().map(|f| Init { target: InitTarget::Member(f.name.clone()), ctor: None, args: vec![member(f.offset as i32, &f.ty)], member_ty: Some(f.ty.clone()) }).collect())
+}
+
+/// Comment marking where a member's construction ran in a constructor body (moved to the
+/// initializer list); consumed after inline folding, never emitted.
+pub const INIT_MARK: &str = "mwdec init order: ";
 
 /// `this->m = v` for a direct member declared before offset `before` and not initialized yet.
 fn earlier_member_init(st: &Stmt, this: VarId, own: &str, db: Option<&TypeDb>, before: i32, inits: &[Init]) -> Option<Init> {
@@ -1198,7 +1345,20 @@ fn inline_locals(e: &Expr, before: &[Stmt], vars: &[Var], db: Option<&TypeDb>, d
                     .collect();
                 // also no writes nested in control flow
                 let nested = before.iter().any(|s| !matches!(s, Stmt::Assign { .. } | Stmt::Expr(_)) && stmt_mentions(s, *v));
-                match (defs.as_slice(), nested) {
+                // a location it read that a later statement overwrites (a stream read before
+                // the stream pointer advances): the value is gone
+                let stale = defs.len() == 1 && {
+                    let d = before.iter().position(|s| matches!(s, Stmt::Assign { dst: Expr::Var(x), .. } if x == v)).unwrap_or(0);
+                    before[d + 1..].iter().any(|s| match s {
+                        Stmt::Assign { dst, .. } if !matches!(dst, Expr::Var(_)) => {
+                            let mut hit = false;
+                            defs[0].walk(&mut |y| hit |= y == dst);
+                            hit
+                        }
+                        _ => false,
+                    })
+                };
+                match (defs.as_slice(), nested || stale) {
                     ([src], false) => match inline_locals(src, before, vars, db, depth + 1) {
                         Some(r) => *x = r,
                         None => ok = false,
@@ -1315,6 +1475,9 @@ fn dtor_unwrap(ir: &mut IrFunction, this: VarId) {
             Stmt::If { cond, .. } if is_member_addr_test(cond, this) => false,
             // (the member at offset 0 tests `this` itself, already known non-null here)
             Stmt::If { cond, els, .. } if unwrapped && els.is_empty() && is_this_test(cond, this) => false,
+            // (the null test merged with the member destructor's own first test:
+            // `if (&this->m && m.mOwn)`)
+            Stmt::If { cond: Expr::Binary { op: BinOp::LogAnd, l, .. }, els, .. } if unwrapped && els.is_empty() && (is_this_test(l, this) || is_member_addr_test(l, this)) => false,
             // implicit base/member destructor calls
             Stmt::Expr(Expr::Call { callee: Callee::Method { sig: s, this: obj, .. }, .. }) if sig::is_dtor(s) => {
                 !(is_this(obj, this) || matches!(&**obj, Expr::AddrOf(inner) if member_of_this(inner, this).is_some()))
@@ -1417,9 +1580,153 @@ fn mentions(s: &Stmt, v: VarId) -> usize {
     n
 }
 
+/// Methods the inline destructor of `cls` calls (`~basic_string() { internal_dereference(); }`
+/// -> `internal_dereference`).
+fn inline_dtor_callees(db: &TypeDb, cls: &str) -> Vec<String> {
+    let base = strip_tmpl(cls);
+    let last = sig::split_scope(&base).1.to_string();
+    let key = format!("{base}::~{last}");
+    let mut out = vec![];
+    for d in db.decls.get(&key).map(|v| v.as_slice()).unwrap_or(&[]) {
+        let Some(body) = &d.inline_body else { continue };
+        let toks: Vec<&str> = body.split_whitespace().collect();
+        for w in toks.windows(2) {
+            if w[1] == "(" && w[0].chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && !matches!(w[0], "if" | "while" | "for" | "return" | "sizeof") {
+                out.push(w[0].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The end of a frame object's life written out: its destructor (or what its inline destructor
+/// calls), possibly behind a null test of its address, as the last statement mentioning it.
+/// C++ destroys objects implicitly (temporaries at the end of their full expression, named
+/// objects at the end of their scope), so the call is no statement of the source; dropping it
+/// also lets a call result used once become the temporary it was.
+fn drop_frame_object_dtor_calls(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
+    let total = |body: &Vec<Stmt>, v: VarId| -> usize { body.iter().map(|s| mentions(s, v)).sum() };
+    let snapshot = body.clone();
+    let on_object = |e: &Expr, v: VarId| -> bool {
+        match e {
+            Expr::AddrOf(x) => matches!(&**x, Expr::Var(w) if *w == v),
+            Expr::Var(w) => *w == v && matches!(vars[v].ty, Type::Ptr(_)),
+            _ => false,
+        }
+    };
+    let dtor_call = |s: &Stmt| -> Option<VarId> {
+        let call = match s {
+            Stmt::Expr(e) => e,
+            Stmt::If { cond, then, els } if els.is_empty() && then.len() == 1 => match &then[0] {
+                Stmt::Expr(e) if matches!(cond, Expr::AddrOf(_)) => e,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let Expr::Call { callee: Callee::Method { sig: sg, this, .. }, args, .. } = call else { return None };
+        let v = match &**this {
+            Expr::AddrOf(x) => match &**x {
+                Expr::Var(w) => *w,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !on_object(this, v) {
+            return None;
+        }
+        let name = sg.qualified_name.rsplit("::").next().unwrap_or("");
+        let is_dtor = sig::is_dtor(sg) && args.iter().all(|a| a.as_int().is_some());
+        // what the receiver class's inline destructor calls, on a frame object (the class of
+        // the object is the method's: the receiver is its start)
+        let inline_part = args.is_empty()
+            && matches!(vars[v].kind, VarKind::Stack { .. })
+            && sg.this_class.as_deref().is_some_and(|c| inline_dtor_callees(db, c).iter().any(|n| n == name));
+        (is_dtor || inline_part).then_some(v)
+    };
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            if let Some(v) = dtor_call(&b[i]) {
+                let before: usize = b[..=i].iter().map(|s| mentions(s, v)).sum();
+                let here = mentions(&b[i], v);
+                // the last mention, after the object was used, nothing elsewhere; or a member
+                // object mentioned nowhere else (destroyed with the object around it)
+                // (an object left an untyped buffer keeps its destructor call: nothing else
+                // would destroy it; one defined whole by a call result is that call's type)
+                let typed = named(&vars[v].ty).is_some()
+                    || b[..i].iter().any(|s| matches!(s, Stmt::Assign { dst: Expr::Var(w), src } if *w == v && matches!(src, Expr::Call { .. })));
+                if before == total(&snapshot, v) && ((before >= 3 && typed) || here == before) {
+                    b.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    });
+}
+
+/// Would forwarding the call result held in stack object `v` into statement `s` put its
+/// frame temporary below an object `s` builds that the target has below it?
+///
+/// MWCC lays out frame objects from one list: named locals in declaration order, then C++
+/// temporaries in creation order (an object built in an expression is created before the
+/// temporaries of its arguments); the list is reversed and sorted stably by size rounded to the
+/// alignment, then allocated upwards. Forwarded into `s`, `v` becomes a temporary created after
+/// every other object of `s`, so among objects of its size class it gets the lowest offset. If
+/// the target has one of them below `v`, `v` is a temporary created first instead: a
+/// reference bound to the call result (`const T& r = f(); x += U(r);`).
+fn forward_breaks_layout(v: VarId, s: &Stmt, vars: &[Var], folded: &[(Type, i32, u32)], forwardable: &HashSet<VarId>) -> bool {
+    let VarKind::Stack { offset: ov, size: sv } = vars[v].kind else { return false };
+    let key = |n: u32| (n + 3) & !3;
+    let mut breaks = false;
+    Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+        // an object built in place (`U(...)`) that was a frame object of the target
+        if let Expr::Construct { class, .. } = e {
+            if folded.iter().any(|(t, oc, sc)| t == class && key(*sc) == key(sv) && *oc < ov) {
+                breaks = true;
+            }
+        }
+        if let Expr::AddrOf(x) = e {
+            if let Expr::Var(c) = &**x {
+                // (another call result about to be forwarded too: no fixed place in the list)
+                if *c != v && !forwardable.contains(c) {
+                    if let VarKind::Stack { offset: oc, size: sc } = vars[*c].kind {
+                        if key(sc) == key(sv) && oc < ov {
+                            breaks = true;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    breaks
+}
+
 /// `T v = f(); g(v);` (v a stack object used once) -> `g(f());`: MWCC copies a returned object
-/// into a named local but builds a temporary in place.
-pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) {
+/// into a named local but builds a temporary in place. Returns the call results kept apart
+/// because forwarding them would change the frame layout ([`forward_breaks_layout`]).
+pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) -> Vec<VarId> {
+    let mut kept: Vec<VarId> = vec![];
+    // call results held in a stack object used once: candidates for forwarding
+    let mut forwardable: HashSet<VarId> = HashSet::new();
+    Stmt::for_each_block_mut(&mut body.clone(), &mut |b| {
+        for st in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(w), src } = st {
+                if src.has_call() && matches!(vars[*w].kind, VarKind::Stack { .. }) && body.iter().map(|x| mentions(x, *w)).sum::<usize>() == 2 {
+                    forwardable.insert(*w);
+                }
+            }
+        }
+    });
+    // frame objects no longer mentioned: built in place as `U(...)` by an earlier pass
+    let folded: Vec<(Type, i32, u32)> = vars
+        .iter()
+        .enumerate()
+        .filter_map(|(v, var)| match var.kind {
+            VarKind::Stack { offset, size } if named(&var.ty).is_some() && !body.iter().any(|s| stmt_mentions(s, v)) => Some((var.ty.clone(), offset, size)),
+            _ => None,
+        })
+        .collect();
     let total = |body: &Vec<Stmt>, v: VarId| -> usize { body.iter().map(|s| mentions(s, v)).sum() };
     let snapshot = body.clone();
     let mut counts: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
@@ -1521,6 +1828,11 @@ pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) {
                 wide
             };
             if let Some((v, src)) = cand {
+                if src.has_call() && mentions(&b[i + 1], v) == 1 && forward_breaks_layout(v, &b[i + 1], vars, &folded, &forwardable) {
+                    kept.push(v);
+                    i += 1;
+                    continue;
+                }
                 if mentions(&b[i + 1], v) == 1 && !wider_read(v, &src, &b[i + 1]) && !matches!(b[i + 1], Stmt::If { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::Switch { .. }) {
                     let mut s = b[i + 1].clone();
                     let mut ok = true;
@@ -1548,6 +1860,7 @@ pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) {
             i += 1;
         }
     });
+    kept
 }
 
 /// Does statement `s` define all of stack object `v` (constructor call on `&v`, or `v = e`)?
@@ -1651,6 +1964,12 @@ pub fn count_mentions(s: &Stmt, v: VarId) -> usize {
 /// Stack slots that are written but never read (compiler temporaries the source never named,
 /// e.g. the extra copy MWCC makes when passing a struct by value): drop the stores.
 pub fn drop_dead_stack_stores(body: &mut Vec<Stmt>, vars: &[Var]) {
+    drop_dead_stack_stores_kept(body, vars);
+}
+
+/// [`drop_dead_stack_stores`], returning what was dropped (in frame-offset order, `order` unset).
+pub fn drop_dead_stack_stores_kept(body: &mut Vec<Stmt>, vars: &[Var]) -> Vec<DeadStackStore> {
+    let mut dropped: Vec<DeadStackStore> = vec![];
     for (v, var) in vars.iter().enumerate() {
         if !matches!(var.kind, VarKind::Stack { .. }) {
             continue;
@@ -1682,11 +2001,23 @@ pub fn drop_dead_stack_stores(body: &mut Vec<Stmt>, vars: &[Var]) {
         if stores != total {
             continue;
         }
+        let VarKind::Stack { offset, size } = var.kind else { continue };
         Stmt::for_each_block_mut(body, &mut |b| {
-            let mut out = Vec::with_capacity(b.len());
+            let mut out: Vec<Stmt> = Vec::with_capacity(b.len());
             for s in b.drain(..) {
                 match s {
                     Stmt::Assign { dst: Expr::Var(x), src } if x == v => {
+                        // the value: a register temp defined earlier in the block stands for
+                        // its (side-effect free) definition
+                        let mut value = src.clone();
+                        if let Expr::Var(t) = &src {
+                            if let Some(Stmt::Assign { src: def, .. }) = out.iter().rev().find(|p| matches!(p, Stmt::Assign { dst: Expr::Var(d), .. } if d == t)) {
+                                if !def.has_call() {
+                                    value = def.clone();
+                                }
+                            }
+                        }
+                        dropped.push(DeadStackStore { offset, size, value, order: 0 });
                         if src.has_call() {
                             out.push(Stmt::Expr(src));
                         }
@@ -1697,6 +2028,8 @@ pub fn drop_dead_stack_stores(body: &mut Vec<Stmt>, vars: &[Var]) {
             *b = out;
         });
     }
+    dropped.sort_by_key(|d| d.offset);
+    dropped
 }
 
 /// A class-typed stack object without a default constructor that is not defined whole at its

@@ -5,6 +5,7 @@
 use crate::ir::*;
 use crate::types;
 use mwdec_core::{Type, TypeDb};
+use std::collections::HashMap;
 
 fn unit_bits(e: &Expr) -> Option<u32> {
     match e {
@@ -275,6 +276,11 @@ fn rlwimi_form(src: &Expr, dst: &Expr) -> Option<Expr> {
     let keep = Expr::bin(BinOp::And, args[0].clone(), Expr::uint((!m) as i64), u());
     let y = match args[1].as_int() {
         Some(v) => Expr::uint((((v as u32) << sh) & m) as i64),
+        // the rotate wraps: a mask inside the low `sh` bits takes the value's top bits
+        None if sh > 0 && (m as u64) < (1u64 << sh) => {
+            let v = Expr::cast(u(), args[1].clone());
+            Expr::bin(BinOp::And, Expr::bin(BinOp::Shr, v, Expr::int(32 - sh as i64), u()), Expr::uint(m as i64), u())
+        }
         None => {
             let shifted = if sh == 0 { args[1].clone() } else { Expr::bin(BinOp::Shl, args[1].clone(), Expr::int(sh as i64), u()) };
             Expr::bin(BinOp::And, shifted, Expr::uint(m as i64), u())
@@ -405,6 +411,184 @@ fn top_down(e: &mut Expr, vars: &[Var], db: &TypeDb) {
 /// `t1 = __rlwimi(x, a, ..); t2 = __rlwimi(__rlwimi(t1, b, ..), c, ..);` becomes
 /// `t1 = x; t1 = __rlwimi(t1, a, ..); t1 = __rlwimi(t1, b, ..); t1 = __rlwimi(t1, c, ..);`.
 pub fn insert_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
+    insert_chains_inner(body, vars, is_temp);
+    join_chains(body, is_temp);
+    split_field_values(body);
+}
+
+/// One variable whose different bits are inserted into several fields is split into its bit
+/// pieces in the source
+/// (`SET_REG_FIELD(reg, 1, 18, op & 1); SET_REG_FIELD(reg, 2, 20, (op >> 1) & 3);`): the masks
+/// leave the instructions alone but not the register allocation.
+fn split_field_values(body: &mut Vec<Stmt>) {
+    let mut count: HashMap<VarId, Vec<(i64, i64, i64)>> = HashMap::new();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Call { args, .. } = e {
+            if is_rlwimi(e) {
+                if let (Expr::Var(v), Some(sh), Some(mb), Some(me)) = (&args[1], args[2].as_int(), args[3].as_int(), args[4].as_int()) {
+                    let f = count.entry(*v).or_default();
+                    if !f.contains(&(sh, mb, me)) {
+                        f.push((sh, mb, me));
+                    }
+                }
+            }
+        }
+    });
+    // pieces: different bits of the value (the same bits at different places are alternatives)
+    count.retain(|_, f| {
+        let mut lows: Vec<i64> = f.iter().map(|(sh, _, me)| (31 - me) - sh).collect();
+        lows.sort();
+        lows.dedup();
+        lows.len() >= 2
+    });
+    if count.is_empty() {
+        return;
+    }
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if !is_rlwimi(e) {
+            return;
+        }
+        let Expr::Call { args, .. } = e else { return };
+        let (Expr::Var(v), Some(sh), Some(mb), Some(me)) = (&args[1], args[2].as_int(), args[3].as_int(), args[4].as_int()) else { return };
+        if !count.contains_key(v) || !(0..=31).contains(&mb) || !(mb..=31).contains(&me) {
+            return;
+        }
+        let fs = 31 - me;
+        let width = me - mb + 1;
+        let d = fs - sh;
+        if !(0..32).contains(&d) || width >= 32 {
+            return;
+        }
+        let ty = Type::Int { size: 4, signed: true };
+        let mut x = args[1].clone();
+        if d > 0 {
+            x = Expr::bin(BinOp::Shr, x, Expr::int(d), ty.clone());
+        }
+        args[1] = Expr::bin(BinOp::And, x, Expr::int((1i64 << width) - 1), ty);
+        args[2] = Expr::int(fs);
+    });
+}
+
+fn is_rlwimi(e: &Expr) -> bool {
+    matches!(e, Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } if symbol == "__rlwimi" && args.len() == 5)
+}
+
+/// Innermost base of an insert chain.
+fn chain_base(e: &Expr) -> &Expr {
+    let mut cur = e;
+    while let Expr::Call { args, .. } = cur {
+        if !is_rlwimi(cur) {
+            break;
+        }
+        cur = &args[0];
+    }
+    cur
+}
+
+/// The register word kept in one variable across a branch, as the SDK writes it
+/// (`reg = gx->tevc[i]; SET_REG_FIELD(reg, ..); if (c) { SET_REG_FIELD(reg, ..); } else
+/// { SET_REG_FIELD(reg, ..); } SET_REG_FIELD(reg, ..);`): the compiler gives each branch's
+/// result its own register, so the lift sees `w = ins(ins(r, ..), ..)` in both arms and a copy
+/// `t = w` before the next inserts. Both arms become in-place inserts on `r`, and `w` and the
+/// copy `t` are `r`.
+fn join_chains(body: &mut Vec<Stmt>, is_temp: &mut Vec<bool>) {
+    let mut defs: HashMap<VarId, usize> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for st in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), .. } = st {
+                *defs.entry(*v).or_default() += 1;
+            }
+        }
+    });
+    let mut renames: HashMap<VarId, VarId> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for i in 0..b.len() {
+            let Stmt::If { then, els, .. } = &mut b[i] else { continue };
+            let arm = |a: &Vec<Stmt>| -> Option<(VarId, VarId)> {
+                let Some(Stmt::Assign { dst: Expr::Var(w), src }) = a.last() else { return None };
+                if !is_rlwimi(src) {
+                    return None;
+                }
+                let Expr::Var(r) = chain_base(src) else { return None };
+                Some((*w, *r))
+            };
+            let (Some((w1, r1)), Some((w2, r2))) = (arm(then), arm(els)) else { continue };
+            if w1 != w2 || r1 != r2 || w1 == r1 || defs.get(&w1) != Some(&2) {
+                continue;
+            }
+            let (w, r) = (w1, r1);
+            for a in [&mut *then, &mut *els] {
+                let Some(Stmt::Assign { src, .. }) = a.pop() else { unreachable!() };
+                let mut inserts = vec![];
+                let mut cur = src;
+                while is_rlwimi(&cur) {
+                    let Expr::Call { callee, args, ret } = cur else { unreachable!() };
+                    let mut args = args;
+                    let inner = std::mem::replace(&mut args[0], Expr::Var(r));
+                    inserts.push(Expr::Call { callee, args, ret });
+                    cur = inner;
+                }
+                for ins in inserts.into_iter().rev() {
+                    a.push(Stmt::Assign { dst: Expr::Var(r), src: ins });
+                }
+            }
+            renames.insert(w, r);
+        }
+    });
+    if renames.is_empty() {
+        return;
+    }
+    let resolve = |mut v: VarId| {
+        while let Some(&n) = renames.get(&v) {
+            v = n;
+        }
+        v
+    };
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *v = resolve(*v);
+        }
+    });
+    // `t = r` followed by inserts into t, with r dead afterwards: t is r
+    let roots: Vec<VarId> = renames.values().copied().collect();
+    let mut more: HashMap<VarId, VarId> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            let copy = match &b[i] {
+                Stmt::Assign { dst: Expr::Var(t), src: Expr::Var(r) } if roots.contains(r) && t != r => Some((*t, *r)),
+                _ => None,
+            };
+            if let Some((t, r)) = copy {
+                let mut later = HashMap::new();
+                crate::inline::count_uses(&b[i + 1..], &mut later);
+                let next_insert = matches!(b.get(i + 1), Some(Stmt::Assign { dst: Expr::Var(t2), src }) if *t2 == t && is_rlwimi(src) && matches!(chain_base(src), Expr::Var(x) if *x == t));
+                if next_insert && later.get(&r).copied().unwrap_or(0) == 0 {
+                    b.remove(i);
+                    more.insert(t, r);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    });
+    if !more.is_empty() {
+        Stmt::rewrite_exprs(body, &mut |e| {
+            if let Expr::Var(v) = e {
+                if let Some(&n) = more.get(v) {
+                    *v = n;
+                }
+            }
+        });
+    }
+    for r in roots {
+        if let Some(x) = is_temp.get_mut(r) {
+            *x = false;
+        }
+    }
+}
+
+fn insert_chains_inner(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
     stored_chains(body, vars, is_temp);
     fn is_insert(e: &Expr) -> bool {
         matches!(e, Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } if symbol == "__rlwimi" && args.len() == 5)

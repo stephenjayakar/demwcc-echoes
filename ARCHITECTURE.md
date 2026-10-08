@@ -136,8 +136,8 @@ harvest:
 `mwdec_lift::lift_function` -> `InlineLibs::get` (`mwdec_inline::build_library_for`, compiles
 missing probes through `Mwcc::compile_in`) -> `mwdec_inline::apply` ->
 `mwdec_emit::emit_function` -> `extern_c_definition`. `choose_draft` compiles the variants with
-and without folded inlines and keeps the better. With `eval --include-implicit` (and in
-`match`), functions classified as header inlines / implicit members, and template instances in
+and without folded inlines and keeps the better. In `eval` (unless `--exclude-implicit`) and
+`match`, functions classified as header inlines / implicit members, and template instances in
 any case, are drafted as instantiations (`instantiation_drafts`, chosen by `choose_among`); only
 when none matches is the lifted body tried as an explicit specialization (alone and followed by
 a use).

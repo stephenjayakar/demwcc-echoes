@@ -391,8 +391,9 @@ Global options: `--root <dir>` (project, read-only; default `$MWDEC_ROOT`), `--w
   writes `best.cpp`/`result.json`; exit 0 only if exact. `--budget-secs 0` scores the draft
   without searching.
 - `mwdec eval [--split test|train] [--max-size N] [--limit K] [--jobs J] [--budget-secs N]
-  [--list rows.jsonl] [--mem-report]`: draft + search over a seeded sample of the dataset of one
-  split (default test); JSONL rows plus an exact-match table by size bucket. Never reads source bodies.
+  [--list rows.jsonl] [--mem-report] [--exclude-implicit]`: draft + search over a seeded sample of the dataset of one
+  split (default test); JSONL rows plus an exact-match table by size bucket and by kind (header
+  inlines, template instances and implicit members are drafted as instantiations and counted). Never reads source bodies.
   `--budget-secs 0` = first drafts only. `--jobs` at most 3.
 - `mwdec harvest [--max-size N] [--scope sourced|auto|all] [--tag T] [--summary]`: draft + search
   over functions not yet matched in report.json, smallest first; keeps exact results (resumable,

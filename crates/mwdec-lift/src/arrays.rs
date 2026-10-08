@@ -1066,6 +1066,99 @@ fn assigns<'a>(b: &'a [Stmt], out: &mut Vec<(&'a Expr, &'a Expr)>) {
     }
 }
 
+/// Hardware register blocks of the console (`0xCC000000`..`0xCC008000`): accesses at constant
+/// addresses there that no context declaration covers are elements of a register array the
+/// draft declares itself at the block's address (`volatile u32 X[N] : 0xCC006400;`, how the SDK
+/// declares them): the compiler then materializes the array's address as a symbol, which differs
+/// from a cast constant (scheduling, `lis`/`addi` + indexed access for computed indices).
+/// Blocks are 0x400-aligned; every access to a block must have the same size.
+pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> Vec<GlobalRef> {
+    const LO: u32 = 0xCC00_0000;
+    const HI: u32 = 0xCC00_8000;
+    fn konst(e: &Expr) -> Option<u32> {
+        match e {
+            Expr::Int { value, .. } => Some(*value as u32),
+            Expr::Cast { e, .. } => konst(e),
+            _ => None,
+        }
+    }
+    // (x, n, address) of `K + x*n` / K
+    let split = |base: &Expr, offset: i32| -> Option<(Option<Expr>, u32, u32)> {
+        if let Some(k) = konst(base) {
+            return Some((None, 1, k.wrapping_add(offset as u32)));
+        }
+        let mut e = base;
+        while let Expr::Cast { e: inner, .. } = e {
+            e = inner;
+        }
+        let Expr::Binary { op: BinOp::Add, l, r, .. } = e else { return None };
+        let (k, rest) = match (konst(l), konst(r)) {
+            (Some(k), None) => (k, &**r),
+            (None, Some(k)) => (k, &**l),
+            _ => return None,
+        };
+        let (x, n, c) = split_index(rest, vars, db).unwrap_or((rest.clone(), 1, 0));
+        Some((Some(x), n, (k as i64).wrapping_add(c).wrapping_add(offset as i64) as u32))
+    };
+    let declared = |a: u32| {
+        db.is_some_and(|db| {
+            db.abs_addrs.iter().any(|(n, start)| {
+                let size = db.globals.get(n).and_then(|(_, t)| types::size_of(Some(db), t)).unwrap_or(4);
+                a >= *start && a < start.wrapping_add(size.max(4))
+            })
+        })
+    };
+    // block -> access size (0 = mixed)
+    let mut blocks: HashMap<u32, u32> = HashMap::new();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Load { base, offset, ty } = e {
+            if let (Some((x, n, a)), Some(es)) = (split(base, *offset), scalar_size(ty)) {
+                if (LO..HI).contains(&a) && !declared(a) && matches!(es, 1 | 2 | 4) && a % es == 0 && (x.is_none() || n % es == 0) {
+                    let b = blocks.entry(a & !0x3ff).or_insert(es);
+                    if *b != es {
+                        *b = 0;
+                    }
+                }
+            }
+        }
+    });
+    blocks.retain(|_, es| *es != 0);
+    if blocks.is_empty() {
+        return vec![];
+    }
+    let name = |b: u32| format!("__hwregs_{b:08X}");
+    let arr = |es: u32| Type::Array(Box::new(Type::Volatile(Box::new(Type::Int { size: es as u8, signed: false }))), 0x400 / es);
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Load { base, offset, ty } = e else { return };
+        let Some((x, n, a)) = split(base, *offset) else { return };
+        let Some(&es) = blocks.get(&(a & !0x3ff)) else { return };
+        if !(LO..HI).contains(&a) || scalar_size(ty) != Some(es) || a % es != 0 || (x.is_some() && n % es != 0) {
+            return;
+        }
+        let b = a & !0x3ff;
+        let it = Type::Int { size: 4, signed: true };
+        let k = Expr::int(((a - b) / es) as i64);
+        let idx = match x {
+            None => k,
+            Some(x) => {
+                let xi = if n / es == 1 { x } else { Expr::bin(BinOp::Mul, x, Expr::int((n / es) as i64), it.clone()) };
+                if a > b {
+                    Expr::bin(BinOp::Add, xi, k, it)
+                } else {
+                    xi
+                }
+            }
+        };
+        // (the element type itself: a cast would drop the volatile access)
+        let et = Type::Int { size: es as u8, signed: false };
+        *e = Expr::Index { base: Box::new(Expr::Global { symbol: name(b), ty: arr(es) }), index: Box::new(idx), ty: et };
+    });
+    blocks
+        .into_iter()
+        .map(|(b, es)| GlobalRef { symbol: name(b), ty: arr(es), is_function: false, section: None, local_def: true, init: None, abs_addr: Some(b) })
+        .collect()
+}
+
 /// Accesses at constant addresses inside a variable the context declares at an absolute address
 /// (hardware register arrays, `vu16 __DSPRegs[32] : 0xCC005000;`) are elements of it:
 /// `__DSPRegs[3]` (the compiler then materializes the array's base and indexes from it).

@@ -23,6 +23,7 @@ pub mod ctrloop;
 pub mod divmagic;
 pub mod debug;
 pub mod frame;
+pub mod frameobj;
 pub mod idioms;
 pub mod indexing;
 pub mod inline;
@@ -34,6 +35,7 @@ pub mod ir;
 pub mod sig;
 pub mod scalars;
 pub mod simplify;
+pub mod structcopy;
 pub mod structure;
 pub mod switchtree;
 pub mod translate;
@@ -53,11 +55,21 @@ use translate::Lifter;
 pub struct LiftOptions {
     pub inline_temps: bool,
     pub for_loops: bool,
+    /// The unit's compiler version from the build configuration (`GC/2.7`, `GC/1.2.5n`, ...),
+    /// for idioms only one compiler generation has. `None` = the game compiler.
+    pub compiler: Option<String>,
+}
+
+impl LiftOptions {
+    /// The SDK compiler generation (GC/1.2.x): parameter home slots in the frame.
+    pub fn sdk_compiler(&self) -> bool {
+        self.compiler.as_deref().is_some_and(|c| c.replace('\\', "/").contains("GC/1.2"))
+    }
 }
 
 impl Default for LiftOptions {
     fn default() -> Self {
-        LiftOptions { inline_temps: true, for_loops: true }
+        LiftOptions { inline_temps: true, for_loops: true, compiler: None }
     }
 }
 
@@ -75,6 +87,10 @@ pub fn lift_function_with(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, o
         }
     }
     // a guessed struct return whose class couldn't be found: no declarable return type
+    let mut ir = ir;
+    if idioms::standin_sret(&mut ir, db) {
+        return Ok(ir);
+    }
     if ir.vars.iter().any(|v| v.kind == VarKind::StructRet && matches!(pointee(&v.ty), Some(mwdec_core::Type::Unknown { .. }))) {
         if let Ok(ir2) = lift_once(obj, f, db, opts, None) {
             return Ok(ir2);
@@ -91,6 +107,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     let mut l = Lifter::new(obj, f, db);
     l.force_sret = force_sret == Some(true);
     l.no_sret_guess = force_sret.is_none();
+    l.param_home_slots = opts.sdk_compiler();
     l.run()?;
     let nb = l.cfg.blocks.len();
 
@@ -189,6 +206,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         s.run()
     };
     debug::stage("structure", &body, &l.vars);
+    structure::volatile_spin_loads(&mut body);
     simplify::fold_logical_values(&mut body, &l.vars);
     ctrloop::forward_constant_copies(&mut body, &l.is_temp);
     ctrloop::propagate_constant_temps(&mut body, &l.vars, &l.is_temp);
@@ -200,9 +218,10 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         bool_return(&body, &l.vars, &mut l.ret_ty);
     }
     wide::merge_halves(&mut body, &l.vars, &l.is_temp);
+    wide::merge_or_assigns(&mut body, &l.vars, &l.is_temp);
     wide::merge_compares(&mut body, &l.vars);
     // compiler-made stack copies the source never names, then fold the temps they kept alive
-    idioms::drop_dead_stack_stores(&mut body, &l.vars);
+    let dead_stores = idioms::drop_dead_stack_stores_kept(&mut body, &l.vars);
     localtypes::fold_delete_checks(&mut body);
     if l.sig.variadic {
         varargs::recover(&mut body, &mut l.vars, l.params.last().copied());
@@ -224,12 +243,17 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         byval::forward_ptmf_args(&mut body, &l.vars, db);
         construct::fold(&mut body, &l.vars, db);
         arrays::recover(&mut body, &l.vars, Some(db));
+        // fields of array elements: the element accesses exist only now
+        bitfields::recover(&mut body, &l.vars, db);
         localtypes::refresh_access_types(&mut body, &l.vars, db);
         localtypes::retype(&body, &mut l.vars);
         localtypes::refresh_access_types(&mut body, &l.vars, db);
         simplify::simplify_body(&mut body, &l.vars);
     }
     construct::fold_returned_temps(&mut body, &l.vars, &mut l.is_temp, &l.ctor_ret_used);
+    for g in arrays::synth_hw_arrays(&mut body, &l.vars, db) {
+        l.globals.insert(g.symbol.clone(), g);
+    }
     localtypes::narrow(&mut body, &mut l.vars, db);
     localtypes::global_types(&mut body, &l.vars, &l.ret_ty, db);
     localtypes::undeclared_returns(&mut body, &l.ret_ty, db);
@@ -281,8 +305,10 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         string_pool,
         warnings: l.warnings,
         decl_params: l.decl_params,
+        dead_stores,
     };
     debug::stage("late simplify", &ir.body, &ir.vars);
+    frameobj::fold_single_reads(&mut ir);
     idioms::apply(&mut ir, db);
     scalars::regroup(&mut ir, db);
     debug::stage("idioms", &ir.body, &ir.vars);
@@ -290,6 +316,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         simplify::form_for_loops(&mut ir.body);
     }
     simplify::name_vars(&ir.body, &mut ir.vars);
+    structure::guard_not_swap(&mut ir.body);
     Ok(ir)
 }
 
@@ -418,11 +445,44 @@ fn rematerialize_loop_headers(l: &mut Lifter) {
             }
             seen
         };
+        // loop blocks dominated by the body's first block through effect-free blocks only (the
+        // arms of an `if` at the top of the body re-reading the value)
+        let effect_free = |blk: usize, l: &Lifter| {
+            l.blocks_out[blk].stmts.iter().all(|s| matches!(s, Stmt::Assign { dst: Expr::Var(_), src } if !src.has_call()) || matches!(s, Stmt::Label(_) | Stmt::Comment(_)))
+        };
+        let mut deeper: Vec<usize> = vec![];
+        for &u in &lp.body {
+            if u == body || u == h {
+                continue;
+            }
+            let mut x = l.cfg.idom[u];
+            let mut ok = true;
+            let mut guard = 0;
+            while x != body {
+                if x == usize::MAX || x == h || !lp.body.contains(&x) || !effect_free(x, l) || guard > 32 {
+                    ok = false;
+                    break;
+                }
+                x = l.cfg.idom[x];
+                guard += 1;
+            }
+            if ok && effect_free(body, l) {
+                deeper.push(u);
+            }
+        }
         let mut body_ok = true;
         let mut use_out = false;
+        let mut used_deeper: Vec<usize> = vec![];
         for (v, _) in &defs {
             let mut seen = in_cond(*v, l);
             seen += leading_uses(body, *v, l);
+            for &u in &deeper {
+                let n = leading_uses(u, *v, l);
+                if n > 0 && !used_deeper.contains(&u) {
+                    used_deeper.push(u);
+                }
+                seen += n;
+            }
             let total = uses.get(v).copied().unwrap_or(0);
             if seen != total && out_ok {
                 let o = leading_uses(out, *v, l);
@@ -436,6 +496,45 @@ fn rematerialize_loop_headers(l: &mut Lifter) {
             }
         }
         if !body_ok {
+            // the body stores before reusing the value (`while ((p = head) != 0) { head = p->next;
+            // f(p); }`): the test reads it, the body's first statement reads it again (MWCC
+            // CSEs the two reads, nothing runs in between)
+            let all_in_loop = defs.iter().all(|(v, _)| {
+                let mut n = in_cond(*v, l);
+                for &b in &lp.body {
+                    if b == h {
+                        continue;
+                    }
+                    let bo = &l.blocks_out[b];
+                    let mut items: Vec<Stmt> = bo.stmts.clone();
+                    if let Some(c) = &bo.cond {
+                        items.push(Stmt::Expr(c.clone()));
+                    }
+                    if let Some(r) = &bo.ret {
+                        items.push(Stmt::Return(Some(r.clone())));
+                    }
+                    let mut m: HashMap<VarId, usize> = HashMap::new();
+                    inline::count_uses(&items, &mut m);
+                    n += m.get(v).copied().unwrap_or(0);
+                }
+                n == uses.get(v).copied().unwrap_or(0) && in_cond(*v, l) > 0
+            });
+            if !all_in_loop {
+                continue;
+            }
+            for (v, e) in &defs {
+                let sub = |x: &mut Expr| {
+                    if matches!(x, Expr::Var(y) if *y == *v) {
+                        *x = e.clone();
+                    }
+                };
+                if let Some(c) = l.blocks_out[h].cond.as_mut() {
+                    c.rewrite(&mut { sub });
+                }
+            }
+            let moved = std::mem::take(&mut l.blocks_out[h].stmts);
+            let rest = std::mem::take(&mut l.blocks_out[body].stmts);
+            l.blocks_out[body].stmts = moved.into_iter().chain(rest).collect();
             continue;
         }
         for (v, e) in &defs {
@@ -450,6 +549,12 @@ fn rematerialize_loop_headers(l: &mut Lifter) {
             Stmt::rewrite_exprs(&mut l.blocks_out[body].stmts, &mut { sub });
             if let Some(c) = l.blocks_out[body].cond.as_mut() {
                 c.rewrite(&mut { sub });
+            }
+            for &u in &used_deeper {
+                Stmt::rewrite_exprs(&mut l.blocks_out[u].stmts, &mut { sub });
+                if let Some(c) = l.blocks_out[u].cond.as_mut() {
+                    c.rewrite(&mut { sub });
+                }
             }
             if use_out {
                 Stmt::rewrite_exprs(&mut l.blocks_out[out].stmts, &mut { sub });
@@ -507,7 +612,13 @@ fn early_returns(l: &mut Lifter) {
         // `if (c) return x;` with x already in place: a branch over an empty block that only
         // jumps to the return block (`bge skip; b epilogue`). Not in void functions, where such
         // blocks are mostly switch-tree leaves (`bge case; b end`) and breaks.
-        let has_value = l.blocks_out[r].ret.is_some();
+        // the value already in place: the block is only the epilogue (its own computations
+        // folded into the returned expression don't count)
+        let only_epilogue = {
+            let blk = &l.cfg.blocks[r];
+            (blk.start..blk.end).all(|k| l.frame.skip.contains(&k) || l.insns[k].is_blr())
+        };
+        let has_value = l.blocks_out[r].ret.is_some() && only_epilogue;
         let bare: Vec<usize> = if !has_value { vec![] } else { l.cfg.blocks[r]
             .preds
             .iter()
@@ -554,6 +665,10 @@ fn early_returns(l: &mut Lifter) {
             let cont = match l.cfg.blocks[p].preds.as_slice() {
                 [c] => match l.cfg.blocks[*c].term {
                     cfg::Term::Cond { taken, fall } if fall == p && taken != p => taken,
+                    // a returning arm the test jumps forward to, over the other arm: the source
+                    // had the other arm first (`if (!c) { B } else { A; return x; }`), the two
+                    // meet at the shared tail
+                    cfg::Term::Cond { taken, fall } if taken == p && fall != p && l.cfg.blocks[p].start > l.cfg.blocks[fall].start => tail,
                     cfg::Term::Cond { taken, fall } if taken == p && fall != p => fall,
                     _ => tail,
                 },
@@ -561,6 +676,62 @@ fn early_returns(l: &mut Lifter) {
             };
             make_return_at(l, p, cont);
         }
+    }
+    shared_return_tail(l);
+    cond_returns_to_epilogue(l);
+}
+
+/// Void functions: a test branching straight to the epilogue is `if (c) return;` when, as an
+/// edge, it would make the epilogue the join of an enclosing test whose arms otherwise meet
+/// earlier (`if (a) { if (c) return; x = 1; } f();`, the two ways into `f()` shared).
+fn cond_returns_to_epilogue(l: &mut Lifter) {
+    if !matches!(strip_cv(&l.ret_ty), mwdec_core::Type::Void) {
+        return;
+    }
+    let nb = l.cfg.blocks.len();
+    let ends: Vec<usize> = (0..nb)
+        .filter(|&b| matches!(l.cfg.blocks[b].term, cfg::Term::Return) && l.blocks_out[b].stmts.is_empty() && l.cfg.blocks[b].preds.len() >= 2 && !l.cfg.pd_extra.iter().any(|e| e.0 == b))
+        .collect();
+    let [end] = ends.as_slice() else { return };
+    let end = *end;
+    let exit = l.cfg.exit();
+    let cands: Vec<usize> = l.cfg.blocks[end].preds.iter().copied().filter(|&c| matches!(l.cfg.blocks[c].term, cfg::Term::Cond { taken, fall } if taken == end && fall != end)).collect();
+    for c in cands {
+        let mut trial = l.cfg.clone();
+        trial.make_cond_return(c);
+        let opens = (0..nb).any(|x| x != c && l.cfg.idom[x] != usize::MAX && l.cfg.ipdom[x] == end && trial.ipdom[x] != end && trial.ipdom[x] != exit && trial.ipdom[x] != usize::MAX);
+        if opens {
+            l.cfg = trial;
+        }
+    }
+}
+
+/// Leaf functions return with a `blr` per `return` statement, the function's last return laid
+/// out at the end. When that last return block is shared by several paths (`if (p && i < n)
+/// return &a[i]; return 0;`), the earlier return blocks are early returns continuing (for
+/// structuring) at their guard's other arm, so the shared tail becomes the join instead of a
+/// copy in every arm.
+fn shared_return_tail(l: &mut Lifter) {
+    let nb = l.cfg.blocks.len();
+    let Some(last) = (0..nb).filter(|&b| l.cfg.idom[b] != usize::MAX).max_by_key(|&b| l.cfg.blocks[b].start) else { return };
+    if !matches!(l.cfg.blocks[last].term, cfg::Term::Return) || l.cfg.blocks[last].preds.len() < 2 || l.cfg.pd_extra.iter().any(|e| e.0 == last) {
+        return;
+    }
+    let mut todo: Vec<(usize, usize)> = vec![];
+    for p in 0..nb {
+        if p == last || !matches!(l.cfg.blocks[p].term, cfg::Term::Return) || l.cfg.pd_extra.iter().any(|e| e.0 == p) {
+            continue;
+        }
+        let [c] = l.cfg.blocks[p].preds.as_slice() else { continue };
+        let cont = match l.cfg.blocks[*c].term {
+            cfg::Term::Cond { taken, fall } if fall == p && taken != p => taken,
+            cfg::Term::Cond { taken, fall } if taken == p && fall != p => fall,
+            _ => continue,
+        };
+        todo.push((p, cont));
+    }
+    for (p, cont) in todo {
+        make_return_at(l, p, cont);
     }
 }
 
@@ -671,7 +842,15 @@ fn loop_returns(l: &mut Lifter) {
         let [c] = l.cfg.blocks[p].preds.as_slice() else { continue };
         let c = *c;
         let Some(lp) = loops.iter().filter(|lp| lp.body.contains(&c)).max_by_key(|lp| lp.body.len()) else { continue };
-        if c == lp.header || lp.latches.contains(&c) {
+        // a CTR loop's `bdnz` latch is its test: a return from the header is an early return
+        let ctr_latch = lp.latches.iter().any(|&lt| {
+            let mut ctr = false;
+            if let Some(cond) = &l.blocks_out[lt].cond {
+                cond.walk(&mut |e| ctr |= matches!(e, Expr::Var(v) if l.vars[*v].name.starts_with("var_ctr")));
+            }
+            ctr
+        });
+        if (c == lp.header && !ctr_latch) || lp.latches.contains(&c) {
             continue;
         }
         let cont = match l.cfg.blocks[c].term {

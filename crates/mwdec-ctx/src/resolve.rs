@@ -762,7 +762,11 @@ fn subst_rec(db: &TypeDb, t: &Type, bind: &HashMap<String, (Type, String)>, inj:
                 return rec(td);
             }
             if n.contains('<') {
-                return Type::Named(normalize_instance(db, &subst_text(n, bind)));
+                let mut x = subst_text(n, bind);
+                if let Some((base, inst)) = inj {
+                    x = subst_injected(&x, base, inst);
+                }
+                return Type::Named(normalize_instance(db, &x));
             }
             t.clone()
         }
@@ -781,6 +785,33 @@ fn subst_rec(db: &TypeDb, t: &Type, bind: &HashMap<String, (Type, String)>, inj:
         }
         _ => t.clone(),
     }
+}
+
+/// The injected class name used as a template argument inside its own template
+/// (`const_linear_iterator<T, basic_string, A>`) -> the instance being instantiated.
+fn subst_injected(text: &str, base: &str, inst: &str) -> String {
+    let last = base.rsplit("::").next().unwrap_or(base);
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b':';
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        if !ident(b[i]) {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        let j = (i..b.len()).find(|&k| !ident(b[k])).unwrap_or(b.len());
+        let tok = &text[i..j];
+        let next = text[j..].trim_start().chars().next();
+        if (tok == last || tok == base) && next != Some('<') && i > 0 {
+            out.push_str(inst);
+        } else {
+            out.push_str(tok);
+        }
+        i = j;
+    }
+    out
 }
 
 /// Does a type still mention an unbound template parameter (or unresolved template member)?

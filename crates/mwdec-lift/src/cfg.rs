@@ -223,6 +223,20 @@ impl Cfg {
         self.compute_orders();
     }
 
+    /// Turn block `b`'s conditional branch into a conditional return (`if (c) return;` branching
+    /// straight to the epilogue), and recompute the orders and (post-)dominators.
+    pub fn make_cond_return(&mut self, b: usize) {
+        if let Term::Cond { taken, fall } = self.blocks[b].term {
+            if taken == fall {
+                return;
+            }
+            self.blocks[b].succs.retain(|&s| s != taken);
+            self.blocks[taken].preds.retain(|&p| p != b);
+            self.blocks[b].term = Term::CondReturn { fall };
+            self.compute_orders();
+        }
+    }
+
     /// Turn block `b`'s jump into a plain return (the function's last statement).
     pub fn make_return_plain(&mut self, b: usize) {
         for s in std::mem::take(&mut self.blocks[b].succs) {
@@ -293,7 +307,7 @@ impl Cfg {
             rpreds[b].push(s);
         }
         for b in 0..nb {
-            if (self.blocks[b].succs.is_empty() && !self.pd_extra.iter().any(|e| e.0 == b)) || matches!(self.blocks[b].term, Term::CondReturn { .. }) {
+            if self.blocks[b].succs.is_empty() && !self.pd_extra.iter().any(|e| e.0 == b) {
                 rsuccs[exit].push(b);
                 rpreds[b].push(exit);
             }

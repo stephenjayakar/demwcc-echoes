@@ -229,10 +229,13 @@ enum Cmd {
         /// Output JSONL path (default $MWDEC_WORK_BASE/eval/eval_<split>_...jsonl).
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Also evaluate functions that can't exist as standalone source (compiler-generated
-        /// special members, header-defined template members); default: an `impl` column.
-        #[arg(long)]
+        /// Accepted for compatibility: functions the compiler emits on demand (header inlines,
+        /// template instances, implicit special members) are evaluated by default.
+        #[arg(long, hide = true)]
         include_implicit: bool,
+        /// Leave header inlines / template instances / implicit members out (own columns).
+        #[arg(long)]
+        exclude_implicit: bool,
         /// Search without diff localisation (focus / schedcheck moves).
         #[arg(long)]
         no_locate: bool,
@@ -308,11 +311,11 @@ fn real_main() -> Result<()> {
             }
             harvest::cmd_verify_units(&root, &units)
         }
-        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, mem_report, list } => {
+        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, exclude_implicit, mem_report, list } => {
             search_cmds::cmd_eval(
                 &root,
                 &cli.work.clone().unwrap_or_else(search_cmds::search_work),
-                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, mem_report, list },
+                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit: include_implicit || !exclude_implicit, mem_report, list },
             )
         }
     }

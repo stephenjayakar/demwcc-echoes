@@ -186,7 +186,7 @@ pub fn matches(ops: &[Op], items: &[(u32, TItem)], addr: &dyn Fn(Lab) -> Option<
             }
         }
     };
-    for op in ops {
+    for (oi, op) in ops.iter().enumerate() {
         match *op {
             Op::Def(l) => {
                 let Some(&(off, _)) = items.get(p) else { return false };
@@ -220,7 +220,17 @@ pub fn matches(ops: &[Op], items: &[(u32, TItem)], addr: &dyn Fn(Lab) -> Option<
                 p += 1;
             }
             Op::B(l) => {
-                let Some(&(off, TItem::B(a))) = items.get(p) else { return false };
+                let Some(&(off, TItem::B(a))) = items.get(p) else {
+                    // the tree's last jump goes to the case body laid out right after it: no `b`
+                    // (not in a one-compare tree: that is an `if`)
+                    let last = ops[oi + 1..].iter().all(|o| matches!(o, Op::Def(_))) && ops.iter().filter(|o| matches!(o, Op::Cmp(_))).count() >= 2;
+                    if let (true, Some(o)) = (last, prev_off) {
+                        if bind(l, o + 4, &mut map) {
+                            continue;
+                        }
+                    }
+                    return false;
+                };
                 if !bind(l, a, &mut map) {
                     return false;
                 }

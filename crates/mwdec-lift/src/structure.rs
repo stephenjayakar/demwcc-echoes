@@ -198,8 +198,26 @@ impl<'a> Structurer<'a> {
                     cur = taken
                 }
                 Term::Cond { .. } => {
+                    if let Some(next) = self.one_case_switch(cur, out) {
+                        match next {
+                            Some(j) => {
+                                cur = j;
+                                continue;
+                            }
+                            None => return,
+                        }
+                    }
+                    if let Some(next) = self.bool_region(cur, out) {
+                        match next {
+                            Some(j) => {
+                                cur = j;
+                                continue;
+                            }
+                            None => return,
+                        }
+                    }
                     let join = self.join_of(cur);
-                    if let Some((e, cases, default, nodes)) = self.case_tree(cur).or_else(|| self.guarded_table(cur)) {
+                    if let Some((e, cases, default, nodes))= self.case_tree(cur).or_else(|| self.guarded_table(cur)) {
                         for n in &nodes {
                             self.emitted[*n] = true;
                         }
@@ -221,6 +239,24 @@ impl<'a> Structurer<'a> {
                     }
                 }
                 Term::CondReturn { fall } => {
+                    if let Some(next) = self.one_case_switch(cur, out) {
+                        match next {
+                            Some(j) => {
+                                cur = j;
+                                continue;
+                            }
+                            None => return,
+                        }
+                    }
+                    if let Some(next) = self.bool_region(cur, out) {
+                        match next {
+                            Some(j) => {
+                                cur = j;
+                                continue;
+                            }
+                            None => return,
+                        }
+                    }
                     let c = self.cond_of(cur);
                     let r = self.blocks[cur].ret.clone();
                     // `cmplwi x, N ; bgtlr` guarding a jump table whose switch ends the function:
@@ -238,7 +274,7 @@ impl<'a> Structurer<'a> {
                     // `li r3,A ; b<c>lr ; li r3,B ; blr` is MWCC's select layout for `return !c ?
                     // B : A` (the else value is loaded first); `if (c) return A; return B;`
                     // would load B first
-                    let tail = (fall < self.cfg.blocks.len() && matches!(self.cfg.blocks[fall].term, Term::Return) && !self.has_stmts(fall) && !self.emitted[fall])
+                    let tail = (fall < self.cfg.blocks.len() && matches!(self.cfg.blocks[fall].term, Term::Return) && !self.has_stmts(fall) && !self.emitted[fall] && self.cfg.blocks[fall].preds.len() == 1)
                         .then(|| self.blocks[fall].ret.clone())
                         .flatten();
                     if let (Some(a), Some(b), false) = (r.clone(), tail, self.ret_void) {
@@ -291,6 +327,298 @@ impl<'a> Structurer<'a> {
             }
         }
         true
+    }
+
+    /// A `&&`/`||` chain in value context (MWCC's `gen_LOGICAL`: `li r,0; cmp; b..; cmp; b..;
+    /// li r,1`): a single-entry DAG of tests from `s` whose exits only produce the constants 0
+    /// and 1, either as returns (`li r3,0; ...; bnelr; li r3,1; blr`) or into a variable that
+    /// was 0 before the first test (`v = 0; ...; v = 1; J:`). Emits `return a && b;` /
+    /// `v = a && b;` (statements already pushed for `s` are in `out`). A branch-context chain
+    /// (`if (a || b) v = 1;`) is not the same code: MWCC turns `==` chains into range tests
+    /// there. Returns the block to continue at (None: the region returned).
+    fn bool_region(&mut self, s: usize, out: &mut Vec<Stmt>) -> Option<Option<usize>> {
+        const T: usize = usize::MAX - 1;
+        const F: usize = usize::MAX - 2;
+        let nblocks = self.cfg.blocks.len();
+        let edges_of = |me: &Self, b: usize| -> Option<(usize, Option<usize>)> {
+            // (fallthrough or taken target, taken target if a block): CondReturn has no taken block
+            match me.cfg.blocks[b].term {
+                Term::Cond { taken, fall } if taken != fall => Some((fall, Some(taken))),
+                Term::CondReturn { fall } => Some((fall, None)),
+                _ => None,
+            }
+        };
+        edges_of(self, s)?;
+        if self.loops.contains_key(&s) {
+            return None;
+        }
+        // statements a test may carry: definitions of temps only read by later tests
+        let temp_defs = |me: &Self, b: usize| -> Option<Vec<(VarId, Expr)>> {
+            let mut defs = vec![];
+            for st in &me.blocks[b].stmts {
+                match st {
+                    Stmt::Label(_) | Stmt::Comment(_) => {}
+                    Stmt::Assign { dst: Expr::Var(v), src } if !src.has_call() && !matches!(me.vars[*v].kind, VarKind::Param { .. } | VarKind::This) => defs.push((*v, src.clone())),
+                    _ => return None,
+                }
+            }
+            Some(defs)
+        };
+        let mut set: Vec<usize> = vec![s];
+        loop {
+            let mut grew = false;
+            let mut cands: Vec<usize> = vec![];
+            for &n in &set {
+                let (f, t) = edges_of(self, n).unwrap();
+                cands.push(f);
+                if let Some(t) = t {
+                    cands.push(t);
+                }
+            }
+            cands.sort_by_key(|&b| if b < nblocks { self.cfg.blocks[b].start } else { usize::MAX });
+            for x in cands {
+                if x >= nblocks || set.contains(&x) || x == self.exit_node() || self.emitted[x] || self.loops.contains_key(&x) {
+                    continue;
+                }
+                if edges_of(self, x).is_none() || temp_defs(self, x).is_none() || !self.cfg.blocks[x].preds.iter().all(|p| set.contains(p)) {
+                    continue;
+                }
+                if self.stack.last().map_or(false, |c| x == c.header || Some(x) == c.exit) {
+                    continue;
+                }
+                set.push(x);
+                grew = true;
+            }
+            if !grew {
+                break;
+            }
+        }
+        if set.len() < 2 || set.len() > 16 {
+            return None;
+        }
+        // classify the exits
+        let const_ret = |me: &Self, b: usize| -> Option<i64> {
+            if b < nblocks && matches!(me.cfg.blocks[b].term, Term::Return) && !me.has_stmts(b) {
+                return me.blocks[b].ret.as_ref()?.as_int();
+            }
+            None
+        };
+        // (var, value, join) of a block that only sets a variable to a constant
+        let set_block = |me: &Self, b: usize| -> Option<(VarId, i64, usize)> {
+            if b >= nblocks || me.emitted[b] {
+                return None;
+            }
+            let st: Vec<&Stmt> = me.blocks[b].stmts.iter().filter(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))).collect();
+            let [Stmt::Assign { dst: Expr::Var(v), src }] = st.as_slice() else { return None };
+            let k = src.as_int()?;
+            match me.cfg.blocks[b].term {
+                Term::Fall(j) | Term::Jump(j) => Some((*v, k, j)),
+                _ => None,
+            }
+        };
+        #[derive(Clone, Copy, PartialEq)]
+        enum Exit {
+            Val(i64),
+            Set(VarId, i64, usize, usize),
+            Join(usize),
+        }
+        let mut exits: Vec<(usize, Exit)> = vec![];
+        for &n in &set {
+            let (f, t) = edges_of(self, n).unwrap();
+            let mut targets = vec![f];
+            match t {
+                Some(t) => targets.push(t),
+                None => {
+                    // CondReturn: the returned value must be a constant
+                    let k = self.blocks[n].ret.as_ref()?.as_int()?;
+                    exits.push((usize::MAX, Exit::Val(k)));
+                }
+            }
+            for x in targets {
+                if set.contains(&x) || exits.iter().any(|(b, _)| *b == x) {
+                    continue;
+                }
+                let e = if let Some(k) = const_ret(self, x) {
+                    Exit::Val(k)
+                } else if let Some((v, k, j)) = set_block(self, x) {
+                    Exit::Set(v, k, j, x)
+                } else {
+                    Exit::Join(x)
+                };
+                exits.push((x, e));
+            }
+        }
+        // variant 1: every exit returns a constant 0/1, both values present
+        let vals: Vec<i64> = exits.iter().filter_map(|(_, e)| if let Exit::Val(k) = e { Some(*k) } else { None }).collect();
+        let mut map: HashMap<usize, usize> = HashMap::new();
+        let mut cr_val: Option<usize> = None;
+        let variant;
+        if vals.len() == exits.len() {
+            // MWCC loads 0 before the tests (the conditional returns: `bnelr`), 1 is set in a
+            // single shared return block (`li r3,1; blr`); two plain
+            // return blocks are an if/else of returns, not a value chain
+            let cr: Vec<i64> = exits.iter().filter(|(b, _)| *b == usize::MAX).filter_map(|(_, e)| if let Exit::Val(k) = e { Some(*k) } else { None }).collect();
+            let rb: Vec<(usize, i64)> = exits.iter().filter(|(b, _)| *b != usize::MAX).filter_map(|(b, e)| if let Exit::Val(k) = e { Some((*b, *k)) } else { None }).collect();
+            if cr.is_empty() || rb.len() != 1 || cr.iter().any(|&k| k != 0) || rb[0].1 != 1 {
+                return None;
+            }
+            cr_val = Some(if cr[0] != 0 { T } else { F });
+            map.insert(rb[0].0, if rb[0].1 != 0 { T } else { F });
+            variant = 1;
+        } else {
+            // variant 2: exits are one `v = k` block and its join, v held the other value before
+            let sets: Vec<(VarId, i64, usize, usize)> = exits.iter().filter_map(|(_, e)| if let Exit::Set(v, k, j, b) = e { Some((*v, *k, *j, *b)) } else { None }).collect();
+            let [(v, k, j, sb)] = sets.as_slice() else { return None };
+            if *k != 1 || exits.len() != 2 || !exits.iter().any(|(_, e)| *e == Exit::Join(*j)) {
+                return None;
+            }
+            if self.cfg.blocks[*sb].preds.iter().any(|p| !set.contains(p)) {
+                return None;
+            }
+            // the value before the tests: the last assignment to v in s's statements
+            let pre = self.blocks[s].stmts.iter().rev().find_map(|st| match st {
+                Stmt::Assign { dst: Expr::Var(x), src } if x == v => Some(src.as_int()),
+                _ => None,
+            })??;
+            if pre != 1 - *k {
+                return None;
+            }
+            map.insert(*sb, if *k != 0 { T } else { F });
+            map.insert(*j, if *k != 0 { F } else { T });
+            variant = 2;
+        }
+        // temps defined in tests after the first: substituted into the later tests when nothing
+        // else reads them
+        let mut subst: Vec<(VarId, Expr)> = vec![];
+        for &n in &set[1..] {
+            for (v, src) in temp_defs(self, n).unwrap() {
+                subst.push((v, src));
+            }
+        }
+        for (v, _) in &subst {
+            if self.var_read_outside(*v, &set) {
+                return None;
+            }
+        }
+        let mut edges: Vec<(usize, Expr, usize, usize)> = vec![];
+        let resolve = |x: usize| -> usize { map.get(&x).copied().unwrap_or(x) };
+        for &n in &set {
+            let mut c = self.cond_of(n);
+            for (v, src) in subst.iter().rev() {
+                c.rewrite(&mut |e| {
+                    if matches!(e, Expr::Var(x) if x == v) {
+                        *e = src.clone();
+                    }
+                });
+            }
+            let (f, t) = edges_of(self, n).unwrap();
+            let t = match t {
+                Some(t) => resolve(t),
+                None => cr_val?,
+            };
+            edges.push((n, c, t, resolve(f)));
+        }
+        if edges.iter().any(|(_, _, t, f)| (*t != T && *t != F && !set.contains(t)) || (*f != T && *f != F && !set.contains(f))) {
+            return None;
+        }
+        let (c, t, _) = reduce_cond_dag(edges, s, self.vars)?;
+        let cond = if t == T { c } else { c.negate(self.vars) };
+        for &n in &set {
+            self.emitted[n] = true;
+        }
+        if variant == 1 {
+            for b in map.keys() {
+                // a shared `return 1;` may be the target of other code too: only drop it when the
+                // region is its only way in
+                if self.cfg.blocks[*b].preds.iter().all(|p| set.contains(p)) {
+                    self.emitted[*b] = true;
+                }
+            }
+            out.push(Stmt::Return(Some(cond)));
+            return Some(None);
+        }
+        let (v, sb, j) = exits
+            .iter()
+            .find_map(|(_, e)| if let Exit::Set(v, _, j, b) = e { Some((*v, *b, *j)) } else { None })
+            .unwrap();
+        self.emitted[sb] = true;
+        // drop the preload pushed with s's statements
+        if let Some(i) = out.iter().rposition(|st| matches!(st, Stmt::Assign { dst: Expr::Var(x), src } if *x == v && src.as_int().is_some())) {
+            out.remove(i);
+        }
+        out.push(Stmt::Assign { dst: Expr::Var(v), src: cond });
+        Some(Some(j))
+    }
+
+    /// `lis rT, hi; addi rT, rT, lo; cmpw x, rT; bne end`: an equality test against a constant
+    /// beyond 16 bits built in a register is MWCC's single-label switch (an `if` compares such a
+    /// constant with `subis; cmplwi`).
+    fn one_case_switch(&mut self, b: usize, out: &mut Vec<Stmt>) -> Option<Option<usize>> {
+        use ppc750cl::Opcode;
+        if self.insns.is_empty() || self.loops.contains_key(&b) {
+            return None;
+        }
+        let blk = &self.cfg.blocks[b];
+        let last = blk.end.checked_sub(1)?;
+        let br = &self.insns[last];
+        if !(br.is_cond_branch() || matches!(br.op(), Opcode::Bclr)) || br.ins.field_bi() != 2 {
+            return None;
+        }
+        let ci = (blk.start..last).rev().find(|&k| matches!(self.insns[k].op(), Opcode::Cmpi | Opcode::Cmpli | Opcode::Cmp | Opcode::Cmpl))?;
+        let ins = &self.insns[ci];
+        if ins.op() != Opcode::Cmp || ins.ins.field_crfd() != 0 {
+            return None;
+        }
+        let k = reg_const(self.insns, ci, ins.rb(), 0)?;
+        if (-0x8000..0x8000).contains(&k) {
+            return None;
+        }
+        let c = self.blocks[b].cond.clone()?;
+        let Expr::Binary { op, l, r, .. } = &c else { return None };
+        if r.as_int() != Some(k) {
+            return None;
+        }
+        let sel = strip_casts((**l).clone());
+        let (case, end) = match (self.cfg.blocks[b].term.clone(), *op) {
+            (Term::Cond { taken, fall }, BinOp::Ne) => (fall, Some(taken)),
+            (Term::Cond { taken, fall }, BinOp::Eq) => (taken, Some(fall)),
+            (Term::CondReturn { fall }, BinOp::Ne) if self.ret_void => (fall, None),
+            _ => return None,
+        };
+        if case >= self.cfg.blocks.len() || self.emitted[case] || self.cfg.blocks[case].preds.len() != 1 {
+            return None;
+        }
+        let end = end.filter(|&e| e != self.exit_node());
+        if let Some(e) = end {
+            if !self.cfg.postdominates(e, case) && self.join_of(b) != Some(e) {
+                return None;
+            }
+        }
+        let stmt = self.build_cases(sel, vec![(vec![k], case)], None, end);
+        out.push(stmt);
+        Some(end)
+    }
+
+    /// Is `v` read anywhere except in the conditions of `region` (its definitions there aside)?
+    fn var_read_outside(&self, v: VarId, region: &[usize]) -> bool {
+        for (b, bo) in self.blocks.iter().enumerate() {
+            let mut found = false;
+            for st in &bo.stmts {
+                match st {
+                    Stmt::Assign { dst: Expr::Var(x), src } if *x == v => found |= src.uses_var(v),
+                    _ => Stmt::walk_exprs(std::slice::from_ref(st), &mut |e| found |= matches!(e, Expr::Var(x) if *x == v)),
+                }
+            }
+            if !region.contains(&b) {
+                found |= bo.cond.as_ref().map_or(false, |c| c.uses_var(v));
+            }
+            found |= bo.ret.as_ref().map_or(false, |c| c.uses_var(v));
+            found |= bo.switch.as_ref().map_or(false, |c| c.uses_var(v));
+            if found {
+                return true;
+            }
+        }
+        false
     }
 
     /// A block that is just `return x;` (possibly with an epilogue) can be duplicated.
@@ -494,7 +822,20 @@ impl<'a> Structurer<'a> {
                 _ => None,
             }
         };
-        if let Some(c) = test_exit(h, self).or_else(|| l.latches.iter().find_map(|&lt| test_exit(lt, self))) {
+        // a CTR loop's `bdnz` latch is the loop test; a test in the body leaving the loop is an
+        // early exit (`for (...) { if (a[i] == x) return i; }`)
+        let ctr_latch = l.latches.iter().copied().find(|&lt| {
+            let mut ctr = false;
+            if let Some(c) = &self.blocks[lt].cond {
+                c.walk(&mut |e| ctr |= matches!(e, Expr::Var(v) if self.vars[*v].name.starts_with("var_ctr")));
+            }
+            ctr && test_exit(lt, self).is_some()
+        });
+        let first_exit = match ctr_latch {
+            Some(lt) => test_exit(lt, self),
+            None => test_exit(h, self).or_else(|| l.latches.iter().find_map(|&lt| test_exit(lt, self))),
+        };
+        if let Some(c) = first_exit {
             let exit_returns = exit.map_or(true, |x| self.only_returns(x, &l.body));
             if Some(c) != exit && exit_returns && c != self.exit_node() {
                 let others_return = l.body.iter().all(|&b| self.cfg.blocks[b].succs.iter().all(|&s| l.body.contains(&s) || s == c || self.only_returns(s, &l.body)));
@@ -527,7 +868,10 @@ impl<'a> Structurer<'a> {
                 };
                 chain.push(cur);
                 conds.push(stay);
+                // MWCC lays the tests of `while (a && b)` out in order: each one falls into the
+                // next (a test that branches back to the body top is the body's own `if`)
                 let more = next != h
+                    && next == f
                     && self.cond_edges(next).map_or(false, |(t2, f2)| t2 == x || f2 == x)
                     && !self.has_stmts(next)
                     && self.cfg.blocks[next].preds.iter().all(|p| chain.contains(p))
@@ -572,12 +916,19 @@ impl<'a> Structurer<'a> {
                 None
             }
         });
+        // the test at the top and an unconditional back edge: `for (;;) { if (!c) break; ... }`
+        // (MWCC moves a `while`'s test to the bottom)
+        let top_test = l.body.iter().all(|&b| self.cfg.blocks[b].start >= self.cfg.blocks[h].start)
+            && l.latches.iter().all(|&lt| matches!(self.cfg.blocks[lt].term, Term::Jump(t) if t == h));
         if let Some((cond, body_start)) = a {
             self.emitted[h] = true;
             let mut body = vec![Stmt::Label(h)];
+            if top_test {
+                body.push(Stmt::If { cond: cond.clone().negate(self.vars), then: vec![Stmt::Break], els: vec![] });
+            }
             self.build(body_start, Some(h), false, &mut body);
             strip_trailing_continue(&mut body);
-            stmt = Stmt::While { cond, body };
+            stmt = if top_test { Stmt::While { cond: Expr::Int { value: 1, ty: mwdec_core::Type::Bool }, body } } else { Stmt::While { cond, body } };
         } else if let Some((lt, cond)) = b {
             let mut body = vec![];
             if lt == h {
@@ -840,30 +1191,6 @@ impl<'a> Structurer<'a> {
             return TreeCheck::Unknown;
         };
         let ins = &self.insns[ci];
-        // `lis rT, hi; [addi|ori rT, rX, lo]; cmpw x, rT` for constants beyond 16 bits (the
-        // `lis` may be shared: `addi r0, r4, 4`)
-        fn reg_const(insns: &[Insn], k: usize, r: u8, depth: u32) -> Option<i64> {
-            if depth > 4 {
-                return None;
-            }
-            let lo_bound = k.saturating_sub(48);
-            let mut j = k;
-            while j > lo_bound {
-                j -= 1;
-                let q = &insns[j];
-                if !crate::insn::defs_uses(q).0.contains(&crate::insn::gpr(r)) {
-                    continue;
-                }
-                return match q.op() {
-                    ppc750cl::Opcode::Addis if q.ra() == 0 => Some(((q.simm() as i64) << 16) as i32 as i64),
-                    ppc750cl::Opcode::Addi if q.ra() == 0 => Some(q.simm() as i64),
-                    ppc750cl::Opcode::Addi => Some((reg_const(insns, j, q.ra(), depth + 1)? + q.simm() as i64) as i32 as i64),
-                    ppc750cl::Opcode::Ori if q.ra() == r => Some(reg_const(insns, j, q.rs(), depth + 1)? | q.uimm() as i64),
-                    _ => None,
-                };
-            }
-            None
-        }
         let reg_const = |k: usize, r: u8| reg_const(self.insns, k, r, 0);
         let sel: Vec<u8> = if is_rec(ci) {
             vec![ins.ra(), ins.rs()]
@@ -1016,6 +1343,77 @@ impl<'a> Structurer<'a> {
 
 }
 
+/// `lis rT, hi; [addi|ori rT, rX, lo]; cmpw x, rT` for constants beyond 16 bits (the
+/// `lis` may be shared: `addi r0, r4, 4`)
+fn reg_const(insns: &[Insn], k: usize, r: u8, depth: u32) -> Option<i64> {
+    if depth > 4 {
+        return None;
+    }
+    let lo_bound = k.saturating_sub(48);
+    let mut j = k;
+    while j > lo_bound {
+        j -= 1;
+        let q = &insns[j];
+        if !crate::insn::defs_uses(q).0.contains(&crate::insn::gpr(r)) {
+            continue;
+        }
+        return match q.op() {
+            ppc750cl::Opcode::Addis if q.ra() == 0 => Some(((q.simm() as i64) << 16) as i32 as i64),
+            ppc750cl::Opcode::Addi if q.ra() == 0 => Some(q.simm() as i64),
+            ppc750cl::Opcode::Addi => Some((reg_const(insns, j, q.ra(), depth + 1)? + q.simm() as i64) as i32 as i64),
+            ppc750cl::Opcode::Ori if q.ra() == r => Some(reg_const(insns, j, q.rs(), depth + 1)? | q.uimm() as i64),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// m2c's reduction of a DAG of tests `(node, cond for taken, taken, fall)` rooted at `root` into
+/// one `&&`/`||` condition: (cond for taken, taken, fall) over the non-node targets.
+fn reduce_cond_dag(mut edges: Vec<(usize, Expr, usize, usize)>, root: usize, vars: &[Var]) -> Option<(Expr, usize, usize)> {
+    loop {
+        let mut did = false;
+        for ci in 0..edges.len() {
+            let child = edges[ci].0;
+            if child == root {
+                continue;
+            }
+            let parents: Vec<usize> = (0..edges.len()).filter(|&p| edges[p].2 == child || edges[p].3 == child).collect();
+            if parents.len() != 1 {
+                continue;
+            }
+            let pi = parents[0];
+            let (_, ref pc, pt, pf) = edges[pi];
+            let (_, ref cc, ct, cf) = edges[ci];
+            let (nc, nt, nf) = if pt == ct && pf == child {
+                (Expr::cmp(BinOp::LogOr, pc.clone(), cc.clone()), pt, cf)
+            } else if pt == cf && pf == child {
+                (Expr::cmp(BinOp::LogOr, pc.clone(), cc.clone().negate(vars)), pt, ct)
+            } else if pt == child && pf == ct {
+                (Expr::cmp(BinOp::LogAnd, pc.clone(), cc.clone().negate(vars)), cf, pf)
+            } else if pt == child && pf == cf {
+                (Expr::cmp(BinOp::LogAnd, pc.clone(), cc.clone()), ct, pf)
+            } else {
+                continue;
+            };
+            edges[pi].1 = nc;
+            edges[pi].2 = nt;
+            edges[pi].3 = nf;
+            edges.remove(ci);
+            did = true;
+            break;
+        }
+        if !did {
+            break;
+        }
+    }
+    if edges.len() != 1 || edges[0].0 != root {
+        return None;
+    }
+    let (_, c, t, f) = edges.remove(0);
+    Some((c, t, f))
+}
+
 /// A statement list that only assigns one variable, possibly through an if/else whose arms both
 /// assign it: (variable, value as a (nested) ternary).
 fn ternary_assign(stmts: &[Stmt]) -> Option<(VarId, Expr)> {
@@ -1067,6 +1465,10 @@ fn diverges(b: &[Stmt]) -> bool {
     match b.iter().rev().find(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))) {
         Some(Stmt::Return(_) | Stmt::Goto(_) | Stmt::Break | Stmt::Continue) => true,
         Some(Stmt::If { then, els, .. }) => !then.is_empty() && !els.is_empty() && diverges(then) && diverges(els),
+        // every case (default included) leaves; a `break` leaves only the switch
+        Some(Stmt::Switch { cases, .. }) => {
+            cases.iter().any(|c| c.is_default) && cases.iter().all(|c| diverges(&c.body) && !matches!(c.body.iter().rev().find(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))), Some(Stmt::Break)))
+        }
         _ => false,
     }
 }
@@ -1075,4 +1477,56 @@ fn strip_trailing_continue(body: &mut Vec<Stmt>) {
     while matches!(body.last(), Some(Stmt::Continue)) {
         body.pop();
     }
+}
+
+/// MWCC swaps the arms of `if (!x) return a; return b;` (each arm a single return) into `if (x)
+/// return b; return a;`, so a structured `if (!x)` over two returns would lose its layout;
+/// `x == 0` keeps it (that form is not swapped).
+pub fn guard_not_swap(body: &mut Vec<Stmt>) {
+    Stmt::for_each_block_mut(body, &mut |blk| {
+        let real: Vec<usize> = (0..blk.len()).filter(|&i| !matches!(blk[i], Stmt::Label(_) | Stmt::Comment(_))).collect();
+        for (k, &i) in real.iter().enumerate() {
+            let next_ret = real.get(k + 1).map_or(false, |&j| matches!(blk[j], Stmt::Return(Some(_))));
+            let Stmt::If { cond, then, els } = &mut blk[i] else { continue };
+            let single_ret = |v: &Vec<Stmt>| {
+                let r: Vec<&Stmt> = v.iter().filter(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))).collect();
+                matches!(r.as_slice(), [Stmt::Return(Some(_))])
+            };
+            let els_empty = els.iter().all(|s| matches!(s, Stmt::Label(_) | Stmt::Comment(_)));
+            if !single_ret(then) || !(single_ret(els) || (els_empty && next_ret)) {
+                continue;
+            }
+            if let Expr::Unary { op: UnOp::Not, e, .. } = cond {
+                if matches!(**e, Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, .. }) {
+                    continue;
+                }
+                let x = (**e).clone();
+                let zero = Expr::Int { value: 0, ty: t_s32() };
+                *cond = Expr::cmp(BinOp::Eq, x, zero);
+            }
+        }
+    });
+}
+
+/// A loop that only re-tests memory (`while (p->done == 0) {}`) reloads it every iteration in
+/// the target: MWCC would hoist a plain load out of the loop, so the source read is volatile.
+pub fn volatile_spin_loads(body: &mut Vec<Stmt>) {
+    Stmt::for_each_block_mut(body, &mut |blk| {
+        for s in blk.iter_mut() {
+            let (Stmt::While { cond, body } | Stmt::DoWhile { body, cond }) = s else { continue };
+            if body.iter().any(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))) || cond.has_call() {
+                continue;
+            }
+            if matches!(cond, Expr::Int { .. }) {
+                continue;
+            }
+            cond.rewrite(&mut |e| {
+                if let Expr::Load { ty, .. } = e {
+                    if !matches!(ty, mwdec_core::Type::Volatile(_)) {
+                        *ty = mwdec_core::Type::Volatile(Box::new(ty.clone()));
+                    }
+                }
+            });
+        }
+    });
 }

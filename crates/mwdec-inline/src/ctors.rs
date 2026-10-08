@@ -243,6 +243,9 @@ pub fn strip_member_ctor_stores(ir: &mut IrFunction, db: &TypeDb) -> usize {
     // leading member stores: constants by offset (first store wins), other pure stores skipped
     let mut consts: HashMap<i32, (usize, u32, i64)> = HashMap::new();
     for (i, s) in ir.body.iter().enumerate() {
+        if matches!(s, Stmt::Comment(c) if c.starts_with(mwdec_lift::idioms::INIT_MARK)) {
+            continue;
+        }
         let Stmt::Assign { dst, src } = s else { break };
         if src.has_call() {
             break;

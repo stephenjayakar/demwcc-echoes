@@ -321,6 +321,9 @@ pub fn emitted_kind(ui: &UnitInputs, f: &Function) -> Option<String> {
 /// Sources that make the compiler emit `f` (an explicit instantiation or a use; see
 /// `mwdec_emit::instantiate`), for header inlines, template instances and implicit members.
 pub fn instantiation_drafts(ui: &UnitInputs, f: &Function) -> Vec<String> {
+    if let Some(t) = thunk_target(&f.name) {
+        return thunk_drafts(ui, t);
+    }
     let db = ui.db.as_ref();
     let sig = mwdec_lift::sig::sig_of(&f.name, db);
     let is_class = |s: &str| {
@@ -330,7 +333,75 @@ pub fn instantiation_drafts(ui: &UnitInputs, f: &Function) -> Vec<String> {
     if mwdec_lift::sig::demangle(&f.name).is_none() {
         return mwdec_emit::instantiate::triggers_c(&sig);
     }
-    mwdec_emit::instantiate::triggers(&f.name, Some(&sig.ret), &is_class)
+    let t = mwdec_emit::instantiate::triggers(&f.name, Some(&sig.ret), &is_class);
+    // classes the context only declares whose destructor the function calls: a definition with
+    // that destructor declared (`delete p` then calls it instead of freeing directly)
+    let Some(db) = db else { return t };
+    let mut stand_ins = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in f.relocs.iter().filter(|r| r.target.starts_with("__dt__")) {
+        let Some(c) = mwdec_lift::sig::sig_of(&r.target, Some(db)).this_class else { continue };
+        if c.contains('<') || !seen.insert(c.clone()) || mwdec_lift::sig::find_class(db, &c).is_some_and(|k| !k.is_declaration) {
+            continue;
+        }
+        let base = mwdec_lift::sig::split_scope(&c).1.to_string();
+        stand_ins.push_str(&format!("struct {c} {{
+    ~{base}();
+}};
+"));
+    }
+    if stand_ins.is_empty() {
+        return t;
+    }
+    let with: Vec<String> = t.iter().map(|x| format!("{stand_ins}{x}")).collect();
+    t.into_iter().chain(with).collect()
+}
+
+/// `@4@Method__5CFooFv` -> `Method__5CFooFv` (a `this`-adjusting thunk's target).
+fn thunk_target(sym: &str) -> Option<&str> {
+    let r = sym.strip_prefix('@')?;
+    let (d, t) = r.split_once('@')?;
+    (!d.is_empty() && d.chars().all(|c| c.is_ascii_digit())).then_some(t)
+}
+
+/// A `this`-adjusting thunk is emitted with its class's vtable, i.e. in the unit defining the
+/// class's key function (its first non-inline virtual function). The drafts are the class's
+/// virtual functions this object defines, each lifted alone (the destructor first; one of them
+/// is the key function).
+fn thunk_drafts(ui: &UnitInputs, target: &str) -> Vec<String> {
+    let db = ui.db.as_ref();
+    let Some(cls) = mwdec_lift::sig::sig_of(target, db).this_class else { return vec![] };
+    let n = mwdec_lift::sig::norm_name(&cls);
+    let vt: Vec<String> = db.and_then(|d| mwdec_lift::sig::find_class(d, &cls)).map(|c| c.vtable.iter().map(|v| v.symbol.clone()).collect()).unwrap_or_default();
+    let mut cands: Vec<(usize, &Function)> = ui
+        .target
+        .functions
+        .iter()
+        .filter(|g| !g.name.starts_with('@'))
+        .filter_map(|g| {
+            let s = mwdec_lift::sig::sig_of(&g.name, db);
+            if s.this_class.as_deref().map(mwdec_lift::sig::norm_name).as_deref() != Some(n.as_str()) {
+                return None;
+            }
+            if mwdec_lift::sig::is_dtor(&s) {
+                Some((0, g))
+            } else {
+                vt.iter().position(|v| *v == g.name).map(|i| (i + 1, g))
+            }
+        })
+        .collect();
+    cands.sort_by_key(|c| c.0);
+    let mut out = Vec::new();
+    for (k, g) in cands.into_iter().take(6) {
+        out.extend(draft_with(ui, g, false).ok());
+        if k == 0 {
+            // (a destructor whose draft doesn't compile: the definition alone still emits the vtable)
+            let base = mwdec_lift::sig::split_scope(&cls).1.split('<').next().unwrap_or("").to_string();
+            out.push(format!("{}::~{base}() {{}}
+", mwdec_emit::types::split_closers(&cls)));
+        }
+    }
+    out
 }
 
 /// Lifted bodies of a function the compiler emits on demand (explicit specializations), each
@@ -416,21 +487,26 @@ pub fn repair_registers(scorer: &Scorer, src: String, tracer: Option<&mwdec_sear
 }
 
 pub fn draft_variant(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool) -> std::result::Result<String, NoDraft> {
-    draft_opts(ui, f, inlines, include_implicit, false, false)
+    draft_opts(ui, f, inlines, include_implicit, false, false, 0)
 }
 
 /// Draft with member accesses as raw offsets (a fallback when field accesses don't compile,
 /// e.g. private members used from a free function).
 pub fn draft_raw(ui: &UnitInputs, f: &Function) -> std::result::Result<String, NoDraft> {
-    draft_opts(ui, f, true, false, true, false)
+    draft_opts(ui, f, true, false, true, false, 0)
 }
 
 /// A static initializer's draft with the globals the context doesn't declare defined `const`.
 pub fn draft_sinit_const(ui: &UnitInputs, f: &Function) -> std::result::Result<String, NoDraft> {
-    draft_opts(ui, f, true, false, false, true)
+    draft_opts(ui, f, true, false, false, true, 0)
 }
 
-fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool, raw_offsets: bool, sinit_const: bool) -> std::result::Result<String, NoDraft> {
+/// A static initializer's alternative draft `k` (objects built by their k-th scalar constructor).
+pub fn draft_sinit_variant(ui: &UnitInputs, f: &Function, k: u8) -> std::result::Result<String, NoDraft> {
+    draft_opts(ui, f, true, false, false, false, k)
+}
+
+fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool, raw_offsets: bool, sinit_const: bool, sinit_variant: u8) -> std::result::Result<String, NoDraft> {
     if !include_implicit {
         if let Some(why) = mwdec_lift::asmonly::requires_asm(&ui.target, f) {
             return Err(NoDraft::Asm(why));
@@ -445,7 +521,8 @@ fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bo
         }
     }
     let ir = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut ir = mwdec_lift::lift_function(ui.lift_obj.as_ref().unwrap_or(&ui.target), f, ui.db.as_ref())?;
+        let lopts = mwdec_lift::LiftOptions { compiler: Some(ui.mwcc.compiler.clone()), ..Default::default() };
+        let mut ir = mwdec_lift::lift_function_with(ui.lift_obj.as_ref().unwrap_or(&ui.target), f, ui.db.as_ref(), &lopts)?;
         if let (Some(db), true) = (&ui.db, inlines && ui.inlines.enabled) {
             let lib = ui.inlines.get(ui, &format!("{}
 {}", ui.mwcc.compiler, ui.ctx.cflags.join(" ")));
@@ -457,7 +534,7 @@ fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bo
         Ok(Err(e)) => return Err(NoDraft::Lift(e.to_string())),
         Err(_) => return Err(NoDraft::Lift("lifter panic".into())),
     };
-    let em = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_emit::emit_function(&ir, ui.db.as_ref(), &mwdec_emit::EmitOptions { c_mode: ui.c_mode, raw_offsets, sinit_const, ..Default::default() }))) {
+    let em = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_emit::emit_function(&ir, ui.db.as_ref(), &mwdec_emit::EmitOptions { c_mode: ui.c_mode, raw_offsets, sinit_const, sinit_variant, ..Default::default() }))) {
         Ok(em) => em,
         Err(_) => return Err(NoDraft::Lift("emitter panic".into())),
     };
