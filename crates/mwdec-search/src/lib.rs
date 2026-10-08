@@ -13,6 +13,7 @@ pub mod near;
 pub mod ops;
 pub mod rng;
 pub mod score;
+pub mod regfix;
 pub mod search;
 pub mod structural;
 pub mod trace;

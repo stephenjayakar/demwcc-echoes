@@ -14,6 +14,7 @@
 
 pub mod aggregates;
 pub mod arrays;
+pub mod asmonly;
 pub mod bitfields;
 pub mod byval;
 pub mod cfg;
@@ -195,7 +196,11 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::simplify_body(&mut body, &l.vars);
     simplify::fold_virtual_delete_checks(&mut body);
     simplify::fold_return_values(&mut body, &l.vars);
+    if sig::demangle(&f.name).is_some() {
+        bool_return(&body, &l.vars, &mut l.ret_ty);
+    }
     wide::merge_halves(&mut body, &l.vars, &l.is_temp);
+    wide::merge_compares(&mut body, &l.vars);
     // compiler-made stack copies the source never names, then fold the temps they kept alive
     idioms::drop_dead_stack_stores(&mut body, &l.vars);
     localtypes::fold_delete_checks(&mut body);
@@ -212,7 +217,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         let is_temp = l.is_temp.clone();
         aggregates::merge_copies_typing(&mut body, &mut l.vars, &|v| is_temp.get(v).copied().unwrap_or(false), db);
         arrays::container_members(&mut body, &l.vars, db);
-        arrays::absolute_globals(&mut body, db);
+        arrays::absolute_globals(&mut body, &l.vars, db);
         bitfields::recover(&mut body, &l.vars, db);
         byval::forward(&mut body, &mut l.vars, db);
         aggregates::literal_inits(&mut body, &l.vars, db, obj);
@@ -224,9 +229,12 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         localtypes::refresh_access_types(&mut body, &l.vars, db);
         simplify::simplify_body(&mut body, &l.vars);
     }
+    construct::fold_returned_temps(&mut body, &l.vars, &mut l.is_temp, &l.ctor_ret_used);
     localtypes::narrow(&mut body, &mut l.vars, db);
     localtypes::global_types(&mut body, &l.vars, &l.ret_ty, db);
     localtypes::undeclared_returns(&mut body, &l.ret_ty, db);
+    localtypes::bool_call_results(&mut body, &l.vars, &l.ret_ty, db);
+    localtypes::bit_copies(&mut body, &l.vars);
     localtypes::drop_redundant_masks(&mut body, &l.vars, db);
     localtypes::cast_intrinsic_args(&mut body, &l.vars);
     debug::stage("aggregates/bitfields", &body, &l.vars);
@@ -244,6 +252,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     }
     indexing::undo_strength_reduction(&mut body, &l.vars);
     indexing::recover(&mut body, &l.vars, db);
+    indexing::raw_index(&mut body, &l.vars);
     arrays::type_indexed_globals(&mut body, &l.vars, db, &Default::default());
     simplify::form_incdec(&mut body, &l.vars, &l.is_temp, db);
     simplify::fold_ternary_constants(&mut body);
@@ -253,9 +262,11 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     if ret_void {
         simplify::drop_trailing_return(&mut body);
     }
+    simplify::drop_garbage_return(&mut body);
 
     let mut sig = l.sig.clone();
     sig.ret = l.ret_ty.clone();
+    let string_pool = l.string_pool_prefix();
     let mut ir = IrFunction {
         symbol: f.name.clone(),
         sig,
@@ -264,8 +275,10 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         this_var: l.this_var,
         body,
         init_list: vec![],
+        implicit_bases: vec![],
         globals: l.globals.into_values().collect(),
         frame: l.frame.info,
+        string_pool,
         warnings: l.warnings,
         decl_params: l.decl_params,
     };
@@ -278,6 +291,45 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     }
     simplify::name_vars(&ir.body, &mut ir.vars);
     Ok(ir)
+}
+
+/// An inferred word return (no declaration) whose every returned value is a truth value
+/// (`a && b`, comparisons, bool locals, 0/1 constants) is `bool`: returning it as `int`
+/// re-extends the byte (`clrlwi`) where the target just copies it.
+fn bool_return(body: &[Stmt], vars: &[ir::Var], ret: &mut mwdec_core::Type) {
+    use ir::*;
+    if !matches!(ret, mwdec_core::Type::Unknown { size: 4 }) {
+        return;
+    }
+    fn returns<'a>(b: &'a [Stmt], out: &mut Vec<&'a Expr>) {
+        for s in b {
+            match s {
+                Stmt::Return(Some(e)) => out.push(e),
+                Stmt::If { then, els, .. } => {
+                    returns(then, out);
+                    returns(els, out);
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => returns(body, out),
+                Stmt::Switch { cases, .. } => cases.iter().for_each(|c| returns(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    let mut rs = vec![];
+    returns(body, &mut rs);
+    let (mut real, mut all) = (false, true);
+    for e in &rs {
+        let t = types::ty_of(e, vars);
+        let is_b = matches!(e, Expr::Binary { op, .. } if op.is_bool()) || matches!(e, Expr::Unary { op: UnOp::Not, .. }) || matches!(strip_cv(&t), mwdec_core::Type::Bool);
+        if is_b {
+            real = true;
+        } else if !matches!(e.as_int(), Some(0 | 1)) {
+            all = false;
+        }
+    }
+    if real && all {
+        *ret = mwdec_core::Type::Bool;
+    }
 }
 
 /// A loop header that only loads a value tested by its condition and reused at the top of the

@@ -31,7 +31,7 @@ fn strip_tmpl(s: &str) -> String {
 }
 
 /// Constructor declarations of class `cls`.
-fn ctor_decls<'a>(db: &'a TypeDb, cls: &str) -> Option<&'a Vec<DeclInfo>> {
+pub(crate) fn ctor_decls<'a>(db: &'a TypeDb, cls: &str) -> Option<&'a Vec<DeclInfo>> {
     let base = strip_tmpl(cls);
     let last = mwdec_lift::sig::split_scope(&base).1.to_string();
     db.decls.get(&format!("{base}::{last}"))

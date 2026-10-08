@@ -50,7 +50,9 @@ Public modules expose each stage: `insn`, `cfg`, `frame`, `translate::Lifter`, `
 **`mwdec-emit`**: IR to C++ text. `emit_function(&IrFunction, Option<&TypeDb>, &EmitOptions) ->
 Emitted { preamble, body }`; helpers `type_str`, `decl`, `referenced_symbols`,
 `float::format_float`. Static initializers (`__sinit_*`) are rendered as the global definitions
-they come from (`sinit`).
+they come from (`sinit`). Functions the compiler emits on demand (template instances, header
+inlines, implicit special members) get instantiation drafts instead (`instantiate::triggers`: an
+explicit instantiation, a call, `new`/`delete[]`, an assignment or the function's address).
 
 **`mwdec-inline`**: folds expanded header inlines back into calls. `build_library_for(db,
 target, cache, compile) -> InlineLib` generates probes (`probe`), compiles them through the
@@ -134,7 +136,11 @@ harvest:
 `mwdec_lift::lift_function` -> `InlineLibs::get` (`mwdec_inline::build_library_for`, compiles
 missing probes through `Mwcc::compile_in`) -> `mwdec_inline::apply` ->
 `mwdec_emit::emit_function` -> `extern_c_definition`. `choose_draft` compiles the variants with
-and without folded inlines and keeps the better.
+and without folded inlines and keeps the better. With `eval --include-implicit` (and in
+`match`), functions classified as header inlines / implicit members, and template instances in
+any case, are drafted as instantiations (`instantiation_drafts`, chosen by `choose_among`); only
+when none matches is the lifted body tried as an explicit specialization (alone and followed by
+a use).
 
 **check** (`cmd_check`): `Project::load` -> `harness::context_tu` -> `Mwcc::precompile` ->
 `Mwcc::compile_in` (retry with the plain context after a crash) ->

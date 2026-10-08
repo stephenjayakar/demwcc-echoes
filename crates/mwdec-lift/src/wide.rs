@@ -145,6 +145,62 @@ fn with_offset(e: &Expr, off: i32, ty: Type) -> Expr {
     }
 }
 
+/// One half of a 64-bit masked equality: `((w & m) ^ c)` with the `& m` / `^ c` optional.
+fn half_parts(e: &Expr) -> (Expr, Option<Expr>, Option<Expr>) {
+    let (x, c) = match e {
+        Expr::Binary { op: BinOp::Xor, l, r, .. } if r.as_int().is_some() => ((**l).clone(), Some((**r).clone())),
+        _ => (e.clone(), None),
+    };
+    match x {
+        Expr::Binary { op: BinOp::And, l, r, .. } => (*l, Some(*r), c),
+        x => (x, None, c),
+    }
+}
+
+/// MWCC compares 64-bit values for (in)equality by xoring each half with the other operand's
+/// half and or-ing the results: `((hi & mh) ^ ch) | ((lo & ml) ^ cl)` tested against 0 is
+/// `(w & m) == c` on the 64-bit word `w` (`CMaterialList`-style bit sets). Rebuild it when the two
+/// halves are the adjacent words of one object.
+pub fn merge_compares(body: &mut Vec<Stmt>, vars: &[Var]) {
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Binary { op: op @ (BinOp::Eq | BinOp::Ne), l, r, .. } = &*e else { return };
+        if r.as_int() != Some(0) {
+            return;
+        }
+        let Expr::Binary { op: BinOp::Or, l: a, r: b, .. } = &**l else { return };
+        let (wa, ma, ca) = half_parts(a);
+        let (wb, mb, cb) = half_parts(b);
+        let off = |w: &Expr| split_lvalue(w).filter(|(_, _, _, t)| scalar_size(t) == Some(4)).map(|(base, o, _, _)| (base.clone(), o));
+        let (Some((ba, oa)), Some((bb, ob))) = (off(&wa), off(&wb)) else { return };
+        if !same_base(&ba, &bb) || (oa - ob).abs() != 4 {
+            return;
+        }
+        // at least one half must really be part of a 64-bit test (a mask or a constant)
+        if ma.is_none() && mb.is_none() && ca.is_none() && cb.is_none() {
+            return;
+        }
+        let ((wh, mh, ch), (wl, ml, cl)) = if oa < ob { ((wa, ma, ca), (wb, mb, cb)) } else { ((wb, mb, cb), (wa, ma, ca)) };
+        if mh.is_some() != ml.is_some() {
+            return;
+        }
+        let w = pair(wh, wl, false, vars);
+        if !matches!(w, Expr::Load { .. } | Expr::Member { .. }) {
+            return;
+        }
+        let w = match w {
+            Expr::Load { base, offset, .. } => Expr::Load { base, offset, ty: wide_ty(false) },
+            Expr::Member { base, offset, .. } => Expr::Member { base, offset, ty: wide_ty(false) },
+            o => o,
+        };
+        let masked = match (mh, ml) {
+            (Some(h), Some(l)) => Expr::bin(BinOp::And, w, pair(h, l, true, vars), wide_ty(false)),
+            _ => w,
+        };
+        let c = pair(ch.unwrap_or(Expr::int(0)), cl.unwrap_or(Expr::int(0)), false, vars);
+        *e = Expr::cmp(*op, masked, c);
+    });
+}
+
 /// Late clean-up: locals assigned once from a half of a 64-bit temp read the half directly,
 /// and `*(u32*)p = (u32)(x >> 32); *(u32*)(p + 4) = (u32)x;` become one 64-bit store.
 pub fn merge_halves(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {

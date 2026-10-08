@@ -641,7 +641,12 @@ fn ctor_init_list(ir: &mut IrFunction, this: VarId, db: Option<&TypeDb>) {
     let own = ir.sig.this_class.clone().unwrap_or_default();
     let mut inits: Vec<Init> = vec![];
     let k = 0;
+    // offset of the last member built by a constructor call: a plain store to a member
+    // declared before it ran in the body (members are built in declaration order)
+    let field_off = |n: &str| db.and_then(|db| sig::find_class(db, &own)).and_then(|c| c.fields.iter().find(|f| f.name == n).map(|f| f.offset as i32));
+    let mut last_call: i32 = -1;
     while k < ir.body.len() {
+        let is_call = matches!(&ir.body[k], Stmt::Expr(_));
         let take = match &ir.body[k] {
             st @ Stmt::Expr(_) => ctor_init_of(st, this, &own, db),
             // leading plain member stores: initializer-list entries (member order is the store
@@ -660,6 +665,19 @@ fn ctor_init_list(ir: &mut IrFunction, this: VarId, db: Option<&TypeDb>) {
                 }
             }),
             _ => None,
+        };
+        let off = match take.as_ref().map(|i| &i.target) {
+            Some(InitTarget::Member(n)) => field_off(n),
+            _ => None,
+        };
+        let take = match (take, off) {
+            (Some(_), Some(o)) if !is_call && o < last_call => None,
+            (t, o) => {
+                if let (true, Some(o), true) = (is_call, o, t.is_some()) {
+                    last_call = last_call.max(o);
+                }
+                t
+            }
         };
         match take {
             Some(init) => {
@@ -812,9 +830,49 @@ fn late_ctor_inits(ir: &mut IrFunction, this: VarId, own: &str, db: Option<&Type
         }
         ir.body.remove(k);
         k -= drop_consumed_temps(&mut ir.body, k, &orig_args, &vars);
+        // members declared before this one that the body set before its construction: their
+        // initializers ran first (`w(in.ReadFloat()), v(in)`)
+        let off = match (&init.target, db.and_then(|db| sig::find_class(db, own))) {
+            (InitTarget::Member(n), Some(c)) => c.fields.iter().find(|f| &f.name == n).map(|f| f.offset as i32),
+            _ => None,
+        };
+        if let Some(o) = off {
+            let mut j = 0;
+            while j < k {
+                if let Some(e) = earlier_member_init(&ir.body[j], this, own, db, o, inits) {
+                    if let Some(a) = spellable_in_init(&e.args[0], false, None, &ir.body[..j], &vars, this, db, true) {
+                        ir.body.remove(j);
+                        k -= 1;
+                        inits.push(Init { args: vec![a], ..e });
+                        continue;
+                    }
+                }
+                j += 1;
+            }
+        }
         if !init.args.is_empty() {
             inits.push(init);
         }
+    }
+}
+
+/// `this->m = v` for a direct member declared before offset `before` and not initialized yet.
+fn earlier_member_init(st: &Stmt, this: VarId, own: &str, db: Option<&TypeDb>, before: i32, inits: &[Init]) -> Option<Init> {
+    let Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } = st else { return None };
+    if !is_this(base, this) || *offset >= before || src.uses_var(this) {
+        return None;
+    }
+    let db = db?;
+    let size = types::size_of(Some(db), ty)?;
+    let (path, ft) = types::field_path(db, own, *offset, size)?;
+    match path.as_slice() {
+        [types::PathElem::Field(n, owner)] if sig::norm_name(owner) == sig::norm_name(own) && types::size_of(Some(db), &ft) == Some(size) && types::class_of(Some(db), &ft).is_none() => {
+            if inits.iter().any(|i| i.target == InitTarget::Member(n.clone())) {
+                return None;
+            }
+            Some(Init { target: InitTarget::Member(n.clone()), ctor: None, args: vec![src.clone()], member_ty: Some(ft.clone()) })
+        }
+        _ => None,
     }
 }
 
@@ -1218,23 +1276,45 @@ fn member_of_this(e: &Expr, this: VarId) -> Option<i32> {
     }
 }
 
+/// `this` / `this != 0`.
+fn is_this_test(cond: &Expr, this: VarId) -> bool {
+    is_this(cond, this) || matches!(cond, Expr::Binary { op: BinOp::Ne, l, r, .. } if is_this(l, this) && r.as_int() == Some(0))
+}
+
 fn dtor_unwrap(ir: &mut IrFunction, this: VarId) {
     let hidden: Vec<VarId> = ir.vars.iter().enumerate().filter(|(_, v)| v.kind == VarKind::Hidden).map(|(i, _)| i).collect();
     // `if (this) { ... }` wrapper
+    let mut unwrapped = false;
     if ir.body.len() == 1 {
         if let Stmt::If { cond, then, els } = &ir.body[0] {
-            if els.is_empty() && (is_this(cond, this) || matches!(cond, Expr::Binary { op: BinOp::Ne, l, r, .. } if is_this(l, this) && r.as_int() == Some(0))) {
+            if els.is_empty() && is_this_test(cond, this) {
                 ir.body = then.clone();
+                unwrapped = true;
             }
         }
     }
     let uses_hidden = |e: &Expr| hidden.iter().any(|h| e.uses_var(*h));
+    // another class's destructor run on `this`: a base's
+    let own = ir.sig.this_class.as_deref().map(sig::norm_name);
+    let mut bases = vec![];
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Call { callee: Callee::Method { sig: s, this: obj, .. }, .. } = e {
+            if let (true, true, Some(c)) = (sig::is_dtor(s), is_this(obj, this), &s.this_class) {
+                if own.as_deref() != Some(sig::norm_name(c).as_str()) && !bases.contains(c) {
+                    bases.push(c.clone());
+                }
+            }
+        }
+    });
+    ir.implicit_bases.extend(bases);
     Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
         b.retain(|s| match s {
             // the `delete this` branch of the deleting destructor
             Stmt::If { cond, .. } if uses_hidden(cond) => false,
             // inlined member destructors start with `if (&this->member != 0)`: implicit
             Stmt::If { cond, .. } if is_member_addr_test(cond, this) => false,
+            // (the member at offset 0 tests `this` itself, already known non-null here)
+            Stmt::If { cond, els, .. } if unwrapped && els.is_empty() && is_this_test(cond, this) => false,
             // implicit base/member destructor calls
             Stmt::Expr(Expr::Call { callee: Callee::Method { sig: s, this: obj, .. }, .. }) if sig::is_dtor(s) => {
                 !(is_this(obj, this) || matches!(&**obj, Expr::AddrOf(inner) if member_of_this(inner, this).is_some()))

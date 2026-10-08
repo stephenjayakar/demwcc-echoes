@@ -13,6 +13,8 @@ enum Init {
     Value(Expr),
     /// (offset, access type, value) per stored member
     Fields(Vec<(i32, Type, Expr)>),
+    /// an array of class objects (`__construct_array`): (element class, count)
+    Array(String, u32),
 }
 
 struct G {
@@ -23,6 +25,13 @@ struct G {
     registered: bool,
     /// class of the destructor registered for it (its type, when the context doesn't say)
     dtor_class: Option<String>,
+}
+
+fn strip_casts(e: &Expr) -> &Expr {
+    match e {
+        Expr::Cast { e, .. } => strip_casts(e),
+        e => e,
+    }
 }
 
 /// (global symbol, byte offset) a pointer expression points at.
@@ -115,6 +124,26 @@ impl<'a> Em<'a> {
             match s {
                 Stmt::Assign { dst: Expr::Var(_), .. } | Stmt::Return(None) | Stmt::Comment(_) => {}
                 Stmt::Expr(Expr::Call { callee: Callee::Method { this, .. }, .. }) if matches!(&**this, Expr::AddrOf(x) if matches!(&**x, Expr::Var(v) if defs.contains_key(v))) => {}
+                // the destructor of a static array is registered as a generated function
+                // (`__arraydtor$12`) with a null object
+                Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }) if symbol == "__register_global_object" && matches!(args.first(), Some(Expr::Int { value: 0, .. })) => {}
+                Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }) if symbol == "__construct_array" && args.len() == 5 => {
+                    let (g, gt, off) = global_ptr(&args[0])?;
+                    fn func_addr(e: &Expr) -> Option<&str> {
+                        match e {
+                            Expr::FuncAddr { symbol } => Some(symbol),
+                            Expr::Cast { e, .. } => func_addr(e),
+                            _ => None,
+                        }
+                    }
+                    let cls = sig::sig_of(func_addr(&args[1])?, Some(db)).this_class?;
+                    let Expr::Int { value: n, .. } = strip_casts(&args[4]) else { return None };
+                    if off != 0 || *n <= 0 {
+                        return None;
+                    }
+                    at(&mut gs, &g, &gt, Init::Array(cls, *n as u32))?;
+                    gs.iter_mut().find(|x| x.symbol == g)?.registered = true;
+                }
                 Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }) if symbol == "__register_global_object" => {
                     let (g, _, _) = args.first().and_then(global_ptr)?;
                     fn func_addr(e: &Expr) -> Option<&str> {
@@ -164,11 +193,13 @@ impl<'a> Em<'a> {
                 Init::Ctor { args, .. } => args.iter().collect(),
                 Init::Value(v) => vec![v],
                 Init::Fields(fs) => fs.iter().map(|(_, _, v)| v).collect(),
+                Init::Array(..) => vec![],
             };
             for v in vals {
                 v.walk(&mut |x| {
                     if let Expr::Global { symbol, .. } = x {
-                        if defined.contains(symbol) && !db.globals.contains_key(symbol) {
+                        // (an object's own address is in scope in its initializer)
+                        if defined.contains(symbol) && !db.globals.contains_key(symbol) && *symbol != g.symbol {
                             reads_own = true;
                         }
                     }
@@ -191,7 +222,13 @@ impl<'a> Em<'a> {
         gs.sort_by_key(|g| last.get(&g.symbol).copied().unwrap_or(0));
         let mut out = String::new();
         for (k, g) in gs.iter().enumerate() {
-            let d = self.sinit_def(g, k)?;
+            let mut d = self.sinit_def(g, k)?;
+            if self.opts.sinit_const && !db.globals.contains_key(&g.symbol) && !d.starts_with("const ") {
+                d = match d.strip_prefix("namespace { ") {
+                    Some(r) => format!("namespace {{ const {r}"),
+                    None => format!("const {d}"),
+                };
+            }
             out.push_str(&d);
             out.push('\n');
         }
@@ -312,6 +349,13 @@ impl<'a> Em<'a> {
         };
         let init = whole_scalar.as_ref().unwrap_or(&g.init);
         match (init, &declared) {
+            (Init::Array(cls, n), _) => {
+                let t = match &declared {
+                    Some((_, t @ Type::Array(..))) => t.clone(),
+                    _ => Type::Array(Box::new(Type::Named(cls.clone())), *n),
+                };
+                Some(wrap(format!("{};", decl(&t, &name))))
+            }
             (Init::Ctor { sig: cs, args }, _) => {
                 let t = match &declared {
                     Some((_, t)) => t.clone(),
@@ -349,6 +393,12 @@ impl<'a> Em<'a> {
                 let base = strip_template_args(&cls);
                 let last = sig::split_scope(&base).1.to_string();
                 if db.decls.get(&format!("{base}::{last}")).is_some_and(|ds| ds.iter().any(|d| d.params.is_empty())) {
+                    return Some(wrap(format!("{};", decl(t, &name))));
+                }
+                // an object with a destructor whose (inlined) constructor takes no arguments that
+                // we can see: default construction (its parameters may all have defaults, or
+                // the constructor is the implicit one)
+                if g.registered || db.decls.get(&format!("{base}::{last}")).is_none() {
                     return Some(wrap(format!("{};", decl(t, &name))));
                 }
                 None

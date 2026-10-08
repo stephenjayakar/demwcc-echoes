@@ -11,7 +11,7 @@
 //! Inputs are the function's signature (from its mangled name) and the context's `TypeDb`;
 //! nothing here reads source.
 
-use mwdec_core::{FuncSig, Type, TypeDb};
+use mwdec_core::{DeclInfo, FuncSig, Type, TypeDb};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Standalone {
@@ -96,6 +96,50 @@ fn names_class(t: &Type, cls: &str) -> bool {
     }
 }
 
+/// `t` with typedefs resolved and cv-qualifiers on by-value parameters dropped, as a comparable key.
+fn type_key(t: &Type, db: &TypeDb, depth: u32) -> String {
+    match t {
+        Type::Named(n) if depth < 8 => match db.typedefs.get(n) {
+            Some(u) => type_key(u, db, depth + 1),
+            // (headers spell names relative to the enclosing scope: compare the last component)
+            None => norm(split_scope(&strip_template_args(n)).1),
+        },
+        Type::Ptr(x) => format!("{}*", type_key(x, db, depth + 1)),
+        Type::Ref(x) => format!("{}&", type_key(x, db, depth + 1)),
+        Type::Const(x) => format!("const {}", type_key(x, db, depth + 1)),
+        Type::Volatile(x) => format!("volatile {}", type_key(x, db, depth + 1)),
+        // (`long` and `int`, `char` and `signed char` differ in mangling but a typedef may hide
+        // either spelling: compare by size and signedness)
+        t => match t.int_info() {
+            Some((sz, sg)) if !matches!(t, Type::Bool) => format!("i{sz}{sg}"),
+            _ => norm(&format!("{t:?}")),
+        },
+    }
+}
+
+fn param_key(t: &Type, db: &TypeDb) -> String {
+    match t {
+        Type::Const(x) | Type::Volatile(x) => type_key(x, db, 0),
+        t => type_key(t, db, 0),
+    }
+}
+
+/// The header declarations of `q` that can be the symbol's: same parameter count and, among
+/// overloads, the ones whose parameter types match the symbol's (all same-count ones when none
+/// matches by type, e.g. template parameters spelled `T`).
+fn candidates<'a>(decls: &'a [DeclInfo], sig: &FuncSig, db: &TypeDb) -> Vec<&'a DeclInfo> {
+    let np = sig.params.len();
+    let same: Vec<&DeclInfo> = decls.iter().filter(|d| d.params.len() == np && d.is_const == sig.is_const).collect();
+    let same = if same.is_empty() { decls.iter().filter(|d| d.params.len() == np).collect() } else { same };
+    let want: Vec<String> = sig.params.iter().map(|p| param_key(&p.ty, db)).collect();
+    let typed: Vec<&DeclInfo> = same.iter().copied().filter(|d| d.params.iter().map(|p| param_key(&p.ty, db)).collect::<Vec<_>>() == want).collect();
+    if typed.is_empty() {
+        same
+    } else {
+        typed
+    }
+}
+
 /// Classify a dataset function (see the module docs).
 pub fn standalone(sig: &FuncSig, db: &TypeDb) -> Standalone {
     let q = &sig.qualified_name;
@@ -106,12 +150,17 @@ pub fn standalone(sig: &FuncSig, db: &TypeDb) -> Standalone {
     if sig.mangled.as_deref().is_some_and(thunk) || thunk(split_scope(q).1) {
         return Standalone::Implicit("thunk");
     }
-    if db.decls.get(q).is_some_and(|v| v.iter().any(|d| d.is_inline_defined && d.params.len() == np)) {
+    // (an overload declared without a body is defined in the unit even when another overload
+    // with as many parameters is inline)
+    if db.decls.get(q).is_some_and(|v| {
+        let c = candidates(v, sig, db);
+        !c.is_empty() && c.iter().all(|d| d.is_inline_defined)
+    }) {
         return Standalone::HeaderInline;
     }
     let key = strip_template_args(q);
     // a member of a class template / a function template instance whose definition is in a header
-    if q.contains('<') && db.decls.get(&key).is_some_and(|v| v.iter().any(|d| d.is_inline_defined && d.params.len() == np)) {
+    if q.contains('<') && db.decls.get(&key).is_some_and(|v| candidates(v, sig, db).iter().any(|d| d.is_inline_defined)) {
         return Standalone::Implicit("template-header-member");
     }
     let Some(cls) = sig.this_class.clone().or_else(|| split_scope(q).0.map(|s| s.to_string())) else { return Standalone::Yes };

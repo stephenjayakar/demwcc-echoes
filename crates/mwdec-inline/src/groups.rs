@@ -22,7 +22,7 @@ struct CStore {
 }
 
 fn scalar_vc(t: &Type) -> bool {
-    matches!(strip(t), Type::Float { .. } | Type::Int { .. } | Type::Long { .. } | Type::Char | Type::Bool | Type::WChar | Type::Ptr(_) | Type::Unknown { size: 1 | 2 | 4 | 8 })
+    matches!(strip(t), Type::Float { .. } | Type::Int { .. } | Type::Long { .. } | Type::Char | Type::Bool | Type::WChar | Type::Ptr(_) | Type::FuncPtr(_) | Type::Unknown { size: 1 | 2 | 4 | 8 })
 }
 
 fn store_size(t: &Type) -> u32 {

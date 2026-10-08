@@ -389,12 +389,39 @@ impl Mwcc {
             None => (stem.with_extension("cpp"), false),
         };
         let obj = stem.with_extension("o");
-        std::fs::write(&src, source).map_err(io("writing TU"))?;
-        let res = self.compile_src(&src, &obj, &stem, cflags, prefix);
+        // A compiler that could not open one of our work files (another process sharing the work
+        // dir was replacing or deleting it, a virus scanner held it, ...) is retried, and reported
+        // as an I/O failure (never cached as a compile error) if it keeps failing.
+        let mut attempt = 0;
+        let res = loop {
+            std::fs::write(&src, source).map_err(io("writing TU"))?;
+            let res = self.compile_src(&src, &obj, &stem, cflags, prefix);
+            match &res {
+                Err(MwccError::Compile { messages, .. }) if self.transient_io(messages) => {
+                    attempt += 1;
+                    if attempt >= IO_RETRIES {
+                        break Err(MwccError::Io(format!("compiler could not open a work file: {}", messages.lines().take(3).collect::<Vec<_>>().join(" | "))));
+                    }
+                    std::thread::sleep(Duration::from_millis(150 * attempt as u64));
+                }
+                _ => break res,
+            }
+        };
         if own_dir {
             let _ = std::fs::remove_dir_all(&stem);
         }
         res
+    }
+
+    /// The compiler failed to open, read or write one of our own files (under the work dir):
+    /// an I/O race, not a property of the source.
+    fn transient_io(&self, messages: &str) -> bool {
+        let lower = messages.to_ascii_lowercase();
+        let marker = ["cannot be opened", "cannot open", "could not write file", "could not load file", "could not find or load precompiled", "oserr"]
+            .iter()
+            .any(|m| lower.contains(m));
+        let work = win_path(&self.work).to_ascii_lowercase();
+        marker && (lower.contains(&work) || lower.contains(&work.replace('\\', "/")) || lower.contains("oserr"))
     }
 
     fn compile_src(&self, src: &Path, obj: &Path, stem: &Path, cflags: &[String], prefix: Option<&Path>) -> Result<Compiled, MwccError> {
@@ -433,35 +460,52 @@ impl Mwcc {
         let lock = self.pch_locks.lock().unwrap().entry(hash).or_default().clone();
         let _g = lock.lock().unwrap();
         if !mch.exists() {
-            std::fs::create_dir_all(&dir).map_err(io("creating pch dir"))?;
-            let stem = dir.join(self.unique("ctx"));
+            let tmp_mch = self.build_mch(context, cflags, &dir, "ctx")?;
+            publish(&tmp_mch, &mch);
+        }
+        Ok(UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: Some(mch), hash, text: String::new(), excluded: vec![], tu_name: None })
+    }
+
+    /// Precompile `context` into a private `.mch` (a unique file the caller owns and deletes).
+    pub(crate) fn precompile_private(&self, context: &str, cflags: &[String]) -> Result<UnitContext, MwccError> {
+        let hash = content_hash(&[CACHE_SALT.as_bytes(), self.compiler.as_bytes(), &flags_bytes(cflags), context.as_bytes()]);
+        let mch = self.build_mch(context, cflags, &self.work.join("pch"), "trial")?;
+        Ok(UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: Some(mch), hash, text: String::new(), excluded: vec![], tu_name: None })
+    }
+
+    /// Run the precompiler on `context` into a new uniquely named `.mch` in `dir` (retrying when
+    /// the compiler could not open one of our files).
+    fn build_mch(&self, context: &str, cflags: &[String], dir: &Path, stem_name: &str) -> Result<PathBuf, MwccError> {
+        std::fs::create_dir_all(dir).map_err(io("creating pch dir"))?;
+        let mut attempt = 0;
+        loop {
+            let stem = dir.join(self.unique(stem_name));
             // The extension selects precompilation in the driver: .pch++ = C++, .pch = C.
             let is_c = cflags.iter().any(|f| f == "-lang=c" || f == "-lang=c99");
             let src = stem.with_extension(if is_c { "pch" } else { "pch++" });
             let tmp_mch = stem.with_extension("mch");
             std::fs::write(&src, context).map_err(io("writing context"))?;
             let mut args: Vec<String> = cflags.to_vec();
-            args.extend([
-                "-c".into(),
-                win_path(&src),
-                "-o".into(),
-                win_path(&dir),
-                "-precompile".into(),
-                win_path(&tmp_mch),
-            ]);
+            args.extend(["-c".into(), win_path(&src), "-o".into(), win_path(dir), "-precompile".into(), win_path(&tmp_mch)]);
             let res = self.run(&args, &stem);
             let _ = std::fs::remove_file(&src);
             let (ok, status, messages, _ms) = res?;
-            if !ok || !tmp_mch.exists() {
-                let _ = std::fs::remove_file(&tmp_mch);
-                return Err(failure(status, messages));
+            if ok && tmp_mch.exists() {
+                return Ok(tmp_mch);
             }
-            if std::fs::rename(&tmp_mch, &mch).is_err() {
-                // Another process won the race; keep theirs.
-                let _ = std::fs::remove_file(&tmp_mch);
+            let _ = std::fs::remove_file(&tmp_mch);
+            let e = failure(status, messages);
+            match &e {
+                MwccError::Compile { messages, .. } if self.transient_io(messages) => {
+                    attempt += 1;
+                    if attempt >= IO_RETRIES {
+                        return Err(MwccError::Io(format!("precompiling: {}", messages.lines().take(3).collect::<Vec<_>>().join(" | "))));
+                    }
+                    std::thread::sleep(Duration::from_millis(150 * attempt as u64));
+                }
+                _ => return Err(e),
             }
         }
-        Ok(UnitContext { cflags: cflags.to_vec(), context: context.to_string(), mch: Some(mch), hash, text: String::new(), excluded: vec![], tu_name: None })
     }
 
     /// A context without PCH: the context text is prepended to every candidate (slow path,
@@ -596,6 +640,16 @@ impl Mwcc {
         true
     }
 
+    /// Make sure `n` fast-path workers hold a persistent compiler for `ctx` before a compile
+    /// loop starts (instead of starting them on demand while candidates compile normally).
+    /// Waits at most `wait`; returns how many hold it (0 when the fast path does not apply).
+    pub fn warm_fast(&self, ctx: &UnitContext, n: usize, wait: std::time::Duration) -> usize {
+        match self.fast_spec(ctx) {
+            Some((fp, spec)) => fp.warm(&spec, n, wait),
+            None => 0,
+        }
+    }
+
     /// End the fast path's workers and their compiler processes (it stays off afterwards).
     pub fn shutdown_fast(&self) {
         let f = self.fast.write().unwrap().take();
@@ -678,6 +732,7 @@ impl Mwcc {
     }
 
     fn disk_put(&self, key: u128, v: Result<&[u8], &str>) -> Option<PathBuf> {
+        // (cache entries are only ever replaced by identical content: a rename over one is safe)
         let (ext, bytes): (&str, &[u8]) = match v {
             Ok(b) => ("o", b),
             Err(m) => ("err", m.as_bytes()),
@@ -691,6 +746,20 @@ impl Mwcc {
         }
         Some(p)
     }
+}
+
+/// Attempts of a compile whose compiler could not open one of our work files.
+const IO_RETRIES: u32 = 3;
+
+/// Move a finished shared file (`.mch`) into place without ever replacing an existing one: other
+/// processes sharing the work dir may be compiling against it right now (a rename over it fails
+/// or, worse, swaps the file under a compiler that is about to open it). The first writer wins.
+pub(crate) fn publish(tmp: &Path, dst: &Path) {
+    if !dst.exists() && std::fs::hard_link(tmp, dst).is_err() && !dst.exists() {
+        // no hard links on this file system: plain rename (still only when absent)
+        let _ = std::fs::rename(tmp, dst);
+    }
+    let _ = std::fs::remove_file(tmp);
 }
 
 /// `MWDEC_PERSIST=0` (or `off` / `no`) disables the fast path.

@@ -303,6 +303,39 @@ impl FastPool {
         }
     }
 
+    /// Start persistent compilers for `spec` until `n` workers (at most the pool's) hold it, or
+    /// `wait` has passed, or a start failed. Returns the number of holders.
+    pub fn warm(&self, spec: &Arc<Spec>, n: usize, wait: Duration) -> usize {
+        let key = spec.key;
+        let deadline = Instant::now() + wait;
+        let n = n.clamp(1, self.n);
+        let mut st = self.shared.state.lock().unwrap();
+        loop {
+            let holders = st.held.iter().filter(|h| h.contains(&key)).count();
+            if holders >= n || st.failed.contains(&key) || Instant::now() >= deadline {
+                return holders;
+            }
+            let now = Instant::now();
+            st.last_use.insert(key, now);
+            let starting = st.starting.get(&key).copied().unwrap_or(0);
+            if holders + starting < n {
+                if let Some(w) = self.start_target(&st, key, n, now) {
+                    st.busy[w] = true;
+                    *st.starting.entry(key).or_default() += 1;
+                    if !self.send(w, Msg::Run(Job { spec: spec.clone(), body: String::new(), reply: None })) {
+                        st.busy[w] = false;
+                        if let Some(k) = st.starting.get_mut(&key) {
+                            *k -= 1;
+                        }
+                        return holders;
+                    }
+                    continue;
+                }
+            }
+            st = self.shared.cv.wait_timeout(st, Duration::from_millis(100)).unwrap().0;
+        }
+    }
+
     /// An idle worker to start `key` on: one with a free cache slot, else one whose least
     /// recently used context is inactive or held by more workers than its share.
     fn start_target(&self, st: &State, key: u64, share: usize, now: Instant) -> Option<usize> {

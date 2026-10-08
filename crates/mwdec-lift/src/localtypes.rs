@@ -734,10 +734,8 @@ pub fn undeclared_returns(body: &mut Vec<Stmt>, ret: &Type, db: Option<&mwdec_co
                 visit(inner, narrow(ty), uses, und, narrow);
             }
             Expr::Call { callee, args, .. } => {
-                if let Callee::Direct { symbol, sig } = callee {
-                    if und(symbol, sig) {
-                        uses.entry(symbol.clone()).or_default().push(ctx.clone());
-                    }
+                if let Some(k) = callee_key(callee, und) {
+                    uses.entry(k).or_default().push(ctx.clone());
                 }
                 if let Callee::Method { this, .. } | Callee::Virtual { this, .. } = callee {
                     visit(this, None, uses, und, narrow);
@@ -783,7 +781,14 @@ pub fn undeclared_returns(body: &mut Vec<Stmt>, ret: &Type, db: Option<&mwdec_co
             }
             Stmt::Assign { dst, src } => {
                 visit(dst, None, &mut uses, &undeclared, &narrow);
-                visit(src, None, &mut uses, &undeclared, &narrow);
+                // a result stored straight into a narrow member/global (`mFlag = f();`)
+                let dst_narrow = match dst {
+                    _ if !matches!(src, Expr::Call { .. }) => None,
+                    Expr::Global { symbol, ty } => narrow(db.and_then(|d| d.globals.get(symbol)).map_or(ty, |g| &g.1)),
+                    Expr::Load { ty, .. } | Expr::Member { ty, .. } => narrow(ty),
+                    _ => None,
+                };
+                visit(src, dst_narrow, &mut uses, &undeclared, &narrow);
             }
             Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } | Stmt::For { cond, .. } => visit(cond, None, &mut uses, &undeclared, &narrow),
             Stmt::Switch { e, .. } => visit(e, None, &mut uses, &undeclared, &narrow),
@@ -803,7 +808,7 @@ pub fn undeclared_returns(body: &mut Vec<Stmt>, ret: &Type, db: Option<&mwdec_co
     Stmt::rewrite_exprs(body, &mut |e| {
         let replace = match e {
             Expr::Cast { e: inner, .. } => match &**inner {
-                Expr::Call { callee: Callee::Direct { symbol, .. }, .. } => chosen.get(symbol).cloned(),
+                Expr::Call { callee, .. } => callee_key(callee, &undeclared).and_then(|k| chosen.get(&k).cloned()),
                 _ => None,
             },
             _ => None,
@@ -816,12 +821,103 @@ pub fn undeclared_returns(body: &mut Vec<Stmt>, ret: &Type, db: Option<&mwdec_co
                 }
                 *e = c;
             }
-        } else if let Expr::Call { callee: Callee::Direct { symbol, .. }, ret, .. } = e {
-            if let Some(t) = chosen.get(symbol) {
+        } else if let Expr::Call { callee, ret, .. } = e {
+            if let Some(t) = callee_key(callee, &undeclared).and_then(|k| chosen.get(&k)) {
                 *ret = t.clone();
             }
         }
     });
+}
+
+/// A call whose return type nobody declares (a stand-in method, a virtual call through an
+/// unknown class) returned from a `bool` function or stored straight into a `bool` lvalue returns
+/// `bool`: an `int`/`u8` result would be normalised (`neg; or; srwi`) where the target copies it.
+pub fn bool_call_results(body: &mut Vec<Stmt>, vars: &[Var], ret: &Type, db: Option<&mwdec_core::TypeDb>) {
+    fn undeclared(e: &Expr) -> bool {
+        let Expr::Call { callee, ret, .. } = e else { return false };
+        let unk = match callee {
+            Callee::Direct { sig, .. } | Callee::Method { sig, .. } => crate::sig::ret_unknown(sig),
+            Callee::Virtual { sig, .. } => sig.as_ref().map_or(true, crate::sig::ret_unknown),
+            Callee::Indirect(_) => false,
+        };
+        unk && matches!(strip_cv(ret), Type::Unknown { size: 4 } | Type::Int { size: 1 | 4, .. })
+    }
+    fn to_bool(e: &mut Expr) {
+        if let Expr::Cast { e: inner, .. } = e {
+            if undeclared(inner) {
+                *e = (**inner).clone();
+            }
+        }
+        if let Expr::Call { ret, .. } = e {
+            *ret = Type::Bool;
+        }
+    }
+    let is_bool = |t: &Type| matches!(strip_cv(&types::resolve(db, t)), Type::Bool);
+    let ret_bool = is_bool(ret);
+    let peel = |e: &Expr| -> bool {
+        match e {
+            Expr::Cast { e: inner, .. } => undeclared(inner),
+            e => undeclared(e),
+        }
+    };
+    // a raw byte read returned / stored as a truth value without normalisation is a `bool` read
+    fn byte_to_bool(e: &mut Expr) {
+        if let Expr::Load { ty, .. } | Expr::Index { ty, .. } = e {
+            if *ty == (Type::Int { size: 1, signed: false }) {
+                *ty = Type::Bool;
+            }
+        }
+    }
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            match s {
+                Stmt::Return(Some(e)) if ret_bool && peel(e) => to_bool(e),
+                Stmt::Return(Some(e)) if ret_bool => byte_to_bool(e),
+                Stmt::Assign { dst, src } if peel(src) && is_bool(&types::ty_of(dst, vars)) => to_bool(src),
+                Stmt::Assign { dst, src } if is_bool(&types::ty_of(dst, vars)) => byte_to_bool(src),
+                _ => {}
+            }
+        }
+    });
+}
+
+/// A word store of an integer value into a float lvalue (`stw` of a GPR into a `float`) copies
+/// the bits; C would convert. Store through an integer view of the object instead
+/// (`*(int*)&f = i`); the same for a float register stored into an integer lvalue (`stfs`).
+pub fn bit_copies(body: &mut Vec<Stmt>, vars: &[Var]) {
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            let Stmt::Assign { dst, src } = s else { continue };
+            if !matches!(dst, Expr::Global { .. } | Expr::Load { .. } | Expr::Member { .. } | Expr::Var(_)) {
+                continue;
+            }
+            if let Expr::Var(v) = dst {
+                if !matches!(vars[*v].kind, VarKind::Stack { .. }) {
+                    continue;
+                }
+            }
+            let dt = types::ty_of(dst, vars);
+            let st = types::ty_of(src, vars);
+            let view = match (strip_cv(&dt), strip_cv(&st)) {
+                (Type::Float { size: 4 }, Type::Int { size: 4, .. } | Type::Unknown { size: 4 }) if !matches!(src, Expr::Int { .. }) => Some(t_s32()),
+                _ => None,
+            };
+            if let Some(t) = view {
+                *dst = Expr::Load { base: Box::new(Expr::AddrOf(Box::new(dst.clone()))), offset: 0, ty: t };
+            }
+        }
+    });
+}
+
+/// Key of a callee whose return type nothing declares: an undeclared C function, a method of a
+/// class the context doesn't know, an unknown virtual slot.
+fn callee_key(c: &Callee, und: &dyn Fn(&str, &mwdec_core::FuncSig) -> bool) -> Option<String> {
+    match c {
+        Callee::Direct { symbol, sig } if und(symbol, sig) => Some(symbol.clone()),
+        Callee::Method { symbol, sig, .. } if crate::sig::ret_unknown(sig) && !symbol.is_empty() && !crate::sig::is_ctor(sig) && !crate::sig::is_dtor(sig) => Some(symbol.clone()),
+        Callee::Virtual { sig: None, class, vtable_offset, .. } => Some(format!("vt:{class:?}:{vtable_offset}")),
+        _ => None,
+    }
 }
 
 fn direct_kids(e: &Expr) -> Vec<&Expr> {

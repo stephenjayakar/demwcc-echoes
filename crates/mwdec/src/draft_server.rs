@@ -5,7 +5,7 @@
 //! The child gets its own (nested) job-object cap (`DRAFT_MEM_MB`, below the parent's), keeps the
 //! inputs of the current unit only (TypeDb, inline library), and answers one JSON line per
 //! request on stdout. The parent no longer holds any TypeDb or inline library.
-use super::search_cmds::{draft_variant, draft_with, unit_inputs, Compilers, NoDraft, UnitInputs};
+use super::search_cmds::{draft_variant, draft_with, emitted_kind, instantiation_drafts, unit_inputs, Compilers, NoDraft, UnitInputs};
 use super::{find_unit, load_project};
 use anyhow::Result;
 use mwdec_core::*;
@@ -32,6 +32,12 @@ pub struct DraftReply {
     pub plain: Option<String>,
     /// Kind of a function that can't exist as standalone source.
     pub implicit: Option<String>,
+    /// Sources that make the compiler emit the function (explicit instantiations or uses), for
+    /// header inlines, template instances and implicit members when they are included.
+    pub alts: Vec<String>,
+    /// Draft with member accesses as raw offsets, when it differs (a fallback for drafts that
+    /// don't compile, e.g. private members).
+    pub raw: Option<String>,
     pub error: Option<String>,
 }
 
@@ -42,15 +48,27 @@ impl DraftReply {
 }
 
 /// Draft one function in-process (the child's work; also the fallback without a child).
-pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool) -> DraftReply {
+/// Functions the compiler emits on demand get instantiation drafts only, unless `lift_emitted`
+/// (a second request when none of those matched: the lifted body as an explicit specialization).
+pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_emitted: bool) -> DraftReply {
     let Some(f) = mwdec_obj::find_function(&ui.target, symbol) else {
         return DraftReply { status: "missing".into(), ..Default::default() };
     };
-    let mut r = DraftReply::default();
-    if let Some(db) = &ui.db {
-        if let mwdec_project::standalone::Standalone::Implicit(k) = mwdec_project::standalone::standalone(&mwdec_lift::sig::sig_of(&f.name, Some(db)), db) {
-            r.implicit = Some(k.to_string());
+    let kind = emitted_kind(ui, f);
+    let mut r = DraftReply { implicit: kind.clone().filter(|k| include_implicit || k != "hdr-inline"), ..Default::default() };
+    if include_implicit && kind.is_some() && !lift_emitted {
+        // emitted by the compiler on demand: the drafts are instantiations / uses, no lift
+        r.alts = instantiation_drafts(ui, f);
+        if !r.alts.is_empty() {
+            r.status = "ok".into();
+            r.src = Some(r.alts[0].clone());
+            return r;
         }
+    }
+    // (a template instance the classifier keeps as ordinary, e.g. a member defined outside the
+    // class template in a header, also gets the instantiation drafts)
+    if kind.is_none() && mwdec_emit::instantiate::is_template_instance(&f.name) {
+        r.alts = instantiation_drafts(ui, f);
     }
     match draft_with(ui, f, include_implicit) {
         Ok(s) => {
@@ -58,10 +76,21 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool) -> Dra
             if ui.inlines.enabled {
                 r.plain = draft_variant(ui, f, false, true).ok().filter(|p| *p != s);
             }
+            if ui.db.is_some() && r.implicit.is_none() {
+                r.raw = super::search_cmds::draft_raw(ui, f).ok().filter(|p| *p != s);
+            }
+            // a static initializer of `const` globals schedules their stores differently
+            if f.name.starts_with("__sinit_") && ui.db.is_some() {
+                r.alts.extend(super::search_cmds::draft_sinit_const(ui, f).ok().filter(|p| *p != s));
+            }
             r.src = Some(s);
         }
         Err(NoDraft::HeaderInline) => r.status = "hdr-inline".into(),
         Err(NoDraft::Implicit(_)) => r.status = "implicit".into(),
+        Err(NoDraft::Asm(why)) => {
+            r.status = "asm".into();
+            r.implicit = Some(format!("asm: {why}"));
+        }
         Err(NoDraft::Lift(e)) => {
             r.status = "lift-err".into();
             r.error = Some(e);
@@ -71,7 +100,7 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool) -> Dra
 }
 
 fn reply_json(r: &DraftReply) -> String {
-    serde_json::json!({"status": r.status, "src": r.src, "plain": r.plain, "implicit": r.implicit, "error": r.error}).to_string()
+    serde_json::json!({"status": r.status, "src": r.src, "plain": r.plain, "implicit": r.implicit, "alts": r.alts, "raw": r.raw, "error": r.error}).to_string()
 }
 
 fn parse_reply(line: &str) -> DraftReply {
@@ -79,7 +108,8 @@ fn parse_reply(line: &str) -> DraftReply {
         return DraftReply::err("crash", format!("bad draft-server reply: {}", line.chars().take(200).collect::<String>()));
     };
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-    DraftReply { status: s("status").unwrap_or_default(), src: s("src"), plain: s("plain"), implicit: s("implicit"), error: s("error") }
+    let alts = v.get("alts").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    DraftReply { status: s("status").unwrap_or_default(), src: s("src"), plain: s("plain"), implicit: s("implicit"), alts, raw: s("raw"), error: s("error") }
 }
 
 /// `mwdec draft-server`: one JSON request per stdin line ({"unit","symbol","include_implicit"}),
@@ -101,6 +131,7 @@ pub fn serve(root: &Path, work: &Path, no_db: bool) -> Result<()> {
         let unit = req.get("unit").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let symbol = req.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let include_implicit = req.get("include_implicit").and_then(|x| x.as_bool()).unwrap_or(false);
+        let lift_emitted = req.get("lift_emitted").and_then(|x| x.as_bool()).unwrap_or(false);
         if cur.as_ref().map_or(true, |c| c.0 != unit) {
             drop(cur.take()); // drop the previous unit before loading the next
             let ui = find_unit(&p, &unit).map_err(|e| e.to_string()).and_then(|u| {
@@ -120,7 +151,7 @@ pub fn serve(root: &Path, work: &Path, no_db: bool) -> Result<()> {
             }
         }
         let r = match &cur.as_ref().unwrap().1 {
-            Ok(ui) => draft_local(ui, &symbol, include_implicit),
+            Ok(ui) => draft_local(ui, &symbol, include_implicit, lift_emitted),
             Err(e) => DraftReply::err("unit-err", e.clone()),
         };
         writeln!(out, "{}", reply_json(&r))?;
@@ -195,7 +226,7 @@ impl DraftClient {
 
     /// Draft `symbol` of `unit` in the child; a dead or hung child is reported for this function
     /// and restarted on the next request.
-    pub fn draft(&self, unit: &str, symbol: &str, include_implicit: bool) -> DraftReply {
+    pub fn draft(&self, unit: &str, symbol: &str, include_implicit: bool, lift_emitted: bool) -> DraftReply {
         let mut g = self.proc_.lock().unwrap();
         if g.is_none() {
             match self.spawn() {
@@ -204,7 +235,7 @@ impl DraftClient {
             }
         }
         let p = g.as_mut().unwrap();
-        let req = serde_json::json!({"unit": unit, "symbol": symbol, "include_implicit": include_implicit}).to_string();
+        let req = serde_json::json!({"unit": unit, "symbol": symbol, "include_implicit": include_implicit, "lift_emitted": lift_emitted}).to_string();
         let sent = writeln!(p.stdin, "{req}").and_then(|_| p.stdin.flush());
         let res = if sent.is_ok() { p.rx.recv_timeout(self.timeout) } else { Err(RecvTimeoutError::Disconnected) };
         match res {

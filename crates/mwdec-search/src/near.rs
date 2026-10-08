@@ -186,3 +186,124 @@ fn remove_stmt(c: &Cst, s: usize) -> Edit {
     Edit { start, end, text: String::new() }
 }
 
+
+/// Split `s` at its top-level binary `+` (outside parentheses/brackets): `(a, b)`.
+fn split_plus(s: &str) -> Option<(&str, &str)> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut at = None;
+    for (k, &ch) in b.iter().enumerate() {
+        match ch {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b'+' if depth == 0 && k > 0 && b.get(k + 1) != Some(&b'+') && b[k - 1] != b'+' => at = Some(k),
+            _ => {}
+        }
+    }
+    let k = at?;
+    Some((s[..k].trim(), s[k + 1..].trim()))
+}
+
+fn int_lit(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(h, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// `*(T*)((char*)E + k)` (either operand order) -> (T, E, k).
+fn raw_load(s: &str) -> Option<(String, String, i64)> {
+    let s = strip_parens(s);
+    let rest = s.strip_prefix('*')?.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    let close = rest.find(')')?;
+    let ty = rest[..close].trim();
+    let ty = ty.strip_suffix('*')?.trim().to_string();
+    let addr = strip_parens(&rest[close + 1..]);
+    let (a, b) = split_plus(addr)?;
+    let (base, k) = match (int_lit(a), int_lit(b)) {
+        (None, Some(k)) => (a, k),
+        (Some(k), None) => (b, k),
+        _ => return None,
+    };
+    let base = strip_parens(base);
+    let e = base.strip_prefix("(char*)").or_else(|| base.strip_prefix("(char *)"))?;
+    Some((ty, strip_parens(e).to_string(), k))
+}
+
+fn type_size(t: &str) -> Option<i64> {
+    match t {
+        "float" | "int" | "unsigned int" | "s32" | "u32" | "f32" | "long" | "unsigned long" => Some(4),
+        "double" | "f64" | "long long" | "unsigned long long" => Some(8),
+        "short" | "unsigned short" | "s16" | "u16" => Some(2),
+        "char" | "unsigned char" | "signed char" | "s8" | "u8" | "bool" => Some(1),
+        _ => None,
+    }
+}
+
+/// Member-wise construction from consecutive members of one object back to a struct copy:
+/// `T(*(float*)((char*)p + 0x3c), *(float*)((char*)p + 0x40), p->z)` -> `*(T*)((char*)p + 0x3c)`
+/// (the target copies member by member, load/store pairs, instead of loading every member first).
+/// Arguments may be raw loads at consecutive offsets or member accesses of the same object (their
+/// offsets inferred from the raw ones).
+pub fn op_ctor_copy(m: &mut M) -> Option<Vec<Edit>> {
+    let c = m.cst;
+    let mut cands: Vec<(usize, String)> = Vec::new();
+    for n in m.nodes.clone() {
+        if c.kind(n) != "call_expression" {
+            continue;
+        }
+        let Some(f) = c.child(n, "function") else { continue };
+        let ty = c.text(f).trim().to_string();
+        let last = ty.rsplit("::").next().unwrap_or(&ty);
+        if !last.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) || !matches!(c.kind(f), "identifier" | "qualified_identifier" | "template_function") {
+            continue;
+        }
+        let Some(args) = c.child(n, "arguments") else { continue };
+        let a: Vec<usize> = c.named(args).into_iter().filter(|&x| c.kind(x) != "comment").collect();
+        if a.len() < 2 {
+            continue;
+        }
+        let parsed: Vec<Option<(String, String, i64)>> = a.iter().map(|&x| raw_load(c.text(x))).collect();
+        let Some((ety, base, _)) = parsed.iter().flatten().next().cloned() else { continue };
+        let Some(sz) = type_size(&ety) else { continue };
+        // start offset implied by every raw argument must agree
+        let mut start = None;
+        let mut ok = true;
+        for (i, p) in parsed.iter().enumerate() {
+            match p {
+                Some((t, b, k)) => {
+                    if *t != ety || *b != base {
+                        ok = false;
+                        break;
+                    }
+                    let s0 = k - sz * i as i64;
+                    if start.is_some_and(|s| s != s0) {
+                        ok = false;
+                        break;
+                    }
+                    start = Some(s0);
+                }
+                None => {
+                    // a member access of the same object
+                    let t = strip_parens(c.text(a[i]));
+                    let pre_arrow = format!("{base}->");
+                    let pre_paren = format!("({base})->");
+                    if !(t.starts_with(&pre_arrow) || t.starts_with(&pre_paren)) || t[pre_arrow.len().min(t.len())..].contains(['(', '-', '+', '*', '[']) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(s0) = start.filter(|_| ok) else { continue };
+        if s0 < 0 {
+            continue;
+        }
+        cands.push((n, format!("*({ty}*)((char*){} + 0x{s0:x})", if base.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == ':') { base.clone() } else { format!("({base})") })));
+    }
+    let (n, text) = m.pick_one(&cands)?;
+    Some(vec![Edit::replace(c, n, text)])
+}

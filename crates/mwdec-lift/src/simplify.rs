@@ -312,6 +312,21 @@ fn simp_cond(c: &mut Expr, vars: &[Var]) {
 
 /// `return;` at the very end of a void function is implicit (also at the end of the branches
 /// of a trailing `if`).
+/// A final `return` of a value nothing computed (the return register is dead after a void call):
+/// the source fell off the end of the function.
+pub fn drop_garbage_return(body: &mut Vec<Stmt>) {
+    fn garbage(e: &Expr) -> bool {
+        match e {
+            Expr::Cast { e, .. } => garbage(e),
+            Expr::Unknown { text, .. } => text == "uninit r3" || text == "uninit f1",
+            _ => false,
+        }
+    }
+    if matches!(body.last(), Some(Stmt::Return(Some(e))) if garbage(e)) {
+        body.pop();
+    }
+}
+
 pub fn drop_trailing_return(body: &mut Vec<Stmt>) {
     if matches!(body.last(), Some(Stmt::Return(None))) {
         body.pop();

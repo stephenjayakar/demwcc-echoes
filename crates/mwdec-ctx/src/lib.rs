@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when the TypeDb produced for the same inputs changes (invalidates caches).
-const CACHE_VERSION: &str = "mwdec-ctx-21-void-ptr-vars-errs";
+const CACHE_VERSION: &str = "mwdec-ctx-22b-bool-static-members";
 
 /// Parse the DWARF of an already-compiled MWCC object into a TypeDb (no header scan).
 pub fn typedb_from_object_bytes(elf: &[u8]) -> Result<TypeDb> {
@@ -419,6 +419,12 @@ fn build_uncached(root: &Path, context_tu: &str, cflags: &[String], dir: &Path) 
     }
     for (c, f) in &sr.friends {
         db.friends.entry(c.clone()).or_default().push(f.clone());
+    }
+    // MWCC's DWARF spells `bool` as `unsigned char`: restore variables declared `bool`
+    for (n, t) in db.globals.values_mut() {
+        if *t == (Type::Int { size: 1, signed: false }) && sr.bool_vars.iter().any(|b| b == n) {
+            *t = Type::Bool;
+        }
     }
     resolve::patch_bool_fields(&mut db, &sr.fields);
     resolve::patch_void_pointers(&mut db, &sr.fields, &sr.template_params);

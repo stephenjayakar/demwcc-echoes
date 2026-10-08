@@ -44,6 +44,10 @@ pub struct SearchConfig {
     pub polish_evals: usize,
     /// Use target register-allocation hints (mwdec-oracle) for hint_order / hint_temp.
     pub use_hints: bool,
+    /// Before the clock starts, wait (up to this long) for the compile fast path to hold a
+    /// persistent compiler for the context on as many workers as the search uses (setup, like
+    /// the precompiled header; zero = start them on demand inside the budget).
+    pub warm_fast: Duration,
     /// Compiler tracer (GC/2.7 units): on register-only diffs, directed fixes from the real
     /// colouring are tried before random mutations.
     pub tracer: Option<Arc<crate::trace::Tracer>>,
@@ -54,6 +58,18 @@ pub struct SearchConfig {
     pub focus_prob: f64,
     /// Operators switched off (ablations).
     pub disabled_ops: Vec<String>,
+    /// Systematic neighbourhood search for targets up to this many bytes of code (0 = off):
+    /// best-first over evaluated candidates, each expanded into all of its distinct one-step
+    /// neighbours ([`ops::neighbours`]), evaluated best operator first. Random children keep
+    /// running alongside (a share of the evaluations).
+    pub systematic_max_bytes: usize,
+    /// Seeds per operator when enumerating a neighbourhood.
+    pub enum_tries: usize,
+    /// Neighbours kept per expansion.
+    pub enum_cap: usize,
+    /// Scheduler advice (`mwdec_oracle::advice`) on reorder diffs, at most this many calls per
+    /// search (each is a compile under the debugger plus a `-sym on` compile; 0 = off).
+    pub max_advice: u64,
 }
 
 impl Default for SearchConfig {
@@ -73,10 +89,15 @@ impl Default for SearchConfig {
             only_ops: vec![],
             polish_evals: 60,
             use_hints: true,
+            warm_fast: Duration::from_secs(20),
             tracer: None,
             locate: true,
             focus_prob: 0.6,
             disabled_ops: vec![],
+            systematic_max_bytes: 128,
+            enum_tries: 12,
+            enum_cap: 800,
+            max_advice: 0,
         }
     }
 }
@@ -130,6 +151,11 @@ pub struct SearchResult {
     /// Children whose first mutation was restricted to the differing statements.
     pub focused: u64,
     pub focused_improved: u64,
+    /// Systematic search: neighbourhoods enumerated, and evaluations taken from them.
+    pub expansions: u64,
+    pub systematic: u64,
+    /// Scheduler advice calls (reorder diffs).
+    pub advices: u64,
 }
 
 #[derive(Clone)]
@@ -188,7 +214,23 @@ struct State {
     traces: u64,
     restarts: u64,
     history: Vec<Improvement>,
+    /// Systematic search: neighbours of the candidate being expanded (popped from the end).
+    enum_q: Vec<(String, usize)>,
+    /// Evaluated candidates not expanded yet (bounded, best kept).
+    open: Vec<Cand>,
+    expanded: HashSet<u128>,
+    enum_busy: bool,
+    expansions: u64,
+    systematic: u64,
+    advices: u64,
+    /// Latest new best waiting for diagnostics (older ones are superseded).
+    diag_q: Option<(Arc<String>, Fitness, u128)>,
 }
+
+/// Open candidates kept for systematic expansion.
+const OPEN_CAP: usize = 512;
+/// Share of evaluations that stay random children while a neighbourhood is being evaluated.
+const RANDOM_SHARE: f64 = 0.5;
 
 fn text_hash(s: &str) -> u128 {
     mwdec_mwcc::content_hash(&[normalize(s).as_bytes()])
@@ -276,6 +318,28 @@ impl State {
             .collect()
     }
 
+    /// Remember an evaluated candidate for systematic expansion.
+    fn add_open(&mut self, c: Cand) {
+        if self.expanded.contains(&c.h) || self.open.iter().any(|o| o.h == c.h) {
+            return;
+        }
+        self.open.push(c);
+        if self.open.len() > OPEN_CAP {
+            if let Some(w) = (0..self.open.len()).max_by(|&a, &b| self.open[a].fit.cmp_better(&self.open[b].fit).then(self.open[a].len.cmp(&self.open[b].len))) {
+                self.open.remove(w);
+            }
+        }
+    }
+
+    /// The best open candidate, marked expanded. Equal fitness: the first evaluated (breadth
+    /// first over a plateau, in the order the neighbourhoods were ranked).
+    fn pop_open(&mut self) -> Option<Cand> {
+        let i = (0..self.open.len()).min_by(|&a, &b| self.open[a].fit.cmp_better(&self.open[b].fit))?;
+        let c = self.open.remove(i);
+        self.expanded.insert(c.h);
+        Some(c)
+    }
+
     fn insert_beam(&mut self, c: Cand, cap: usize, rng: &mut Rng) {
         if self.beam.iter().any(|b| Arc::ptr_eq(&b.src, &c.src) || *b.src == *c.src) {
             return;
@@ -315,6 +379,8 @@ struct Directed {
     lines: Option<Arc<Vec<u32>>>,
     traced: bool,
     located: bool,
+    /// The scheduler advice ran (`mwdec_oracle::advice::statement_moves_in`).
+    advised: bool,
 }
 
 fn directed_for(
@@ -324,10 +390,11 @@ fn directed_for(
     src: &str,
     fit: &Fitness,
     ops_ids: (usize, usize, usize),
+    advice_left: bool,
 ) -> Directed {
     let (trace_op, sched_op, swap_op) = ops_ids;
     let symbol = &scorer.symbol;
-    let mut d = Directed { cands: vec![], focus: None, lines: None, traced: false, located: false };
+    let mut d = Directed { cands: vec![], focus: None, lines: None, traced: false, located: false, advised: false };
     if fit.exact {
         return d;
     }
@@ -408,6 +475,29 @@ fn directed_for(
             }
         }
     }
+    // Reorder diffs: the real scheduler says which statement to move (program-order ties and
+    // operands waited for, besides the forced moves found above).
+    if fit.profile.reorder > 0 && advice_left {
+        if let Some(tr) = &cfg.tracer {
+            let tf = crate::locate::to_asm(scorer.tf);
+            let tobj = mwdec_oracle::asm::Obj { funcs: vec![tf.clone()], ..Default::default() };
+            let cand = mwdec_oracle::advice::Candidate { context: &tr.context, src, symbol };
+            if let Ok(diag) = mwdec_oracle::advice::statement_moves_in(&tr.comp, &cand, &tobj, &tf) {
+                d.advised = true;
+                if cfg.verbose {
+                    let mv: Vec<_> = diag.moves.iter().map(|m| (m.line, m.before, m.votes)).collect();
+                    eprintln!("  advice: moves {mv:?}");
+                }
+                for m in diag.moves.iter().take(6) {
+                    for c in crate::locate::move_before(src, symbol, m.line, m.before) {
+                        if !d.cands.iter().any(|v| v.0 == c) {
+                            d.cands.push((c, sched_op));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Popped from the end: put the most specific (tracer, then forced moves) last.
     d.cands.reverse();
     d
@@ -415,7 +505,7 @@ fn directed_for(
 
 /// Run the search from `init` (candidate source containing the function for `scorer.symbol`).
 pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
-    let t0 = Instant::now();
+    let mut t0 = Instant::now();
     let mut base = ops::base_weights();
     let hints = if cfg.use_hints { crate::hints::target_hints(scorer.tf) } else { Default::default() };
     if !hints.is_empty() {
@@ -463,7 +553,16 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
         traces: 0,
         restarts: 0,
         history: vec![],
+        enum_q: vec![],
+        open: vec![],
+        expanded: HashSet::new(),
+        enum_busy: false,
+        expansions: 0,
+        systematic: 0,
+        advices: 0,
+        diag_q: None,
     };
+    let systematic = cfg.systematic_max_bytes > 0 && scorer.tf.code.len() <= cfg.systematic_max_bytes;
     st.seen.insert(text_hash(init));
     if let Some(d) = &cfg.out_dir {
         let _ = std::fs::create_dir_all(d);
@@ -480,6 +579,9 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
             st.beam.push(c.clone());
             st.init = Some(c.clone());
             st.best = Some(c.clone());
+            if systematic {
+                st.add_open(c.clone());
+            }
             save(cfg, &c, "");
             st.history.push(Improvement { secs: 0.0, evals: 1, penalty: f.penalty, score: f.score, ops: vec![] });
         }
@@ -489,6 +591,11 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
     }
     let initial = e0.fitness().cloned();
     let exact0 = initial.as_ref().is_some_and(|f| f.exact);
+    if !exact0 && initial.is_some() && cfg.budget > Duration::ZERO && cfg.warm_fast > Duration::ZERO {
+        let ctx = if scorer.pch_broken.load(Ordering::Relaxed) { scorer.plain.unwrap_or(scorer.ctx) } else { scorer.ctx };
+        scorer.mwcc.warm_fast(ctx, cfg.workers.clamp(1, 4), cfg.warm_fast);
+        t0 = Instant::now();
+    }
     // Diagnostic compiles with line info: only set up when there is something to search.
     let want_locator = cfg.locate && !exact0 && initial.is_some() && cfg.budget > Duration::ZERO;
     let locator_cell: std::sync::OnceLock<Option<crate::locate::Locator>> = std::sync::OnceLock::new();
@@ -503,7 +610,8 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
             })
             .as_ref()
     };
-    // Diagnostics of the initial candidate run in the first worker while the others search.
+    // Diagnostics (initial candidate, then new bests) run in their own thread while the workers
+    // search.
     let init_diag = AtomicBool::new(initial.is_some() && cfg.budget > Duration::ZERO);
     // Set once the initial diagnostics are in (the generation-failure stop waits for them).
     let init_diag_done = AtomicBool::new(!init_diag.load(Ordering::Relaxed));
@@ -514,37 +622,92 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
     let locator = &locator;
 
     std::thread::scope(|s| {
+        // diagnostics thread
+        {
+            let state = &state;
+            let stop = &stop;
+            let init_src = init_src.clone();
+            let init_diag = &init_diag;
+            let init_diag_done = &init_diag_done;
+            let initial = &initial;
+            let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, move || {
+                let merge = |d: Directed, h: u128| {
+                    let mut g = state.lock().unwrap();
+                    g.advices += d.advised as u64;
+                    g.traces += d.traced as u64;
+                    g.locates += d.located as u64;
+                    if let Some(fr) = d.focus {
+                        g.focus.insert(h, fr);
+                    }
+                    if d.lines.is_some() {
+                        g.focus_lines = d.lines;
+                    }
+                    g.priority.extend(d.cands);
+                };
+                if init_diag.swap(false, Ordering::Relaxed) {
+                    if let Some(f) = &initial {
+                        merge(directed_for(scorer, cfg, locator(), &init_src, f, ops_ids, cfg.max_advice > 0), text_hash(&init_src));
+                    }
+                }
+                init_diag_done.store(true, Ordering::Relaxed);
+                while !stop.load(Ordering::Relaxed) {
+                    let (job, left) = {
+                        let mut g = state.lock().unwrap();
+                        (g.diag_q.take(), g.advices < cfg.max_advice)
+                    };
+                    match job {
+                        Some((src, fit, h)) => merge(directed_for(scorer, cfg, locator(), &src, &fit, ops_ids, left), h),
+                        None => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            });
+        }
         for w in 0..cfg.workers.max(1) {
             let state = &state;
             let stop = &stop;
             let base = &base;
             let symbol = &symbol;
             let init_src = init_src.clone();
-            let init_diag = &init_diag;
             let init_diag_done = &init_diag_done;
-            let initial = &initial;
             let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, move || {
                 let mut rng = Rng::new(cfg.seed.wrapping_mul(0x1000_0000_01b3).wrapping_add(w as u64 * 7919 + 1));
-                if init_diag.swap(false, Ordering::Relaxed) {
-                    if let Some(f) = &initial {
-                        let d = directed_for(scorer, cfg, locator(), &init_src, f, ops_ids);
-                        let mut g = state.lock().unwrap();
-                        g.traces += d.traced as u64;
-                        g.locates += d.located as u64;
-                        if let Some(fr) = d.focus {
-                            g.focus.insert(text_hash(&init_src), fr);
-                        }
-                        if d.lines.is_some() {
-                            g.focus_lines = d.lines;
-                        }
-                        g.priority.extend(d.cands);
-                    }
-                    init_diag_done.store(true, Ordering::Relaxed);
-                }
                 while !stop.load(Ordering::Relaxed) {
                     if t0.elapsed() >= cfg.budget {
                         stop.store(true, Ordering::Relaxed);
                         break;
+                    }
+                    // Systematic search: expand the best open candidate once the current
+                    // neighbourhood is used up.
+                    if systematic {
+                        let job = {
+                            let mut g = state.lock().unwrap();
+                            if g.priority.is_empty() && g.enum_q.is_empty() && !g.enum_busy {
+                                g.pop_open().map(|c| {
+                                    g.enum_busy = true;
+                                    let w = g.weights(base, &c.fit, cfg);
+                                    let focus = g.focus.get(&c.h).cloned().or_else(|| g.focus_lines.as_ref().map(|ls| Arc::new(crate::locate::line_ranges(&c.src, ls))));
+                                    (c, w, focus, g.expansions)
+                                })
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((c, w, focus, k)) = job {
+                            let te = Instant::now();
+                            let nb = ops::neighbours(&c.src, symbol, &w, hints_ref, focus.as_deref().map(|v| v.as_slice()), cfg.enum_tries, cfg.seed ^ (k + 1).wrapping_mul(0x9e37_79b9), cfg.enum_cap);
+                            let hs: Vec<u128> = nb.iter().map(|n| text_hash(&n.src)).collect();
+                            let total = nb.len();
+                            let mut g = state.lock().unwrap();
+                            g.enum_busy = false;
+                            g.expansions += 1;
+                            let mut q: Vec<(String, usize)> = nb.into_iter().zip(hs).filter(|(_, h)| !g.seen.contains(h)).map(|(n, _)| (n.src, n.op)).collect();
+                            q.reverse();
+                            if cfg.verbose {
+                                eprintln!("  expand [{:.1}s]: penalty {} -> {} new of {} neighbours ({} ms)", t0.elapsed().as_secs_f64(), c.fit.penalty, q.len(), total, te.elapsed().as_millis());
+                            }
+                            g.enum_q = q;
+                            continue;
+                        }
                     }
                     // Choose parent and weights; directed candidates first.
                     let (parent, weights, directed, focus, chain) = {
@@ -566,7 +729,11 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
                             let init = g.init.clone().unwrap();
                             g.beam = vec![best, init];
                         }
-                        let directed = g.priority.pop();
+                        let mut directed = g.priority.pop();
+                        if directed.is_none() && systematic && !g.enum_q.is_empty() && !rng.chance(RANDOM_SHARE) {
+                            directed = g.enum_q.pop();
+                            g.systematic += 1;
+                        }
                         let p = if directed.is_some() || rng.chance(0.5) || g.beam.len() == 1 {
                             g.best.clone().unwrap()
                         } else {
@@ -695,25 +862,19 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
                         if fit.exact {
                             stop.store(true, Ordering::Relaxed);
                         }
+                        // first improvement: continue from the new best's neighbourhood
+                        g.enum_q.clear();
+                    }
+                    if systematic {
+                        g.add_open(cand.clone());
                     }
                     let _ = &init_src;
                     // New best: tracer fixes / schedcheck moves / diff focus.
                     let diag_src = (is_best && !fit.exact && g.traced.insert(h)).then(|| cand.src.clone());
-                    g.insert_beam(cand, cfg.beam, &mut rng);
-                    drop(g);
                     if let Some(s) = diag_src {
-                        let d = directed_for(scorer, cfg, locator(), &s, &fit, ops_ids);
-                        let mut g = state.lock().unwrap();
-                        g.traces += d.traced as u64;
-                        g.locates += d.located as u64;
-                        if let Some(fr) = d.focus {
-                            g.focus.insert(h, fr);
-                        }
-                        if d.lines.is_some() {
-                            g.focus_lines = d.lines;
-                        }
-                        g.priority.extend(d.cands);
+                        g.diag_q = Some((s, fit.clone(), h));
                     }
+                    g.insert_beam(cand, cfg.beam, &mut rng);
                 }
             });
         }
@@ -751,6 +912,9 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
         locates: g.locates,
         focused: g.focused,
         focused_improved: g.focused_improved,
+        expansions: g.expansions,
+        systematic: g.systematic,
+        advices: g.advices,
     };
     if let Some(b) = &best {
         save(cfg, b, &serde_json::to_string_pretty(&res).unwrap_or_default());

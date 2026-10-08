@@ -146,6 +146,8 @@ pub enum NoDraft {
     /// Compiler-generated special member or header-defined template member: no standalone
     /// definition exists (`mwdec_project::standalone`).
     Implicit(String),
+    /// Machine code only assembly produces (`mwdec_lift::asmonly`): no C/C++ source can match.
+    Asm(String),
     Lift(String),
 }
 
@@ -305,6 +307,82 @@ pub fn choose_draft(ui: &UnitInputs, f: &Function, scorer: &Scorer, with_inlines
     choose_between(scorer, with_inlines, plain)
 }
 
+/// Kind of a function the compiler emits without a definition in the unit (`hdr-inline` or an
+/// `mwdec_project::standalone` implicit kind); None for ordinary functions.
+pub fn emitted_kind(ui: &UnitInputs, f: &Function) -> Option<String> {
+    let db = ui.db.as_ref()?;
+    match mwdec_project::standalone::standalone(&mwdec_lift::sig::sig_of(&f.name, Some(db)), db) {
+        mwdec_project::standalone::Standalone::Yes => None,
+        mwdec_project::standalone::Standalone::HeaderInline => Some("hdr-inline".into()),
+        mwdec_project::standalone::Standalone::Implicit(k) => Some(k.to_string()),
+    }
+}
+
+/// Sources that make the compiler emit `f` (an explicit instantiation or a use; see
+/// `mwdec_emit::instantiate`), for header inlines, template instances and implicit members.
+pub fn instantiation_drafts(ui: &UnitInputs, f: &Function) -> Vec<String> {
+    let db = ui.db.as_ref();
+    let sig = mwdec_lift::sig::sig_of(&f.name, db);
+    let is_class = |s: &str| {
+        db.is_some_and(|d| mwdec_lift::sig::find_class(d, s).is_some())
+            || mwdec_lift::sig::split_scope(s).1.chars().next().is_some_and(|c| !c.is_ascii_lowercase())
+    };
+    if mwdec_lift::sig::demangle(&f.name).is_none() {
+        return mwdec_emit::instantiate::triggers_c(&sig);
+    }
+    mwdec_emit::instantiate::triggers(&f.name, Some(&sig.ret), &is_class)
+}
+
+/// Lifted bodies of a function the compiler emits on demand (explicit specializations), each
+/// alone and followed by each use from `alts`: a specialization of an inline member is itself
+/// inline, emitted only when something needs it out of line.
+pub fn specialization_drafts(alts: &[String], lifted: impl Iterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for l in lifted {
+        out.push(l.clone());
+        for a in alts.iter().filter(|a| !a.starts_with("template ")) {
+            out.push(format!("{l}
+{a}"));
+        }
+    }
+    out
+}
+
+/// The best (by compile + compare) of several drafts, in order; the first exact one wins.
+pub fn choose_among(scorer: &Scorer, cands: Vec<String>) -> Option<String> {
+    let mut best: Option<(String, Option<mwdec_search::Fitness>)> = None;
+    let mut seen = std::collections::HashSet::new();
+    for c in cands {
+        if !seen.insert(c.clone()) {
+            continue;
+        }
+        let (r, _) = scorer.eval(&c);
+        let fit = r.fitness().cloned();
+        if std::env::var_os("MWDEC_SHOW_DRAFTS").is_some() {
+            let what = match &fit {
+                Some(f) if f.exact => "exact".to_string(),
+                Some(f) => format!("score {:.1}", f.score),
+                None => format!("{:?}", r).chars().take(300).collect(),
+            };
+            eprintln!("--- candidate: {what}
+{c}");
+        }
+        if fit.as_ref().is_some_and(|f| f.exact) {
+            return Some(c);
+        }
+        let better = match (&best, &fit) {
+            (None, _) => true,
+            (Some((_, None)), Some(_)) => true,
+            (Some((_, Some(b))), Some(x)) => x.better_than(b),
+            _ => false,
+        };
+        if better {
+            best = Some((c, fit));
+        }
+    }
+    best.map(|b| b.0)
+}
+
 /// The better (by compile + compare) of the draft with folded inlines and the one without.
 pub fn choose_between(scorer: &Scorer, with_inlines: String, plain: Option<String>) -> String {
     let Some(plain) = plain.filter(|p| *p != with_inlines) else { return with_inlines };
@@ -317,21 +395,51 @@ pub fn choose_between(scorer: &Scorer, with_inlines: String, plain: Option<Strin
     }
 }
 
+/// Register-only mismatch of the chosen draft: a bounded deterministic repair over
+/// variable-structure edits (`mwdec_search::regfix`), scored by the compiler. Part of drafting;
+/// `MWDEC_NO_REGFIX` switches it off.
+pub fn repair_registers(scorer: &Scorer, src: String, tracer: Option<&mwdec_search::trace::Tracer>) -> String {
+    if std::env::var("MWDEC_NO_REGFIX").is_ok() {
+        return src;
+    }
+    let (e, _) = scorer.eval(&src);
+    let Some(f) = e.fitness() else { return src };
+    if !mwdec_search::regfix::register_only(f) {
+        return src;
+    }
+    // Many compiles of one context: persistent compilers pay off here (started on demand).
+    scorer.mwcc.enable_fast(4);
+    match mwdec_search::regfix::repair(scorer, &src, f, tracer, &mwdec_search::regfix::RepairConfig::default()) {
+        Some(r) => r.src,
+        None => src,
+    }
+}
+
 pub fn draft_variant(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool) -> std::result::Result<String, NoDraft> {
-    draft_opts(ui, f, inlines, include_implicit, false)
+    draft_opts(ui, f, inlines, include_implicit, false, false)
 }
 
 /// Draft with member accesses as raw offsets (a fallback when field accesses don't compile,
 /// e.g. private members used from a free function).
 pub fn draft_raw(ui: &UnitInputs, f: &Function) -> std::result::Result<String, NoDraft> {
-    draft_opts(ui, f, true, false, true)
+    draft_opts(ui, f, true, false, true, false)
 }
 
-fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool, raw_offsets: bool) -> std::result::Result<String, NoDraft> {
+/// A static initializer's draft with the globals the context doesn't declare defined `const`.
+pub fn draft_sinit_const(ui: &UnitInputs, f: &Function) -> std::result::Result<String, NoDraft> {
+    draft_opts(ui, f, true, false, false, true)
+}
+
+fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bool, raw_offsets: bool, sinit_const: bool) -> std::result::Result<String, NoDraft> {
+    if !include_implicit {
+        if let Some(why) = mwdec_lift::asmonly::requires_asm(&ui.target, f) {
+            return Err(NoDraft::Asm(why));
+        }
+    }
     if let Some(db) = &ui.db {
         let sig = mwdec_lift::sig::sig_of(&f.name, Some(db));
         match mwdec_project::standalone::standalone(&sig, db) {
-            mwdec_project::standalone::Standalone::HeaderInline => return Err(NoDraft::HeaderInline),
+            mwdec_project::standalone::Standalone::HeaderInline if !include_implicit => return Err(NoDraft::HeaderInline),
             mwdec_project::standalone::Standalone::Implicit(k) if !include_implicit => return Err(NoDraft::Implicit(k.to_string())),
             _ => {}
         }
@@ -349,7 +457,7 @@ fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bo
         Ok(Err(e)) => return Err(NoDraft::Lift(e.to_string())),
         Err(_) => return Err(NoDraft::Lift("lifter panic".into())),
     };
-    let em = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_emit::emit_function(&ir, ui.db.as_ref(), &mwdec_emit::EmitOptions { c_mode: ui.c_mode, raw_offsets, ..Default::default() }))) {
+    let em = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_emit::emit_function(&ir, ui.db.as_ref(), &mwdec_emit::EmitOptions { c_mode: ui.c_mode, raw_offsets, sinit_const, ..Default::default() }))) {
         Ok(em) => em,
         Err(_) => return Err(NoDraft::Lift("emitter panic".into())),
     };
@@ -466,15 +574,28 @@ pub fn cmd_match(root: &Path, work: &Path, a: MatchArgs) -> Result<()> {
     let init = match &a.init {
         Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
         None => match draft(&ui, f) {
+            Ok(s) if emitted_kind(&ui, f).is_some() || mwdec_emit::instantiate::is_template_instance(&f.name) => {
+                let ti = ObjIndex::with_externs(&ui.target, &t_ext);
+                let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&o_ext), &a.symbol);
+                let mut c = instantiation_drafts(&ui, f);
+                let lifted = specialization_drafts(&c, std::iter::once(s));
+                c.extend(lifted);
+                choose_among(&scorer, c).unwrap_or_default()
+            }
             Ok(s) => s,
             Err(NoDraft::HeaderInline) => bail!("{} is defined inline in a context header; nothing to decompile", a.symbol),
             Err(NoDraft::Implicit(k)) => bail!("{} can't exist as standalone source ({k})", a.symbol),
+            Err(NoDraft::Asm(k)) => bail!("{} needs assembly ({k}); pass --init <file.cpp>", a.symbol),
             Err(NoDraft::Lift(e)) => bail!("no first draft ({e}); pass --init <file.cpp>"),
         },
     };
     let ti = ObjIndex::with_externs(&ui.target, &t_ext);
     let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&o_ext), &a.symbol);
-    let init = if a.init.is_none() { choose_draft(&ui, f, &scorer, init) } else { init };
+    let init = if a.init.is_none() && emitted_kind(&ui, f).is_none() && !mwdec_emit::instantiate::is_template_instance(&f.name) {
+        repair_registers(&scorer, choose_draft(&ui, f, &scorer, init), ui.tracer.as_deref())
+    } else {
+        init
+    };
     let out = a.out.clone().unwrap_or_else(|| search_dir().join(sanitize(&u.name)).join(sanitize(&a.symbol)));
     let cfg = SearchConfig {
         budget: Duration::from_secs(a.budget_secs),
@@ -793,12 +914,13 @@ fn run_one(
         return;
     };
     let d = match drafter {
-        Some(c) => c.draft(&e.unit, &e.symbol, a.include_implicit),
-        None => crate::draft_server::draft_local(ui, &e.symbol, a.include_implicit),
+        Some(c) => c.draft(&e.unit, &e.symbol, a.include_implicit, false),
+        None => crate::draft_server::draft_local(ui, &e.symbol, a.include_implicit, false),
     };
     row.implicit = d.implicit.clone();
     let (src, plain) = match (d.status.as_str(), d.src) {
         ("ok", Some(s)) => (s, d.plain),
+        (_, _) if !d.alts.is_empty() => (d.alts[0].clone(), None),
         (st, _) => {
             row.status = if st == "ok" { "lift-err".into() } else { st.to_string() };
             row.error = d.error;
@@ -808,10 +930,39 @@ fn run_one(
     row.drafted = true;
     let ti = ObjIndex::with_externs(&ui.target, &ext.0);
     let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &e.symbol);
-    let src = choose_between(&scorer, src, plain);
+    let src = if d.alts.is_empty() {
+        choose_between(&scorer, src, plain)
+    } else {
+        // (instantiations first for functions emitted on demand, else the lifted drafts first)
+        let mut c = if d.implicit.is_some() { d.alts.clone() } else { vec![] };
+        c.push(src);
+        c.extend(plain);
+        if d.implicit.is_none() {
+            c.extend(d.alts.iter().cloned());
+        }
+        let best = choose_among(&scorer, c.clone()).unwrap_or_default();
+        if d.implicit.is_some() && !scorer.eval(&best).0.fitness().is_some_and(|f| f.exact) {
+            // none of the instantiations matches (the header's body differs from the target's):
+            // the lifted body as an explicit specialization
+            let l = match drafter {
+                Some(dc) => dc.draft(&e.unit, &e.symbol, true, true),
+                None => crate::draft_server::draft_local(ui, &e.symbol, true, true),
+            };
+            c.extend(specialization_drafts(&d.alts, l.src.into_iter().chain(l.plain)));
+            choose_among(&scorer, c).unwrap_or_default()
+        } else {
+            best
+        }
+    };
+    let src = repair_registers(&scorer, src, ui.tracer.as_deref());
     // Compile the draft before the search clock starts: a compiler crash with the unit's PCH is
     // repaired here (split PCH, once per unit context, cached on disk), not inside the budget.
-    let _ = scorer.eval(&src);
+    let (first, _) = scorer.eval(&src);
+    // a draft that doesn't compile (e.g. a private member) is replaced by the raw-offsets draft
+    let src = match (first.fitness(), d.raw) {
+        (None, Some(raw)) if scorer.eval(&raw).0.fitness().is_some() => raw,
+        _ => src,
+    };
     let cfg = SearchConfig {
         budget: Duration::from_secs(a.budget_secs),
         max_compiles: a.max_compiles,
@@ -866,6 +1017,7 @@ fn print_table(rows: &[Row]) {
         scored: usize,
         hdr: usize,
         imp: usize,
+        asm: usize,
     }
     let mut by: BTreeMap<&str, B> = BTreeMap::new();
     let mut tot = B::default();
@@ -877,6 +1029,10 @@ fn print_table(rows: &[Row]) {
             }
             if r.status == "implicit" {
                 b.imp += 1;
+                continue;
+            }
+            if r.status == "asm" {
+                b.asm += 1;
                 continue;
             }
             b.n += 1;
@@ -891,10 +1047,10 @@ fn print_table(rows: &[Row]) {
         }
     }
     let pct = |a: usize, n: usize| if n == 0 { "-".to_string() } else { format!("{:.1}%", 100.0 * a as f64 / n as f64) };
-    println!("{:<8} {:>5} {:>8} {:>9} {:>9} {:>9} {:>10} {:>6} {:>6}", "size", "n", "drafted", "compiled", "1st-exact", "final", "mean-best", "hdr", "impl");
+    println!("{:<8} {:>5} {:>8} {:>9} {:>9} {:>9} {:>10} {:>6} {:>6} {:>6}", "size", "n", "drafted", "compiled", "1st-exact", "final", "mean-best", "hdr", "impl", "asm");
     let line = |name: &str, b: &B| {
         println!(
-            "{:<8} {:>5} {:>8} {:>9} {:>9} {:>9} {:>10} {:>6} {:>6}",
+            "{:<8} {:>5} {:>8} {:>9} {:>9} {:>9} {:>10} {:>6} {:>6} {:>6}",
             name,
             b.n,
             pct(b.drafted, b.n),
@@ -903,7 +1059,8 @@ fn print_table(rows: &[Row]) {
             pct(b.fin, b.n),
             if b.scored > 0 { format!("{:.1}", b.score / b.scored as f64) } else { "-".into() },
             b.hdr,
-            b.imp
+            b.imp,
+            b.asm
         );
     };
     for name in SIZE_BUCKETS {
@@ -912,4 +1069,18 @@ fn print_table(rows: &[Row]) {
         }
     }
     line("all", &tot);
+    // functions emitted without a definition (evaluated with --include-implicit), by kind
+    let mut kinds: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+    for r in rows.iter().filter(|r| r.status != "implicit" && r.status != "hdr-inline") {
+        let k = kinds.entry(r.implicit.as_deref().unwrap_or("standalone")).or_default();
+        k.0 += 1;
+        k.1 += r.compiled as usize;
+        k.2 += r.final_exact as usize;
+    }
+    if kinds.len() > 1 {
+        println!("{:<24} {:>5} {:>9} {:>9}", "kind", "n", "compiled", "exact");
+        for (k, (n, c, x)) in &kinds {
+            println!("{:<24} {:>5} {:>9} {:>9}", k, n, pct(*c, *n), pct(*x, *n));
+        }
+    }
 }

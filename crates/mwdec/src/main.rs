@@ -379,7 +379,13 @@ fn cmd_check(
         bail!("unit {} has no compiler flags in build.ninja", u.name);
     }
     let code = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let m = Mwcc::new(root, work, 6);
+    // The unit's own compiler (Dolphin SDK / runtime units use GC/1.2.5n etc.).
+    let mut m = Mwcc::new(root, work, 6);
+    let compiler = p.compiler_rel(&u.name);
+    if m.compiler != compiler {
+        m = Mwcc::new(root, &work.join(compiler.replace(['/', '.'], "_")), 6);
+        m.compiler = compiler;
+    }
     let context = if no_context { String::new() } else { harness::context_tu(&p, u)? };
     let t = Instant::now();
     let plain = m.plain_context(&context, &u.cflags).named(&u.name);
@@ -762,10 +768,8 @@ fn cmd_bench_compile(root: &Path, work: &Path, unit: &str, n: usize, jobs: usize
         "parallel pool ({jobs} jobs): {k} compiles in {total:.0} ms = {:.1} ms/compile effective ({ok} ok)",
         total / k as f64
     );
-    // Clean up: the bench-only PCH and the uncached objects left in work/tmp.
-    if let Some(mch) = &pch.mch {
-        let _ = std::fs::remove_file(mch);
-    }
+    // Clean up the uncached objects left in work/tmp. The PCH stays: it is a shared,
+    // content-addressed file that other processes using this work dir may be compiling against.
     if let Ok(rd) = std::fs::read_dir(work.join("tmp")) {
         for e in rd.flatten() {
             if e.file_name().to_string_lossy().starts_with(&format!("tu_{}_", std::process::id())) {

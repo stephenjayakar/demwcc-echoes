@@ -72,6 +72,15 @@ impl Mwcc {
     /// Context whose PCH holds the context lines except `excluded`, which are included as text
     /// in front of each candidate (followed by `#line 1`, so candidate line numbers are unchanged).
     pub fn precompile_split(&self, ctx: &UnitContext, excluded: &[usize]) -> Result<UnitContext, MwccError> {
+        self.split_context(ctx, excluded, false)
+    }
+
+    /// [`Mwcc::precompile_split`] into a private `.mch` that only the caller uses (and deletes).
+    fn precompile_split_trial(&self, ctx: &UnitContext, excluded: &[usize]) -> Result<UnitContext, MwccError> {
+        self.split_context(ctx, excluded, true)
+    }
+
+    fn split_context(&self, ctx: &UnitContext, excluded: &[usize], private: bool) -> Result<UnitContext, MwccError> {
         let lines = lines_of(&ctx.context);
         let pch: Vec<&str> = lines.iter().enumerate().filter(|(i, _)| !excluded.contains(i)).map(|(_, l)| *l).collect();
         let text: Vec<&str> = lines.iter().enumerate().filter(|(i, _)| excluded.contains(i)).map(|(_, l)| *l).collect();
@@ -79,7 +88,7 @@ impl Mwcc {
         if pch.is_empty() {
             pctx = "/* empty */\n".into();
         }
-        let built = self.precompile_mch(&pctx, &ctx.cflags)?;
+        let built = if private { self.precompile_private(&pctx, &ctx.cflags)? } else { self.precompile_mch(&pctx, &ctx.cflags)? };
         Ok(UnitContext {
             cflags: ctx.cflags.clone(),
             context: ctx.context.clone(),
@@ -154,9 +163,11 @@ impl Mwcc {
             if trials.get() > MAX_TRIALS {
                 return None;
             }
-            let sp = self.precompile_split(ctx, ex).ok()?;
+            // a private PCH: the shared content-addressed one of the same lines may be in use by
+            // another process (deleting it made their compiles fail with "cannot be opened")
+            let sp = self.precompile_split_trial(ctx, ex).ok()?;
             let r = !matches!(self.compile_pch(&sp, code), Err(MwccError::Crash { .. }));
-            if let Some(m) = sp.mch.as_ref().filter(|m| Some(*m) != ctx.mch.as_ref()) {
+            if let Some(m) = sp.mch.as_ref() {
                 let _ = std::fs::remove_file(m);
             }
             Some(r)
@@ -248,7 +259,11 @@ impl Mwcc {
                 Some(s) => s.excluded.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","),
                 None => "none".into(),
             };
-            let _ = std::fs::write(f, body);
+            // written whole (readers never see a partial file)
+            let tmp = f.with_extension(format!("split.{}", self.unique("w")));
+            if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, f).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
         result
     }

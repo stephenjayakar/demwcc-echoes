@@ -1069,7 +1069,7 @@ fn assigns<'a>(b: &'a [Stmt], out: &mut Vec<(&'a Expr, &'a Expr)>) {
 /// Accesses at constant addresses inside a variable the context declares at an absolute address
 /// (hardware register arrays, `vu16 __DSPRegs[32] : 0xCC005000;`) are elements of it:
 /// `__DSPRegs[3]` (the compiler then materializes the array's base and indexes from it).
-pub fn absolute_globals(body: &mut Vec<Stmt>, db: &TypeDb) {
+pub fn absolute_globals(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
     if db.abs_addrs.is_empty() {
         return;
     }
@@ -1099,8 +1099,85 @@ pub fn absolute_globals(body: &mut Vec<Stmt>, db: &TypeDb) {
             _ => None,
         }
     }
+    // a register-array element with a computed index, `K + i*n` (`__EXIRegs[chan * 5]`): the
+    // compiler materializes the array's address and adds the scaled index. A single-assignment
+    // variable holding such an address (the compiler's CSE of the repeated element) is
+    // substituted back into its accesses first.
+    // `K + x*n (+ c)` with a constant base K (possibly behind a cast) -> (x, n, K + c)
+    let split_abs = |e: &Expr| -> Option<(Expr, u32, i64)> {
+        let mut e = e;
+        while let Expr::Cast { e: inner, .. } = e {
+            e = inner;
+        }
+        let Expr::Binary { op: BinOp::Add, l, r, .. } = e else { return None };
+        let (k, rest) = match (konst(l), konst(r)) {
+            (Some(k), None) => (k, &**r),
+            (None, Some(k)) => (k, &**l),
+            _ => return None,
+        };
+        let (x, n, c) = split_index(rest, vars, Some(db)).or_else(|| Some((rest.clone(), 1, 0)))?;
+        Some((x, n, (k as i64).wrapping_add(c)))
+    };
+    let in_region = |a: u32| regions.iter().any(|(_, start, _, es, cnt)| a >= *start && a < start.wrapping_add(es * cnt));
+    let dyn_addr = |e: &Expr| -> bool {
+        matches!(split_abs(e), Some((_, _, k)) if in_region(k as u32))
+    };
+    let mut nassign: HashMap<VarId, usize> = HashMap::new();
+    let mut value: HashMap<VarId, Expr> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for st in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), src } = st {
+                *nassign.entry(*v).or_default() += 1;
+                value.insert(*v, src.clone());
+            }
+        }
+    });
+    let subst: HashMap<VarId, Expr> = value
+        .into_iter()
+        .filter(|(v, src)| {
+            nassign.get(v) == Some(&1) && dyn_addr(src) && {
+                // operands never reassigned (parameters, single-assignment temps)
+                let mut ok = true;
+                src.walk(&mut |x| {
+                    if let Expr::Var(w) = x {
+                        ok &= nassign.get(w).copied().unwrap_or(0) <= 1 && w != v;
+                    }
+                });
+                ok
+            }
+        })
+        .collect();
+    if !subst.is_empty() {
+        Stmt::rewrite_exprs(body, &mut |e| {
+            if let Expr::Load { base, .. } = e {
+                if let Expr::Var(v) = &**base {
+                    if let Some(src) = subst.get(v) {
+                        *base = Box::new(src.clone());
+                    }
+                }
+            }
+        });
+    }
     Stmt::rewrite_exprs(body, &mut |e| {
         let Expr::Load { base, offset, ty } = e else { return };
+        if konst(base).is_none() {
+            let Some((x, n, k)) = split_abs(base) else { return };
+            let a = (k as u32).wrapping_add(*offset as u32);
+            for (name, start, et, es, cnt) in &regions {
+                let end = start.wrapping_add(es * cnt);
+                if a >= *start && a < end && (a - start) % es == 0 && n % es == 0 && scalar_size(ty) == Some(*es) {
+                    let it = Type::Int { size: 4, signed: true };
+                    let mut idx = if n / es == 1 { x.clone() } else { Expr::bin(BinOp::Mul, x.clone(), Expr::int((n / es) as i64), it.clone()) };
+                    if a > *start {
+                        idx = Expr::bin(BinOp::Add, idx, Expr::int(((a - start) / es) as i64), it);
+                    }
+                    let arr = Type::Array(Box::new(et.clone()), *cnt);
+                    *e = Expr::Index { base: Box::new(Expr::Global { symbol: name.clone(), ty: arr }), index: Box::new(idx), ty: et.clone() };
+                    return;
+                }
+            }
+            return;
+        }
         let Some(k) = konst(base) else { return };
         let a = k.wrapping_add(*offset as u32);
         for (n, start, et, es, cnt) in &regions {

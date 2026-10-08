@@ -14,6 +14,7 @@ pub mod buffers;
 pub mod cflow;
 pub mod complete;
 pub mod ctors;
+pub mod defctor;
 pub mod groups;
 pub mod matcher;
 pub mod objlocals;
@@ -42,6 +43,8 @@ pub struct InlineLib {
     /// Names of inlines with side effects (statement and mutator templates); folded calls of
     /// the others are pure values.
     pub effectful: std::collections::HashSet<String>,
+    /// Default constructions of the classes the target's constructors hold as members/bases.
+    pub default_ctors: defctor::DefCtors,
 }
 
 /// Version of the probe generator / template extraction (part of the cache key).
@@ -52,6 +55,7 @@ pub const TEMPLATE_VERSION: &str = "mwdec-inline templates v5";
 pub struct ProbeCache {
     templates: ser::Cache,
     failures: ser::Cache,
+    defctors: defctor::DefCache,
 }
 
 impl ProbeCache {
@@ -64,6 +68,7 @@ impl ProbeCache {
             templates: ser::Cache::new(dir.join("templates"), format!("{TEMPLATE_VERSION}\n{flags}")),
             // a probe failing in one context (access, instantiation errors) fails elsewhere too
             failures: ser::Cache::new(dir.join("failures"), format!("{TEMPLATE_VERSION}\n{flags}")),
+            defctors: defctor::DefCache::new(dir.join("defctors"), format!("{TEMPLATE_VERSION}\n{flags}")),
         }
     }
 }
@@ -72,17 +77,32 @@ impl ProbeCache {
 /// With `target`, only inlines of classes the target object refers to are probed.
 pub fn build_library_for(db: &TypeDb, target: Option<&ObjectFile>, cache: Option<&ProbeCache>, compile: &(dyn Fn(&str) -> Result<ObjectFile, String> + Sync)) -> InlineLib {
     let rel = target.map(|o| relevance::relevant_classes(o, db));
-    build_library_rel(db, rel.as_ref(), cache, compile)
+    let mut lib = build_library_rel(db, rel.as_ref(), cache, compile);
+    if let Some(o) = target {
+        let classes = defctor::wanted(o.functions.iter().map(|f| f.name.as_str()), db);
+        lib.default_ctors = defctor::build(db, &classes, cache.map(|c| &c.defctors), compile);
+    }
+    lib
 }
 
 /// Library for the classes one function can touch (see [`relevance::relevant_for_function`]).
 pub fn build_library_for_function(db: &TypeDb, f: &mwdec_core::Function, cache: Option<&ProbeCache>, compile: &(dyn Fn(&str) -> Result<ObjectFile, String> + Sync)) -> InlineLib {
     let rel = relevance::relevant_for_function(f, db);
-    build_library_rel(db, Some(&rel), cache, compile)
+    let mut lib = build_library_rel(db, Some(&rel), cache, compile);
+    let classes = defctor::wanted(std::iter::once(f.name.as_str()), db);
+    lib.default_ctors = defctor::build(db, &classes, cache.map(|c| &c.defctors), compile);
+    lib
 }
 
 fn probe_key(p: &probe::Probe) -> String {
-    p.decl.inline_body.as_deref().unwrap_or("").replacen(&p.name, "__P", 1)
+    let key = p.decl.inline_body.as_deref().unwrap_or("").replacen(&p.name, "__P", 1);
+    // probes with stack-passed arguments: lifted again since float stack slots became one word
+    let floats = p.params.iter().filter(|t| matches!(util::strip(t), mwdec_core::Type::Float { .. })).count();
+    if floats > 8 || p.params.len() - floats > 8 {
+        return format!("{key}
+stack-args 2");
+    }
+    key
 }
 
 fn build_library_rel(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>, cache: Option<&ProbeCache>, compile: &(dyn Fn(&str) -> Result<ObjectFile, String> + Sync)) -> InlineLib {

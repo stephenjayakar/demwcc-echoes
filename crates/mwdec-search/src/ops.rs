@@ -137,6 +137,7 @@ pub const OPS: &[OpDef] = &[
     OpDef { name: "swap_args", cat: Cat::Expr, weight: 2.0, aff: S | R | L | C, f: crate::near::op_swap_args },
     OpDef { name: "ret_var", cat: Cat::Control, weight: 2.0, aff: L | C, f: crate::near::op_ret_var },
     OpDef { name: "delete_stmt", cat: Cat::Expr, weight: 1.0, aff: C, f: crate::near::op_delete_stmt },
+    OpDef { name: "ctor_copy", cat: Cat::Expr, weight: 4.0, aff: S | R | C, f: crate::near::op_ctor_copy },
     // Verified no codegen effect: near-zero weight (cleanup / stepping stones only).
     OpDef { name: "unwrap_block", cat: Cat::Order, weight: 0.46, aff: 0, f: op_unwrap_block },
     OpDef { name: "wrap_block", cat: Cat::Order, weight: 0.1, aff: 0, f: op_wrap_block },
@@ -2593,6 +2594,82 @@ pub fn mutate_in(src: &str, symbol: &str, weights: &[f64], rng: &mut Rng, hints:
         }
     }
     None
+}
+
+/// One distinct neighbour of a candidate (see [`neighbours`]).
+#[derive(Clone, Debug)]
+pub struct Neighbour {
+    pub src: String,
+    pub op: usize,
+    /// Operator weight, doubled when the edit touches the focus ranges.
+    pub score: f64,
+}
+
+/// The distinct one-step neighbours of `src`, best first: every operator with a positive weight,
+/// applied with `tries` seeds (operators pick their site and variant at random, so a few seeds
+/// cover the sites of a small function), first restricted to `focus` (the differing statements)
+/// and then anywhere. At most `cap` neighbours, ordered by [`Neighbour::score`].
+pub fn neighbours(src: &str, symbol: &str, weights: &[f64], hints: Option<&RegHints>, focus: Option<&[(usize, usize)]>, tries: usize, seed: u64, cap: usize) -> Vec<Neighbour> {
+    let Some(p) = Parsed::new(src, symbol) else { return vec![] };
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<Neighbour> = Vec::new();
+    let mut rng = Rng::new(seed);
+    let mut push = |s: String, op: usize, score: f64, out: &mut Vec<Neighbour>| {
+        let n = normalize(&s);
+        match seen.get(&n) {
+            Some(&i) => {
+                if out[i].score < score {
+                    out[i].score = score;
+                    out[i].op = op;
+                }
+            }
+            None => {
+                seen.insert(n, out.len());
+                out.push(Neighbour { src: s, op, score });
+            }
+        }
+    };
+    for (op, &w) in weights.iter().enumerate() {
+        if w <= 0.0 {
+            continue;
+        }
+        if let Some(fr) = focus.filter(|f| !f.is_empty()) {
+            let (mut hits, mut misses) = (0, 0);
+            for _ in 0..tries {
+                match p.apply_in(op, &mut rng, hints, None, Some(fr)) {
+                    Some(s) => {
+                        hits += 1;
+                        push(s, op, 2.0 * w, &mut out)
+                    }
+                    None => {
+                        misses += 1;
+                        if misses >= tries && hits == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let (mut hits, mut misses) = (0, 0);
+        for _ in 0..2 * tries {
+            match p.apply(op, &mut rng, hints) {
+                Some(s) => {
+                    hits += 1;
+                    push(s, op, w, &mut out)
+                }
+                // probably no site at all: stop early
+                None => {
+                    misses += 1;
+                    if misses >= 2 * tries && hits == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(cap);
+    out
 }
 
 pub fn base_weights() -> Vec<f64> {

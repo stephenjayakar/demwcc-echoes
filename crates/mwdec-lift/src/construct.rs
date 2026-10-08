@@ -449,3 +449,136 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
         }
     });
 }
+
+/// A constructed stack object whose address reaches a call argument through the constructor's
+/// own return value (`this` in r3, not recomputed from the stack pointer) was a temporary in
+/// the source: `f(x, T(args))` instead of `T t(args); f(x, t);`. `temps` are the objects whose
+/// constructor result was used. The object must be used by nothing but its constructor, that one
+/// reference argument and its destructor right after the call, with only pure statements between
+/// the construction and the call.
+pub fn fold_returned_temps(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &mut [bool], temps: &std::collections::HashSet<VarId>) {
+    if temps.is_empty() {
+        return;
+    }
+    let mut uses: HashMap<VarId, usize> = HashMap::new();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *uses.entry(*v).or_default() += 1;
+        }
+    });
+    Stmt::for_each_block_mut(body, &mut |b| fold_returned_block(b, vars, is_temp, temps, &uses));
+}
+
+fn on_object(this: &Expr, v: VarId) -> bool {
+    matches!(this, Expr::AddrOf(x) if matches!(&**x, Expr::Var(y) if *y == v))
+}
+
+fn fold_returned_block(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &mut [bool], temps: &std::collections::HashSet<VarId>, uses: &HashMap<VarId, usize>) {
+    let mut i = 0;
+    while i < b.len() {
+        let found = match &b[i] {
+            Stmt::Expr(Expr::Call { callee: Callee::Method { sig: s, this, .. }, args, .. }) if sig::is_ctor(s) => match &**this {
+                Expr::AddrOf(x) => match &**x {
+                    Expr::Var(v) if temps.contains(v) && matches!(vars[*v].kind, VarKind::Stack { .. }) && !args.iter().any(|a| a.uses_var(*v)) => Some((*v, s.clone(), args.clone())),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((v, csig, cargs)) = found else {
+            i += 1;
+            continue;
+        };
+        // the call using it, after pure statements only
+        let mut j = i + 1;
+        while j < b.len() && !stmt_uses(&b[j], v) && pure_stmt(&b[j]) {
+            j += 1;
+        }
+        if j >= b.len() || !stmt_uses(&b[j], v) {
+            i += 1;
+            continue;
+        }
+        let dtor_after = b.get(j + 1).is_some_and(|s| matches!(s, Stmt::Expr(Expr::Call { callee: Callee::Method { sig: s, this, .. }, args, .. }) if sig::is_dtor(s) && on_object(this, v) && args.iter().all(|a| a.as_int().is_some())));
+        let mut in_call = 0;
+        Stmt::walk_exprs(std::slice::from_ref(&b[j]), &mut |e| {
+            if let Expr::Var(x) = e {
+                if *x == v {
+                    in_call += 1;
+                }
+            }
+        });
+        let total = uses.get(&v).copied().unwrap_or(0);
+        if in_call != 1 || total != 2 + dtor_after as usize {
+            i += 1;
+            continue;
+        }
+        // the use: `&v` passed for a reference parameter
+        let class = vars[v].ty.clone();
+        let mut done = false;
+        let mut stmt = b[j].clone();
+        Stmt::rewrite_exprs(std::slice::from_mut(&mut stmt), &mut |e| {
+            if done {
+                return;
+            }
+            if let Expr::Call { callee: Callee::Method { sig: s, .. } | Callee::Direct { sig: s, .. }, args, .. } = e {
+                for (n, a) in args.iter_mut().enumerate() {
+                    if on_object(a, v) && s.params.get(n).is_some_and(|p| matches!(strip_cv_ty(&p.ty), Type::Ref(_))) {
+                        *a = Expr::AddrOf(Box::new(Expr::Construct { class: class.clone(), ctor: Some(csig.clone()), args: cargs.clone() }));
+                        done = true;
+                    }
+                }
+            }
+        });
+        if !done {
+            i += 1;
+            continue;
+        }
+        // values computed before the construction and kept across it were named in the source
+        // (an argument expression would be evaluated after the temporary's constructor call)
+        let mut k = i;
+        while k > 0 {
+            k -= 1;
+            match &b[k] {
+                Stmt::Assign { dst: Expr::Var(t), src } if !src.has_call() => {
+                    if stmt_uses(&stmt, *t) {
+                        if let Some(x) = is_temp.get_mut(*t) {
+                            *x = false;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        b[j] = stmt;
+        if dtor_after {
+            b.remove(j + 1);
+        }
+        b.remove(i);
+    }
+}
+
+fn strip_cv_ty(t: &Type) -> &Type {
+    match t {
+        Type::Const(x) | Type::Volatile(x) => strip_cv_ty(x),
+        t => t,
+    }
+}
+
+fn stmt_uses(s: &Stmt, v: VarId) -> bool {
+    let mut f = false;
+    Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+        if matches!(e, Expr::Var(x) if *x == v) {
+            f = true;
+        }
+    });
+    f
+}
+
+fn pure_stmt(s: &Stmt) -> bool {
+    match s {
+        Stmt::Assign { dst: Expr::Var(_), src } => !src.has_call(),
+        Stmt::Comment(_) => true,
+        _ => false,
+    }
+}

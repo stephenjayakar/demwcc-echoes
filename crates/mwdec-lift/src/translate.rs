@@ -120,6 +120,10 @@ pub struct BlockOut {
     pub ret: Option<Expr>,
 }
 
+/// Declared size of an extern addressed absolutely whose size the object doesn't know: anything
+/// above the small-data limit (8 bytes) keeps the compiler off small-data addressing.
+const FAR_EXTERN_SIZE: u32 = 16;
+
 pub struct Lifter<'a> {
     pub obj: &'a ObjectFile,
     pub f: &'a Function,
@@ -168,6 +172,8 @@ pub struct Lifter<'a> {
     mfcr_vals: HashMap<usize, Vec<Option<Expr>>>,
     /// string literal -> (pool symbol, offset) it was read from
     str_origin: HashMap<Vec<u8>, (String, i64)>,
+    /// Stack objects whose constructor's return value (`this`) is used afterwards.
+    pub ctor_ret_used: HashSet<VarId>,
 }
 
 fn is_literal_name(n: &str) -> bool {
@@ -312,6 +318,7 @@ impl<'a> Lifter<'a> {
             out_stack: HashSet::new(),
             mfcr_vals: HashMap::new(),
             str_origin: HashMap::new(),
+            ctor_ret_used: HashSet::new(),
         }
     }
 
@@ -420,6 +427,14 @@ impl<'a> Lifter<'a> {
             }
             let (d, u) = defs_uses(i);
             if i.is_call() || i.is_bctrl() {
+                // a constructor run on the unwritten r3: the object being returned
+                if next == 3 && !written.contains(&gpr(3)) && i.is_call() {
+                    if let Some(r) = &i.reloc {
+                        if sig::is_ctor(&sig_of(&r.target, self.db)) {
+                            return true;
+                        }
+                    }
+                }
                 break;
             }
             if u.contains(&gpr(next)) && !written.contains(&gpr(next)) {
@@ -529,7 +544,8 @@ impl<'a> Lifter<'a> {
             // guess: member if the register after the last explicit param was set in this block
             let lay = layout(&s, true, sret, self.db);
             let last_g = lay.params.iter().rev().find_map(|l| if let ArgLoc::Gpr(r) = l { Some(*r) } else { None });
-            if let Some(last) = last_g {
+            // without explicit GPR parameters the register to test is `this` (r3) itself
+            if let Some(last) = last_g.or(lay.this) {
                 if !sig::is_ctor(&s) && !sig::is_dtor(&s) && !s.is_const && !self.reg_set_before(k, gpr(last)) {
                     has_this = false;
                 }
@@ -857,12 +873,14 @@ impl<'a> Lifter<'a> {
         // whose result isn't otherwise used.
         let mut other_uses: HashMap<Site, u32> = HashMap::new();
         let mut ret_defs: HashMap<Reg, Vec<u32>> = HashMap::new();
+        // defs reaching each use (to see through register copies)
+        let mut use_defs: HashMap<(u32, Reg), Vec<u32>> = HashMap::new();
         self.ret_reg = None;
         self.for_each_use(|k, r, defs| {
             for &d in defs {
                 *other_uses.entry((d, r)).or_default() += 1;
             }
-            let _ = k;
+            use_defs.insert((k as u32, r), defs.to_vec());
         });
         for b in 0..self.cfg.blocks.len() {
             if self.cfg.idom[b] == usize::MAX || !matches!(self.cfg.blocks[b].term, Term::Return) {
@@ -919,14 +937,56 @@ impl<'a> Lifter<'a> {
         });
         let g_ok = g_ok || self_value;
         let g_nc = g_nc || self_value;
-        if f_ok && (f_nc || getter_like) {
+        // a returned call result whose callee's return type is known decides between f1 and r3
+        let call_ret = |r: Reg, want_float: bool| {
+            ret_defs.get(&r).is_some_and(|defs| {
+                defs.iter().any(|&d| {
+                    self.call_layouts.get(&(d as usize)).is_some_and(|(s, _, _)| {
+                        !sig::ret_unknown(s) && !matches!(strip_cv(&s.ret), Type::Void) && is_float(&types::resolve(self.db, &s.ret)) == want_float && !types::is_aggregate(self.db, &s.ret)
+                    })
+                })
+            })
+        };
+        let f_strong = f_ok && (f_nc || (getter_like && call_ret(fpr(1), true)));
+        let g_strong = g_ok && (g_nc || (getter_like && call_ret(gpr(3), false)));
+        let pick_f = if f_strong && !(g_strong && !f_nc) {
+            true
+        } else if g_strong {
+            false
+        } else {
+            f_ok && getter_like
+        };
+        if pick_f {
             self.ret_reg = Some(fpr(1));
             self.ret_ty = t_f32();
         } else if g_ok && (g_nc || getter_like) {
             self.ret_reg = Some(gpr(3));
             // bool if every def is li 0/1
-            let defs = ret_defs.get(&gpr(3)).cloned().unwrap_or_default();
-            let all_bool = defs.iter().all(|&d| {
+            let mut defs = ret_defs.get(&gpr(3)).cloned().unwrap_or_default();
+            // through `mr rD, rS` copies to the values they copy
+            let mut flat = vec![];
+            let mut seen = HashSet::new();
+            while let Some(d) = defs.pop() {
+                if !seen.insert(d) || seen.len() > 64 {
+                    continue;
+                }
+                if d != ENTRY {
+                    let i = &self.insns[d as usize];
+                    let copy_of = match i.op() {
+                        Opcode::Or if i.rs() == i.rb() => Some(i.rs()),
+                        Opcode::Addi if i.ra() != 0 && i.simm() == 0 => Some(i.ra()),
+                        _ => None,
+                    };
+                    if let Some(rs) = copy_of {
+                        if let Some(src) = use_defs.get(&(d, gpr(rs))) {
+                            defs.extend(src.iter().copied());
+                            continue;
+                        }
+                    }
+                }
+                flat.push(d);
+            }
+            let all_bool = !flat.is_empty() && flat.iter().all(|&d| {
                 d != ENTRY && {
                     let i = &self.insns[d as usize];
                     (i.op() == Opcode::Addi && i.ra() == 0 && (i.simm() == 0 || i.simm() == 1))
@@ -1107,7 +1167,8 @@ impl<'a> Lifter<'a> {
             }
             let t = types::resolve(self.db, &sig.params[n].ty).into_owned();
             let size = match strip_cv(&t) {
-                Type::Float { .. } | Type::Int { size: 8, .. } => 8,
+                // (a float argument takes one word: `stfs` to consecutive words)
+                Type::Float { size: 8 } | Type::Int { size: 8, .. } => 8,
                 _ => 4,
             };
             if size == 8 && o % 8 != 0 {
@@ -1185,6 +1246,8 @@ impl<'a> Lifter<'a> {
         let mut addr: Vec<i32> = vec![];
         let mut obj_size: HashMap<i32, u32> = HashMap::new();
         let mut psq: HashSet<i32> = HashSet::new();
+        // addresses passed in r3 (a struct return) to calls whose signature is not known yet
+        let mut indirect: HashSet<i32> = HashSet::new();
         for (k, i) in self.insns.iter().enumerate() {
             if self.frame.skip.contains(&k) {
                 continue;
@@ -1212,6 +1275,8 @@ impl<'a> Lifter<'a> {
                     if let Some(sz) = self.addr_object_size(k, i.rd()) {
                         let e = obj_size.entry(i.simm() as i32).or_insert(0);
                         *e = (*e).max(sz);
+                    } else if i.rd() == 3 && self.addr_to_indirect_call(k, i.rd()) {
+                        indirect.insert(i.simm() as i32);
                     }
                     continue;
                 }
@@ -1246,6 +1311,31 @@ impl<'a> Lifter<'a> {
         let mut regions = vec![];
         for (n, &o) in addr.iter().enumerate() {
             let mut end = addr.get(n + 1).copied().unwrap_or(top).max(o + 1);
+            // The topmost object: the gap up to the register save area includes the frame's
+            // alignment padding, so size it from what the code shows (the class object it is
+            // passed as, the accesses into it), within the sizes that give the frame its size.
+            if n + 1 == addr.len() {
+                if let Some((floor, max_end)) = self.locals_bounds() {
+                    let scratch = |c: i32| conv.contains(&c) || psq.contains(&c);
+                    let ext = acc
+                        .iter()
+                        .filter(|(&a, _)| a >= o && a < end && !(a > o && scratch(a)))
+                        .map(|(&a, x)| a - o + x.sizes.iter().map(|s| s.0 as i32).max().unwrap_or(1))
+                        .chain(obj_size.get(&o).map(|&s| s as i32))
+                        .max()
+                        .unwrap_or(0);
+                    let ext = (ext + 3) & !3;
+                    let first_scratch = conv.iter().chain(psq.iter()).copied().filter(|&c| c >= o + ext.max(1) && c < end).min();
+                    if let Some(fs) = first_scratch {
+                        // codegen temporaries (8-aligned conversion scratch) follow the locals
+                        end = (o + ext).max(fs - 4).min(fs);
+                    } else if ext > 0 && !indirect.contains(&o) {
+                        end = (o + ext).max(floor).min(max_end.max(o + ext)).min(end);
+                    } else {
+                        end = end.min(max_end).max(o + 1);
+                    }
+                }
+            }
             // the class object the address is passed as (constructor/method receiver, reference
             // or by-value argument) bounds the region; the rest are separate locals
             if let Some(&sz) = obj_size.get(&o) {
@@ -1284,6 +1374,53 @@ impl<'a> Lifter<'a> {
             slots.insert(o, v);
         }
         self.stack = StackModel { slots, regions, conv };
+    }
+
+    /// Bounds `(lowest, highest)` for the end offset of the frame's local area that give the
+    /// frame its size.
+    ///
+    /// MWCC lays out the frame as linkage (8) + outgoing arguments + locals and temporaries
+    /// (rounded to 8), then pads so that the GPR save area ends on the frame alignment (16 on
+    /// GC/2.x, 8 on the older compilers), then the FPR saves (8 bytes each, 16 with a `psq_st`
+    /// upper half) rounded to the alignment. `None` if the prologue doesn't fit that model.
+    fn locals_bounds(&self) -> Option<(i32, i32)> {
+        let fi = &self.frame.info;
+        let size = fi.size as i32;
+        if size == 0 || fi.uses_savegpr {
+            return None;
+        }
+        let align = if size % 16 == 0 { 16 } else { 8 };
+        let fpr_bytes = 8 * (fi.saved_fprs.len() + fi.saved_ps.len()) as i32;
+        let fpr_area = (fpr_bytes + align - 1) & !(align - 1);
+        let gpr_lo = size - fpr_area - 4 * fi.saved_gprs.len() as i32;
+        if let Some(&lo) = self.frame.save_slots.iter().filter(|(_, &r)| r < 32).map(|(o, _)| o).min() {
+            if lo != gpr_lo {
+                return None;
+            }
+        }
+        // the locals rounded to 8 end in (gpr_lo - align, gpr_lo]; objects are word aligned
+        let lo8 = ((gpr_lo - align) / 8 + 1) * 8;
+        let hi8 = gpr_lo / 8 * 8;
+        if hi8 < lo8 {
+            return None;
+        }
+        Some((lo8 - 4, hi8))
+    }
+
+    /// Whether the address `addi rd, r1, X` at instruction `k` is passed to an indirect
+    /// (virtual) call, whose signature is resolved only later.
+    fn addr_to_indirect_call(&self, k: usize, rd: u8) -> bool {
+        let b = self.cfg.block_of[k];
+        for j in k + 1..self.cfg.blocks[b].end {
+            let i = &self.insns[j];
+            if i.is_bctrl() {
+                return true;
+            }
+            if i.is_call() || defs_uses(i).0.contains(&gpr(rd)) {
+                return false;
+            }
+        }
+        false
     }
 
     /// Size of the class object whose address `addi rd, r1, X` at instruction `k` computes, from
@@ -1419,6 +1556,47 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Strings of the string pool before (and including) the last string the function uses,
+    /// when some used string is not at the start of its pool; empty otherwise or when strings
+    /// come from more than one pool.
+    pub fn string_pool_prefix(&self) -> Vec<Vec<u8>> {
+        let pools: HashSet<&str> = self.str_origin.values().map(|(s, _)| s.as_str()).collect();
+        if pools.len() != 1 {
+            return vec![];
+        }
+        let sym = *pools.iter().next().unwrap();
+        let end = self.str_origin.iter().map(|(b, (_, a))| a + b.len() as i64 + 1).max().unwrap_or(0);
+        if self.str_origin.values().all(|(_, a)| *a == 0) || end > 0x4000 {
+            return vec![];
+        }
+        let mut out = vec![];
+        let mut off = 0i64;
+        while off < end {
+            let Some(s) = mwdec_obj::c_string_at(self.obj, sym, off) else { return vec![] };
+            off += s.len() as i64 + 1;
+            out.push(s.to_vec());
+        }
+        out
+    }
+
+    /// (symbol, addend) of a literal-pool address held in a register: a string or a literal
+    /// symbol's address, directly or through a temporary.
+    fn literal_addr(&self, e: &Expr, depth: u32) -> Option<(String, i64)> {
+        match e {
+            Expr::Var(t) if depth < 4 => self.literal_addr(self.temp_def.get(t)?, depth + 1),
+            Expr::Str { bytes } => self.str_origin.get(bytes).cloned(),
+            Expr::AddrOf(g) => match &**g {
+                Expr::Global { symbol, .. } if is_literal_name(symbol) => Some((symbol.clone(), 0)),
+                Expr::Member { base, offset, .. } => match &**base {
+                    Expr::Global { symbol, .. } if is_literal_name(symbol) => Some((symbol.clone(), *offset as i64)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Address of symbol+addend as an expression.
     fn sym_addr(&mut self, sym: &str, addend: i64) -> Expr {
         if self.obj.functions.iter().any(|f| f.name == sym) || (!self.obj.data.contains_key(sym) && sig::demangle(sym).map_or(false, |d| d.contains('('))) {
@@ -1462,8 +1640,25 @@ impl<'a> Lifter<'a> {
         }
         match self.obj.data.get(sym) {
             Some(d) => t_unk(d.size),
+            // an extern only ever addressed absolutely (`@ha`/`@l`), never small-data relative:
+            // the compiler only does that for an object larger than the small-data limit, so a
+            // scalar declaration would turn its accesses into SDA ones
+            None if self.far_only(sym) => t_unk(FAR_EXTERN_SIZE),
             None => t_unk(0),
         }
+    }
+
+    fn far_only(&self, sym: &str) -> bool {
+        let mut far = false;
+        for i in &self.insns {
+            if let Some(r) = i.reloc.as_ref().filter(|r| r.target == sym) {
+                match r.kind {
+                    RelocKind::Addr16Ha | RelocKind::Addr16Lo | RelocKind::Addr16Hi => far = true,
+                    _ => return false,
+                }
+            }
+        }
+        far
     }
 
     /// Memory lvalue for symbol+addend accessed with type `ty`.
@@ -1472,7 +1667,9 @@ impl<'a> Lifter<'a> {
         self.note_global(sym, &gty, false);
         let g = Expr::Global { symbol: sym.to_string(), ty: gty.clone() };
         let gsize = types::size_of(self.db, &gty).unwrap_or(0);
-        if addend == 0 && (gsize == scalar_size(&ty).unwrap_or(0) || matches!(gty, Type::Unknown { .. })) {
+        // (an object larger than the small-data limit stays an object: a scalar declaration
+        // would move its accesses to small-data addressing)
+        if addend == 0 && (gsize == scalar_size(&ty).unwrap_or(0) || matches!(gty, Type::Unknown { size } if size <= 8)) {
             if let Type::Unknown { .. } = gty {
                 return Expr::Global { symbol: sym.to_string(), ty };
             }
@@ -2153,6 +2350,13 @@ impl<'a> Lifter<'a> {
             // MWCC constructors/destructors return `this`
             if sig::is_ctor(&sig) || sig::is_dtor(&sig) {
                 if let Some(t) = this_val {
+                    if sig::is_ctor(&sig) && self.use_count.get(&(k as u32, gpr(3))).copied().unwrap_or(0) > 0 {
+                        if let Expr::AddrOf(x) = &t {
+                            if let Expr::Var(v) = &**x {
+                                self.ctor_ret_used.insert(*v);
+                            }
+                        }
+                    }
                     self.def(st, k, gpr(3), t);
                 }
             }
@@ -2615,6 +2819,16 @@ impl<'a> Lifter<'a> {
                         self.def(st, k, fpr(ins.field_frd()), c);
                         return;
                     }
+                } else if i.ra() != 1 && i.ra() != 0 {
+                    // a literal read through its address in a register (`addi rX, rY, lit@l;
+                    // lfs f0, 0(rX)`, the scheduler's choice for float constants): the literal
+                    let base = self.get(st, gpr(i.ra()));
+                    if let Some((sym, add)) = self.literal_addr(&base, 0) {
+                        if let Some(c) = self.literal_load(&sym, add + i.disp() as i64, &ty) {
+                            self.def(st, k, fpr(ins.field_frd()), c);
+                            return;
+                        }
+                    }
                 }
                 if i.ra() == 1 && self.stack.conv.contains(&i.disp()) {
                     let v = self.conv_read(st, i.disp(), &ty);
@@ -2690,6 +2904,7 @@ impl<'a> Lifter<'a> {
                     return;
                 }
                 let src = narrow_store(src, &ty);
+                let ty = const_store_ty(ty, &src);
                 let lv = self.d_lvalue(st, i, ty);
                 self.store(st, lv, src);
             }
@@ -2703,6 +2918,7 @@ impl<'a> Lifter<'a> {
             Stwx | Sthx | Stbx | Stfsx | Stfdx => {
                 let ty = Self::store_ty(ins.op);
                 let src = if matches!(ins.op, Stfsx | Stfdx) { self.get(st, fpr(ins.field_frs())) } else { self.get(st, gpr(i.rs())) };
+                let ty = const_store_ty(ty, &src);
                 let lv = self.x_lvalue(st, i, ty);
                 self.store(st, lv, src);
             }
@@ -3687,6 +3903,15 @@ pub fn as_unsigned(e: Expr, vars: &[Var]) -> Expr {
             Expr::cast(t_u32(), e)
         }
         _ => e,
+    }
+}
+
+/// A halfword/byte store of a negative constant (`li r0, -1; sth`) stores a signed narrow value:
+/// through an unsigned type the constant would be 0xffff, materialised as `lis; subi`.
+fn const_store_ty(ty: Type, src: &Expr) -> Type {
+    match (&ty, src.as_int()) {
+        (Type::Int { size: size @ (1 | 2), signed: false }, Some(c)) if c < 0 && c >= -(1i64 << (8 * *size as i64 - 1)) => Type::Int { size: *size, signed: true },
+        _ => ty,
     }
 }
 

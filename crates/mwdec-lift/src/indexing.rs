@@ -111,6 +111,75 @@ pub fn recover(body: &mut [Stmt], vars: &[Var], db: Option<&TypeDb>) {
     Stmt::rewrite_exprs(body, &mut |e| rewrite(e, vars, db));
 }
 
+/// Scaled index of a raw byte offset: `i << s`, `i * 2^s`, `(i << s) & (0xff << s)` (an 8/16-bit
+/// index), or a plain byte index (`k = 1`).
+fn raw_scaled(e: &Expr) -> (Expr, i64) {
+    match uncast(e) {
+        Expr::Binary { op: BinOp::Shl, l, r, .. } => {
+            if let Some(s) = r.as_int().filter(|s| (1..4).contains(s)) {
+                return ((**l).clone(), 1i64 << s);
+            }
+        }
+        Expr::Binary { op: BinOp::Mul, l, r, .. } => {
+            if let Some(k) = r.as_int().filter(|k| matches!(k, 2 | 4 | 8)) {
+                return ((**l).clone(), k);
+            }
+        }
+        Expr::Binary { op: BinOp::And, l, r, .. } => {
+            if let (Expr::Binary { op: BinOp::Shl, l: x, r: sh, .. }, Some(m)) = (uncast(l), r.as_int()) {
+                if let Some(s) = sh.as_int().filter(|s| (1..4).contains(s)) {
+                    for (w, sz) in [(0xffi64, 1u8), (0xffff, 2)] {
+                        if m == w << s {
+                            return (Expr::cast(t_int(sz, false), (**x).clone()), 1i64 << s);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    (e.clone(), 1)
+}
+
+/// A raw access `*(T*)(((u8*)p + (i << s)) + c)` (the target adds the scaled index first and
+/// folds `c` into the load displacement: `slwi; add; lwz c(rX)`) is spelled as an array element
+/// `((T*)((u8*)p + c))[i]`: MWCC re-associates the byte-pointer spelling into `p + ((i << s) + c)`
+/// (`addi; lwzx`). Element types the access does not match go through an integer array of the
+/// scale's width (`*(T*)&((u16*)((u8*)p + c))[i]`).
+pub fn raw_index(body: &mut [Stmt], vars: &[Var]) {
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Load { base, offset, ty } = &*e else { return };
+        if *offset == 0 {
+            return;
+        }
+        let Some((p, off)) = byte_add_parts(base) else { return };
+        if off.as_int().is_some() {
+            return;
+        }
+        let pt = types::ty_of(p, vars);
+        if !is_ptr(&pt) && !matches!(strip_cv(&pt), Type::Int { size: 4, .. } | Type::Unknown { size: 4 }) {
+            return;
+        }
+        let (i, k) = raw_scaled(off);
+        if i.as_int().is_some() {
+            return;
+        }
+        let at = scalar_size(ty);
+        let (ety, wrap) = if at == Some(k as u32) {
+            (if matches!(strip_cv(ty), Type::Unknown { .. }) { t_int(k as u8, k == 4) } else { ty.clone() }, false)
+        } else {
+            (t_int(k as u8, false), true)
+        };
+        let row = Expr::AddrOf(Box::new(Expr::Index {
+            base: Box::new(Expr::cast(t_ptr(t_int(1, false)), p.clone())),
+            index: Box::new(Expr::int(*offset as i64)),
+            ty: t_int(1, false),
+        }));
+        let el = Expr::Index { base: Box::new(Expr::cast(t_ptr(ety.clone()), row)), index: Box::new(i), ty: ety };
+        *e = if wrap { Expr::Load { base: Box::new(Expr::AddrOf(Box::new(el))), offset: 0, ty: ty.clone() } } else { el };
+    });
+}
+
 /// In `for (i = 0; i < n; i++)`: an offset variable `v = 0; ... v = v + K;` advancing in lockstep
 /// with `i` is `i * K` (strength reduction undone).
 pub fn undo_strength_reduction(body: &mut Vec<Stmt>, vars: &[Var]) {

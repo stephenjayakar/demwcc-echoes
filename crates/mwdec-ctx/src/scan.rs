@@ -178,6 +178,8 @@ pub struct ScanResult {
     pub template_fields: Vec<(String, String, Vec<String>, mwdec_core::Access)>,
     /// namespace-scope variables declared at an absolute address (`T name[N] : 0xCC005000;`)
     pub abs_addrs: Vec<(String, u32)>,
+    /// Variables (globals, static data members) declared `bool` (DWARF says `unsigned char`).
+    pub bool_vars: Vec<String>,
 }
 
 const SPECIFIERS: &[&str] = &["virtual", "static", "inline", "explicit", "extern", "friend", "mutable", "register", "__inline", "__declspec"];
@@ -689,6 +691,9 @@ impl<'t> Scanner<'t> {
                 }
             } else if scope != "@anon" && !decl.iter().any(|t| t.is("operator")) {
                 self.out.globals.push(qual(scope, &name));
+                if ty_toks.iter().any(|w| w == "bool") && !ty_toks.iter().any(|w| matches!(w.as_str(), "*" | "&" | "[" | "(")) {
+                    self.out.bool_vars.push(qual(scope, &name));
+                }
                 // `T name[N] : 0xADDR` (CodeWarrior absolute-address variable; the address may be a
                 // constant expression: `: (0x80000000 | 0x00F8)`)
                 if let Some(c) = toks.iter().position(|w| w == ":") {

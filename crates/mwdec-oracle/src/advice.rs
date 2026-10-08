@@ -180,6 +180,13 @@ pub fn statement_moves(comp: &Compiler, cand: &Candidate, target_obj: &[u8], tar
     Ok(diagnose(cand, details))
 }
 
+/// [`statement_moves`] with the target function already parsed (`target_obj` gives the data
+/// symbols its relocations refer to; a single-function object is enough).
+pub fn statement_moves_in(comp: &Compiler, cand: &Candidate, target_obj: &asm::Obj, target: &asm::Func) -> Result<OrderDiagnosis> {
+    let details = explain_sched_diff(comp, &cand.tu(), cand.symbol, target_obj, target)?;
+    Ok(diagnose(cand, details))
+}
+
 fn diagnose(cand: &Candidate, details: Vec<OrderAdvice>) -> OrderDiagnosis {
     let mut d = OrderDiagnosis::default();
     // the line table of inlined header code holds header line numbers: keep moves inside the body

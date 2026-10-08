@@ -343,3 +343,78 @@ pub fn return_values(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
     });
     n
 }
+
+/// Single-use temporaries loaded early (the compiler scheduled the loads ahead of the stores a
+/// folded inline replaced) move into the folded value that consumes them:
+/// `t1 = p->y; t2 = p->z; return T(p->x, t1, t2);` -> `return T(p->x, p->y, p->z);`. Only
+/// pure reads move, past pure temp definitions that don't redefine what they read.
+pub fn forward_temps_into_folded(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    let counts = mentions_body(body);
+    let mut n = 0;
+    let is_temp = |v: VarId| matches!(vars[v].kind, VarKind::Local) && vars[v].name.starts_with("temp_");
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = b.len();
+        while i > 0 {
+            i -= 1;
+            let Stmt::Assign { dst: Expr::Var(v), src } = &b[i] else { continue };
+            let (v, src) = (*v, src.clone());
+            if !is_temp(v) || counts.get(&v) != Some(&2) || src.has_call() || matches!(src, Expr::IncDec { .. }) {
+                continue;
+            }
+            let Some(j) = (i + 1..b.len()).find(|&k| mentions(&b[k], v) > 0) else { continue };
+            // the consumer: a folded value taking the temp as an argument
+            let mut in_folded = false;
+            for e in stmt_exprs(&b[j]) {
+                e.walk(&mut |x| {
+                    if folded_value(x) {
+                        let args = match x {
+                            Expr::Call { args, .. } | Expr::Construct { args, .. } => args,
+                            _ => return,
+                        };
+                        if args.iter().any(|a| a.uses_var(v)) {
+                            in_folded = true;
+                        }
+                    }
+                });
+            }
+            if !in_folded {
+                continue;
+            }
+            let mut read = vec![];
+            src.walk(&mut |x| {
+                if let Expr::Var(w) = x {
+                    read.push(*w);
+                }
+            });
+            let between_ok = (i + 1..j).all(|k| match &b[k] {
+                Stmt::Assign { dst: Expr::Var(w), src: s2 } => is_temp(*w) && !s2.has_call() && !read.contains(w),
+                _ => false,
+            });
+            if !between_ok {
+                continue;
+            }
+            let mut s = b[j].clone();
+            let mut hits = 0;
+            let sub = &mut |x: &mut Expr| {
+                if matches!(x, Expr::Var(y) if *y == v) {
+                    *x = src.clone();
+                    hits += 1;
+                }
+            };
+            match &mut s {
+                Stmt::Expr(e) | Stmt::Return(Some(e)) => e.rewrite(sub),
+                Stmt::Assign { dst, src: s2 } => {
+                    s2.rewrite(sub);
+                    dst.rewrite(sub);
+                }
+                _ => continue,
+            }
+            if hits == 1 {
+                b[j] = s;
+                b.remove(i);
+                n += 1;
+            }
+        }
+    });
+    n
+}

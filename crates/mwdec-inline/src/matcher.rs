@@ -841,12 +841,13 @@ pub fn index(lib: &InlineLib) -> Index {
 }
 
 pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
+    // members' own constructors' stores at the start of a constructor body are implicit
+    let stripped = if std::env::var("MWDI_NO_CTORS").is_ok() { 0 } else { crate::defctor::strip(ir, db, &lib.default_ctors) };
     if lib.templates.is_empty() {
-        return 0;
+        return stripped;
     }
     let idx = index(lib);
-    // members' own constructors' stores at the start of a constructor body are implicit
-    let mut total = if std::env::var("MWDI_NO_CTORS").is_ok() { 0 } else { crate::ctors::strip_member_ctor_stores(ir, db) };
+    let mut total = stripped + if std::env::var("MWDI_NO_CTORS").is_ok() { 0 } else { crate::ctors::strip_member_ctor_stores(ir, db) };
     // stack slots typed only by size that are objects passed to calls
     if std::env::var("MWDI_NO_BUFFERS").is_err() {
         total += crate::buffers::type_object_slots(ir, db);
@@ -887,6 +888,7 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
         crate::post::forward_cond_temps(&mut ir.body, &ir.vars);
         crate::post::return_values(&mut ir.body, &ir.vars);
+        crate::post::forward_temps_into_folded(&mut ir.body, &ir.vars);
     }
     total
 }

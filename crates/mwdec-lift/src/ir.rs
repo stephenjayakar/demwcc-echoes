@@ -280,10 +280,16 @@ pub struct IrFunction {
     pub body: Vec<Stmt>,
     /// Constructor initializer list (empty for other functions).
     pub init_list: Vec<Init>,
+    /// Bases whose constructor/destructor the function ran on `this` implicitly (calls the
+    /// compiler makes itself, dropped from the body): the class derives from them.
+    pub implicit_bases: Vec<String>,
     pub globals: Vec<GlobalRef>,
     pub frame: FrameInfo,
     /// Lifter diagnostics (unhandled instructions, guesses).
     pub warnings: Vec<String>,
+    /// The target's string pool from its start up to the last string this function uses, when
+    /// that string isn't at offset 0 (earlier functions of the unit put strings before it).
+    pub string_pool: Vec<Vec<u8>>,
 }
 
 impl IrFunction {

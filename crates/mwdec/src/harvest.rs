@@ -439,7 +439,16 @@ pub fn cmd_harvest(root: &Path, work: &Path, a: HarvestArgs) -> Result<()> {
         }
     });
     eprintln!("harvest: {} exact of {} attempted in {:.0}s", n_exact.into_inner(), cands.len(), t0.elapsed().as_secs_f64());
-    Ok(())
+    // Every result is written and flushed. Exit now instead of tearing down the cached unit
+    // drivers: their persistent compilers (and any start still in flight on a fast-path worker)
+    // could otherwise keep the process alive after the last candidate. Debugged compiler
+    // processes end with their debugger, child compilers with the memory-cap job.
+    for f in [&attempts_file, &exact_file, &started_file] {
+        let _ = f.lock().map(|mut f| f.flush());
+    }
+    let _ = std::io::stderr().flush();
+    let _ = std::io::stdout().flush();
+    std::process::exit(0)
 }
 
 fn row_json(r: &Row, tag: &str) -> serde_json::Value {
@@ -496,6 +505,11 @@ fn run_one(us: &UnitSlot, ext: &(ExternIndex, ExternIndex), c: &Cand, a: &Harves
             row.error = Some(k);
             return;
         }
+        Err(NoDraft::Asm(k)) => {
+            row.status = "asm".into();
+            row.error = Some(k);
+            return;
+        }
         Err(NoDraft::Lift(err)) => {
             row.status = "lift-err".into();
             row.error = Some(err);
@@ -504,7 +518,7 @@ fn run_one(us: &UnitSlot, ext: &(ExternIndex, ExternIndex), c: &Cand, a: &Harves
     };
     let ti = ObjIndex::with_externs(&ui.target, &ext.0);
     let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &c.symbol);
-    let src = choose_draft(ui, f, &scorer, src);
+    let src = super::search_cmds::repair_registers(&scorer, choose_draft(ui, f, &scorer, src), ui.tracer.as_deref());
     let cfg = SearchConfig {
         budget: Duration::from_secs(a.budget_secs),
         max_compiles: a.max_compiles,
