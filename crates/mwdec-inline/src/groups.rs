@@ -82,6 +82,10 @@ fn try_copy(b: &[Stmt], start: usize, end: usize, stores: &[CStore], env: &Env) 
             if !ok || cur != hi || pick.len() < 2 {
                 continue;
             }
+            // (a class declaring its own out-of-line assignment: `dst = src` would call it)
+            if out_of_line_assign(&cls, env) {
+                continue;
+            }
             // already member-wise float copies of a small class are handled by the lifter
             let Some((_, dlv)) = object_at(&anchor.addr, lo, &cls, env) else { continue };
             let Some((_, slv)) = object_at(&sp, lo + dsrc, &cls, env) else { continue };
@@ -116,6 +120,11 @@ fn try_copy(b: &[Stmt], start: usize, end: usize, stores: &[CStore], env: &Env) 
         }
     }
     None
+}
+
+/// Does `cls` declare a copy assignment defined out of line?
+fn out_of_line_assign(cls: &str, env: &Env) -> bool {
+    env.db.decls.get(&format!("{cls}::operator=")).is_some_and(|ds| ds.iter().any(|d| d.params.len() == 1 && !d.is_inline_defined))
 }
 
 /// Component stores of one statement.

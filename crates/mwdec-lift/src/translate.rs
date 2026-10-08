@@ -585,7 +585,9 @@ impl<'a> Lifter<'a> {
             let last_g = lay.params.iter().rev().find_map(|l| if let ArgLoc::Gpr(r) = l { Some(*r) } else { None });
             // without explicit GPR parameters the register to test is `this` (r3) itself
             if let Some(last) = last_g.or(lay.this) {
-                if !sig::is_ctor(&s) && !sig::is_dtor(&s) && !s.is_const && !self.reg_set_before(k, gpr(last)) {
+                // (a register the block reads as an operand before the call, never writing it
+                // after, holds a value of this function, not the last argument)
+                if !sig::is_ctor(&s) && !sig::is_dtor(&s) && !s.is_const && (!self.reg_set_before(k, gpr(last)) || self.reg_read_last_in_block(k, gpr(last))) {
                     has_this = false;
                 }
             }
@@ -661,6 +663,29 @@ impl<'a> Lifter<'a> {
 
     /// Was `reg` written in the same block before instruction k (after the previous call), or is it
     /// a live-in parameter register?
+    /// Walking back from the call `k` in its block, is `reg` read before any write (its value is
+    /// consumed by an instruction of the block, not set up for the call)?
+    fn reg_read_last_in_block(&self, k: usize, reg: Reg) -> bool {
+        let b = self.cfg.block_of[k];
+        let start = self.cfg.blocks[b].start;
+        let mut j = k;
+        while j > start {
+            j -= 1;
+            let i = &self.insns[j];
+            if i.is_call() || i.is_bctrl() || self.frame.skip.contains(&j) {
+                return false;
+            }
+            let (d, u) = defs_uses(i);
+            if d.contains(&reg) {
+                return false;
+            }
+            if u.contains(&reg) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn reg_set_before(&self, k: usize, reg: Reg) -> bool {
         let b = self.cfg.block_of[k];
         let start = self.cfg.blocks[b].start;
@@ -773,7 +798,11 @@ impl<'a> Lifter<'a> {
         // set up in a dominating block (an incoming value copied before a loop, passed after
         // it): the register's only touch in the function, on the dominator path, no call between
         let mut bb = b;
+        let mut fuel = crate::fuel::Fuel::new("translate.dominator_walk", self.cfg.idom.len() + 1);
         loop {
+            if !fuel.burn() {
+                return false;
+            }
             let up = self.cfg.idom[bb];
             if up == usize::MAX || up == bb {
                 return false;
@@ -941,7 +970,8 @@ impl<'a> Lifter<'a> {
         }
         let mut changed = true;
         let rpo = self.cfg.rpo.clone();
-        while changed {
+        let mut fuel = crate::fuel::Fuel::new("translate.reaching_defs", crate::fuel::CAP_FIXPOINT);
+        while changed && fuel.burn() {
             changed = false;
             for &b in &rpo {
                 if b != 0 || !self.cfg.blocks[0].preds.is_empty() {
@@ -1467,6 +1497,17 @@ impl<'a> Lifter<'a> {
             if stfd && lo.map_or(false, |l| l.sizes.iter().any(|s| !s.2 && !s.1)) {
                 conv.insert(o);
                 conv.insert(o + 4);
+            }
+        }
+        // a wide access covering narrower ones (bytes stored one by one, the word read back:
+        // a small object built member-wise and copied whole) is one object, not separate slots
+        for (&o, a) in &acc {
+            if conv.contains(&o) || self.frame.save_slots.contains_key(&o) {
+                continue;
+            }
+            let wide = a.sizes.iter().map(|s| s.0).max().unwrap_or(0) as i32;
+            if wide > 1 && acc.range(o + 1..o + wide).any(|(q, _)| !conv.contains(q)) {
+                addr.push(o);
             }
         }
         addr.sort();
@@ -3053,9 +3094,14 @@ impl<'a> Lifter<'a> {
                     class,
                     sig: vsig.clone(),
                 };
-                if obj != this && !args.is_empty() && args[0] == obj {
+                // a class returned by value: r3 is the destination even when `this` (r4) and the
+                // arguments were not set up here (forwarded: `return this->GetAimPosition(mgr, 0.f)`)
+                let sret_ret = vsig.as_ref().is_some_and(|s| types::is_aggregate(self.db, strip_cv(&s.ret)) && named(strip_cv(&s.ret)).is_some());
+                if obj != this && ((!args.is_empty() && args[0] == obj) || sret_ret) {
                     // sret: r3 is the destination
-                    args.remove(0);
+                    if !args.is_empty() && args[0] == obj {
+                        args.remove(0);
+                    }
                     if let Some(s) = &vsig {
                         // the parameters follow the result and `this` (r5..), whether or not
                         // this function set them up (forwarded incoming parameters)

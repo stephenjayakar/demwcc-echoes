@@ -58,7 +58,11 @@ pub fn merge_register_webs(body: &mut Vec<Stmt>, vars: &mut [Var]) -> bool {
         Stmt::rewrite_exprs(body, &mut |e| {
             if let Expr::Var(v) = e {
                 let mut t = *v;
+                let mut fuel = crate::fuel::Fuel::new("samereg.renames", renames.len() + 1);
                 while let Some((_, to)) = renames.iter().find(|(f, _)| *f == t) {
+                    if !fuel.burn() {
+                        break;
+                    }
                     t = *to;
                 }
                 *v = t;

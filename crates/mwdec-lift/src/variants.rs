@@ -72,6 +72,10 @@ pub const ORDER_SPLIT_LAST_FIELD: &str = "order.split_last_field";
 /// compiler re-extends (`clrlwi`) a const bool where it is used.
 pub const BOOL_CONST_LOCAL: &str = "bool.const_local";
 
+/// Temps read from memory just before a loop and used once inside it are read there (the
+/// compiler hoisted the loop-invariant reads: `i < v.size()`, `a[i].id == id`).
+pub const LOOP_INVARIANT_READS: &str = "loop.invariant_reads";
+
 /// GC/1.2.5n: draft locals in volatile registers holding a global read are folded into their
 /// single use when the target's frame shows no scalar-local slots (`mwdec_lift::sdkframe`).
 pub const SDK_FOLD_SLOT_LOCALS: &str = "sdk.fold_slot_locals";
@@ -101,6 +105,10 @@ pub const ORDER_PARAM_LOADS: &str = "order.param_loads";
 
 /// A global object copied word by word behind a pointer becomes one struct assignment.
 pub const GLOBAL_STRUCT_COPY: &str = "structcopy.global_whole";
+
+/// Temporaries of a run of floating-point copies between two objects stay named locals (declared
+/// by target register), so the compiler's colouring follows the target's register rotation.
+pub const NAMED_FP_COPIES: &str = "copies.named_fp";
 
 /// A pointer step after a read the next statement uses (`t = *p; p += 1; f(t);`) is a statement
 /// of its own after it (`f(*p); ++p;`) instead of a post-increment inside it (`f(*p++)`).
@@ -132,6 +140,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (ARGS_NAMED_LOCALS, "computed call arguments become named locals assigned in argument order"),
     (ORDER_PARAM_LOADS, "the leading parameter loads are ordered by parameter, then offset"),
     (GLOBAL_STRUCT_COPY, "a global object copied word by word behind a pointer becomes one struct assignment"),
+    (NAMED_FP_COPIES, "temporaries of a floating-point copy run stay named locals, declared by target register"),
     (INCDEC_STEP_AFTER, "a step after a read the next statement uses is a statement after it, not a post-increment"),
     (EXPR_BYTE_FIELDS, "byte/halfword fields packed into a word are narrowing conversions, not masks"),
     (CONST_READ_ONLY_EXTERNS, "scalar externs the function only reads are declared const"),
@@ -139,6 +148,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),
     (ORDER_SPLIT_LAST_FIELD, "a packed word built from field inserts gets its last field in a statement of its own"),
     (BOOL_CONST_LOCAL, "bool locals defined once are const (re-extended at their uses)"),
+    (LOOP_INVARIANT_READS, "temps read before a loop and used once inside it are read in the loop"),
     (SRET_CLASS_BY_LAYOUT, "an unnamed struct return takes the one context class whose layout and constructor fit its stores"),
 ];
 

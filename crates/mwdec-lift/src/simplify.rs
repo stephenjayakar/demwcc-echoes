@@ -28,8 +28,8 @@ fn is_neg_of(e: &Expr, x: &Expr) -> bool {
 
 /// MWCC's branchless 0/1 materialisations (value-context comparisons) back to comparisons; with
 /// an arithmetic shift (`srawi`) the sign bit spreads: 0/-1, `c ? -1 : 0`.
-fn bool_idiom(e: &Expr) -> Option<Expr> {
-    let b = bool_idiom_bit(e)?;
+fn bool_idiom(e: &Expr, vars: &[Var]) -> Option<Expr> {
+    let b = bool_idiom_bit(e, vars)?;
     match e {
         Expr::Binary { ty: ty @ Type::Int { signed: true, .. }, .. } => {
             Some(Expr::Ternary { c: Box::new(b), t: Box::new(Expr::Int { value: -1, ty: ty.clone() }), f: Box::new(Expr::Int { value: 0, ty: ty.clone() }), ty: ty.clone() })
@@ -38,15 +38,25 @@ fn bool_idiom(e: &Expr) -> Option<Expr> {
     }
 }
 
-fn bool_idiom_bit(e: &Expr) -> Option<Expr> {
+fn ne_operand(q: &Expr, vars: &[Var]) -> Expr {
+    let a = uncast(q).clone();
+    if matches!(strip_cv(&ty_of(&a, vars)), Type::Bool) {
+        Expr::Cast { ty: Type::Int { size: 4, signed: true }, e: Box::new(a) }
+    } else {
+        a
+    }
+}
+
+fn bool_idiom_bit(e: &Expr, vars: &[Var]) -> Option<Expr> {
     let Expr::Binary { op: BinOp::Shr, l, r, .. } = e else { return None };
     if r.as_int() != Some(31) {
         return None;
     }
     match uncast(l) {
-        // (-a | a) >> 31  ==  a != 0
-        Expr::Binary { op: BinOp::Or, l: p, r: q, .. } if is_neg_of(p, q) => Some(Expr::cmp(BinOp::Ne, uncast(q).clone(), Expr::int(0))),
-        Expr::Binary { op: BinOp::Or, l: p, r: q, .. } if is_neg_of(q, p) => Some(Expr::cmp(BinOp::Ne, uncast(p).clone(), Expr::int(0))),
+        // (-a | a) >> 31  ==  a != 0 (a bool keeps its widening: the source normalised it
+        // explicitly, `b != 0`, which `b` alone wouldn't compile to)
+        Expr::Binary { op: BinOp::Or, l: p, r: q, .. } if is_neg_of(p, q) => Some(Expr::cmp(BinOp::Ne, ne_operand(q, vars), Expr::int(0))),
+        Expr::Binary { op: BinOp::Or, l: p, r: q, .. } if is_neg_of(q, p) => Some(Expr::cmp(BinOp::Ne, ne_operand(p, vars), Expr::int(0))),
         // (-a & ~a) >> 31  ==  a > 0
         Expr::Binary { op: BinOp::And, l: p, r: q, .. } if is_neg_of(p, q) => None,
         Expr::Binary { op: BinOp::And, l: p, r: q, .. } => match uncast(q) {
@@ -134,9 +144,19 @@ fn simp(e: &mut Expr, vars: &[Var]) {
     if let Some(n) = narrow_lt_idiom(e, vars) {
         *e = n;
     }
-    if let Some(n) = bool_idiom(e) {
+    if let Some(n) = bool_idiom(e, vars) {
         *e = n;
         return;
+    }
+    // K & (c ? -1 : 0)  ==  c ? K : 0 (MWCC's branch-free select of a constant: `srawi 31 ; and`)
+    if let Expr::Binary { op: BinOp::And, l, r, ty } = e {
+        let (k, m) = if l.as_int().is_some() { (&**l, &**r) } else { (&**r, &**l) };
+        if let (Some(_), Expr::Ternary { c, t, f, .. }) = (k.as_int(), m) {
+            if t.as_int() == Some(-1) && f.as_int() == Some(0) {
+                *e = Expr::Ternary { c: c.clone(), t: Box::new(k.clone()), f: f.clone(), ty: ty.clone() };
+                return;
+            }
+        }
     }
     // (x + a) + b  /  (x + a) - b  ->  x + (a + b) / x + (a - b) (an address split into
     // `addis` / `addi` halves, so the array and member recovery sees one offset)
@@ -497,6 +517,33 @@ pub fn form_for_loops(body: &mut Vec<Stmt>) {
     });
 }
 
+/// Adding one to a local narrower than `int` (a `for` step or a statement of its own) is `i++`:
+/// MWCC keeps the incremented value in its register and narrows it only where it is read, where
+/// `i = i + 1` narrows it at the assignment as well (one more `clrlwi`).
+pub fn narrow_counter_steps(body: &mut Vec<Stmt>, vars: &[Var]) {
+    Stmt::for_each_block_mut(body, &mut |blk| {
+        for s in blk.iter_mut() {
+            let step: &mut [Stmt] = match s {
+                Stmt::For { step, .. } => step.as_mut_slice(),
+                s => std::slice::from_mut(s),
+            };
+            let [Stmt::Assign { dst: Expr::Var(v), src }] = &*step else { continue };
+            let v = *v;
+            let narrow = match strip_cv(&vars[v].ty) {
+                Type::Int { size, .. } => *size < 4,
+                Type::Char => true,
+                _ => false,
+            };
+            if !narrow {
+                continue;
+            }
+            if let Some(d) = step_of(src, v, vars, None) {
+                step[0] = Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(v)), delta: d, post: true });
+            }
+        }
+    });
+}
+
 fn contains_continue(b: &[Stmt]) -> bool {
     b.iter().any(|s| match s {
         Stmt::Continue => true,
@@ -577,6 +624,32 @@ fn mentions_var(s: &Stmt, v: VarId) -> usize {
     n
 }
 
+/// Does `s` read `v` before any branch of its own (not in a nested body, a loop condition, the
+/// right side of `&&` / `||` or an arm of `?:`)? Folding an update into such a read keeps it
+/// where the machine code does it.
+fn reads_unconditionally(s: &Stmt, v: VarId) -> bool {
+    let e = match s {
+        Stmt::Assign { dst, src } => {
+            return [dst, src].iter().any(|e| e.uses_var(v) && !read_after_branch(e, v));
+        }
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => e,
+        Stmt::If { cond, .. } => cond,
+        Stmt::Switch { e, .. } => e,
+        _ => return false,
+    };
+    e.uses_var(v) && !read_after_branch(e, v)
+}
+
+fn read_after_branch(e: &Expr, v: VarId) -> bool {
+    let mut hit = false;
+    e.walk(&mut |x| match x {
+        Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, r, .. } => hit |= r.uses_var(v),
+        Expr::Ternary { t, f, .. } => hit |= t.uses_var(v) || f.uses_var(v),
+        _ => {}
+    });
+    hit
+}
+
 fn subst_var(s: &mut Stmt, v: VarId, with: &Expr) {
     let mut f = |e: &mut Expr| {
         if matches!(e, Expr::Var(x) if *x == v) {
@@ -604,7 +677,7 @@ pub fn form_incdec_with(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool], db
                 let (t, x) = (*t, *x);
                 if temp(t) && !temp(x) && uses.get(&t) == Some(&1) && e.uses_var(x) && !e.has_call() {
                     if let Some(d) = step_of(step, x, vars, db) {
-                        if mentions_var(&b[i + 2], t) == 1 && mentions_var(&b[i + 2], x) == 0 {
+                        if mentions_var(&b[i + 2], t) == 1 && reads_unconditionally(&b[i + 2], t) && mentions_var(&b[i + 2], x) == 0 {
                             // (or the step as a statement of its own after the use)
                             if matches!(&b[i + 2], Stmt::Expr(_) | Stmt::Assign { .. }) && crate::variants::alt(crate::variants::INCDEC_STEP_AFTER) {
                                 let mut s = b[i + 2].clone();
@@ -640,14 +713,18 @@ pub fn form_incdec_with(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool], db
                         _ => None,
                     };
                     if let Some(d) = d {
-                        if mentions_var(&b[i + 2], t) == 1 {
-                            let inc = Expr::IncDec { e: Box::new(l.clone()), delta: d, post: false };
+                        let inc = Expr::IncDec { e: Box::new(l.clone()), delta: d, post: false };
+                        if mentions_var(&b[i + 2], t) == 1 && reads_unconditionally(&b[i + 2], t) {
                             let mut s = b[i + 2].clone();
                             subst_var(&mut s, t, &inc);
                             b[i + 2] = s;
                             b.drain(i..i + 2);
                             continue;
                         }
+                        // read later, after a branch: `t = --x;` (not `t = x - 1; x = t;`, after
+                        // which MWCC knows x is t and doesn't read x again)
+                        b[i] = Stmt::Assign { dst: Expr::Var(t), src: inc };
+                        b.remove(i + 1);
                     }
                 }
             }
@@ -944,6 +1021,19 @@ fn count_assigns(b: &[Stmt], v: VarId, n: &mut usize) {
     }
 }
 
+/// A CTR count `(X + (k-1)) >> log2(k)` (unsigned) is the trip count of `for (i = 0; i < X; i += k)`:
+/// (X, k).
+fn stepped_count(n: &Expr) -> Option<(Expr, i64)> {
+    let Expr::Binary { op: BinOp::Shr, l, r, .. } = uncast(n) else { return None };
+    let sh = r.as_int().filter(|s| (1..=4).contains(s))?;
+    if !unsigned_cast(l) {
+        return None;
+    }
+    let Expr::Binary { op: BinOp::Add, l: x, r: c, .. } = uncast(l) else { return None };
+    let k = 1i64 << sh;
+    (c.as_int() == Some(k - 1)).then(|| (uncast(x).clone(), k))
+}
+
 fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
     // search loops with an early exit: `ctr = n; if (n <= 0) R; while (true) { ...; ctr--; if (!ctr) R; }`
     {
@@ -1063,9 +1153,23 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
     }
     let mut uses: HashMap<VarId, usize> = HashMap::new();
     crate::inline::count_uses(body, &mut uses);
-    let mut todo: Vec<(VarId, Expr, bool)> = vec![];
+    let mut todo: Vec<(VarId, Expr, bool, i64)> = vec![];
     // find candidates first (immutable walk), then rewrite with fresh vars
-    fn scan(b: &[Stmt], vars: &[Var], uses: &HashMap<VarId, usize>, out: &mut Vec<(VarId, Expr, bool)>) {
+    // temps holding `n - k`
+    let mut minus: HashMap<VarId, i64> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter() {
+            let k = match s {
+                Stmt::Assign { dst: Expr::Var(v), src: Expr::Binary { op: BinOp::Add, r, .. } } => r.as_int().filter(|c| *c < 0).map(|c| (*v, -c)),
+                Stmt::Assign { dst: Expr::Var(v), src: Expr::Binary { op: BinOp::Sub, r, .. } } => r.as_int().filter(|c| *c > 0).map(|c| (*v, c)),
+                _ => None,
+            };
+            if let Some((v, c)) = k {
+                minus.insert(v, c);
+            }
+        }
+    });
+    fn scan(b: &[Stmt], vars: &[Var], uses: &HashMap<VarId, usize>, minus: &HashMap<VarId, i64>, out: &mut Vec<(VarId, Expr, bool, i64)>) {
         for (k, s) in b.iter().enumerate() {
             if let Stmt::If { cond, then, els } = s {
                 if els.is_empty() && then.len() == 1 {
@@ -1078,35 +1182,41 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                                     _ => None,
                                 });
                                 if let Some(n) = init {
+                                    // `(X + k-1) >> log2(k)` iterations: `i < X` counting by k (unless
+                                    // X is `n - k`: MWCC's own unrolling by k, recovered later)
+                                    let (n, step) = match stepped_count(&n) {
+                                        Some((x, k)) if !matches!(&x, Expr::Var(v) if minus.get(v) == Some(&k)) => (x, k),
+                                        _ => (n, 1),
+                                    };
                                     let signed = match cond {
                                         Expr::Binary { op: BinOp::Gt, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(!unsigned_cast(l)),
                                         Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(false),
                                         _ => None,
                                     };
                                     if let Some(sg) = signed {
-                                        out.push((c, n, sg));
+                                        out.push((c, n, sg, step));
                                     }
                                 }
                             }
                         }
                     }
                 }
-                scan(then, vars, uses, out);
-                scan(els, vars, uses, out);
+                scan(then, vars, uses, minus, out);
+                scan(els, vars, uses, minus, out);
             }
             match s {
-                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => scan(body, vars, uses, out),
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => scan(body, vars, uses, minus, out),
                 Stmt::Switch { cases, .. } => {
                     for c in cases {
-                        scan(&c.body, vars, uses, out);
+                        scan(&c.body, vars, uses, minus, out);
                     }
                 }
                 _ => {}
             }
         }
     }
-    scan(body, vars, &uses, &mut todo);
-    for (c, n, signed) in todo {
+    scan(body, vars, &uses, &minus, &mut todo);
+    for (c, n, signed, step) in todo {
         let i = vars.len();
         vars.push(Var { name: "i".into(), ty: Type::Int { size: 4, signed }, kind: VarKind::Local });
         is_temp.push(false);
@@ -1123,7 +1233,11 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                     let f = Stmt::For {
                         init: vec![Stmt::Assign { dst: Expr::Var(i), src: Expr::Int { value: 0, ty: ty.clone() } }],
                         cond: Expr::cmp(BinOp::Lt, Expr::Var(i), cmp_n),
-                        step: vec![Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(i)), delta: 1, post: true })],
+                        step: vec![if step == 1 {
+                            Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(i)), delta: 1, post: true })
+                        } else {
+                            Stmt::Assign { dst: Expr::Var(i), src: Expr::bin(BinOp::Add, Expr::Var(i), Expr::Int { value: step, ty: ty.clone() }, ty.clone()) }
+                        }],
                         body: lb,
                     };
                     b.insert(k, f);

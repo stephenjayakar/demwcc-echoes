@@ -274,6 +274,10 @@ pub fn unknown_callee_byval(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>
                 continue;
             }
             let mut hit = false;
+            if !copyable(db, &t) {
+                i += 1;
+                continue;
+            }
             let size = crate::types::size_of(Some(db), &t).unwrap_or(0);
             let copy = match dead.iter().position(|d| d.size == size && same_place(&d.value, &obj)) {
                 Some(k) => {
@@ -338,4 +342,118 @@ fn same_place(a: &Expr, b: &Expr) -> bool {
         (Expr::Member { base: x, offset: o, .. }, Expr::Member { base: y, offset: p, .. }) | (Expr::Load { base: x, offset: o, .. }, Expr::Load { base: y, offset: p, .. }) => o == p && x == y,
         (x, y) => x == y,
     }
+}
+
+/// A returned object built from a call's by-value result copied whole into it (word by word)
+/// plus constant stores of the returned class's own members, the class having a constructor
+/// taking that result's class: `return R(f());` (`return optional_object<CAABox>(
+/// GetBoundingBox())`: the valid flag set, the box copied into the item storage).
+pub fn fold_converting_return(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    let Some(rv) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return };
+    let rt = strip_cv(&ir.sig.ret).clone();
+    let Some(rcls) = named(&rt).map(|s| s.to_string()) else { return };
+    let b = &ir.body;
+    let Some(Stmt::Return(None)) = b.last() else { return };
+    let end = b.len() - 1;
+    // the result object: `s = f()` with every later statement a store into the returned object
+    // or a register temp read from `s`
+    let Some(si) = (0..end).rev().find(|&k| matches!(&b[k], Stmt::Assign { dst: Expr::Var(s), src: Expr::Call { .. } } if matches!(ir.vars[*s].kind, VarKind::Stack { .. }))) else { return };
+    let Stmt::Assign { dst: Expr::Var(s), src: call } = &b[si] else { return };
+    let (s, call) = (*s, call.clone());
+    let t = strip_cv(&ir.vars[s].ty).clone();
+    if named(&t).is_none() {
+        return;
+    }
+    let Some(tsize) = crate::types::size_of(Some(db), &t) else { return };
+    let mut temps: std::collections::HashMap<VarId, i32> = std::collections::HashMap::new();
+    let mut copied: Vec<(i32, i32, u32)> = vec![]; // (dst offset, src offset, size)
+    for st in &b[si + 1..end] {
+        match st {
+            Stmt::Assign { dst: Expr::Var(x), src: Expr::Member { base, offset, .. } } if matches!(**base, Expr::Var(w) if w == s) => {
+                temps.insert(*x, *offset);
+            }
+            Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if matches!(**base, Expr::Var(w) if w == rv) => {
+                let n = scalar_size(ty).unwrap_or(0);
+                match src {
+                    Expr::Member { base: sb, offset: so, .. } if matches!(**sb, Expr::Var(w) if w == s) => copied.push((*offset, *so, n)),
+                    Expr::Var(x) if temps.contains_key(x) => copied.push((*offset, temps[x], n)),
+                    Expr::Int { .. } | Expr::Float { .. } => {}
+                    _ => return,
+                }
+            }
+            _ => return,
+        }
+    }
+    // the whole object copied, word by word, to one place
+    copied.sort_by_key(|c| c.1);
+    let Some(&(d0, s0, _)) = copied.first() else { return };
+    let mut next = 0i32;
+    for &(d, so, n) in &copied {
+        if so != next || d - so != d0 - s0 || n == 0 {
+            return;
+        }
+        next += n as i32;
+    }
+    if next as u32 != tsize || s0 != 0 {
+        return;
+    }
+    // the returned class's constructor taking that class (or its template parameter)
+    let base = strip_template_args(&rcls);
+    let last = crate::sig::split_scope(&base).1.to_string();
+    let key = format!("{base}::{last}");
+    let takes = |d: &mwdec_core::DeclInfo| -> bool {
+        if d.params.len() != 1 || !d.is_inline_defined || d.access != mwdec_core::Access::Public {
+            return false;
+        }
+        let pt = match strip_cv(&d.params[0].ty) {
+            Type::Ref(x) => strip_cv(x).clone(),
+            x => x.clone(),
+        };
+        pt == t || matches!(&pt, Type::Named(n) if d.template_params.contains(n))
+    };
+    let Some(_) = db.decls.get(&key).and_then(|ds| ds.iter().find(|d| takes(d))) else { return };
+    let ctor = mwdec_core::FuncSig {
+        qualified_name: key,
+        mangled: None,
+        ret: Type::Void,
+        params: vec![mwdec_core::Param { name: None, ty: Type::Ref(Box::new(Type::Const(Box::new(t.clone())))) }],
+        this_class: Some(rcls.clone()),
+        is_const: false,
+        is_static: false,
+        is_virtual: false,
+        variadic: false,
+        runs_code: false,
+    };
+    let ret = Stmt::Return(Some(Expr::Construct { class: rt, ctor: Some(ctor), args: vec![call] }));
+    ir.body.truncate(si);
+    ir.body.push(ret);
+}
+
+/// `rstl::optional_object<CAABox>` -> `rstl::optional_object` (decl keys carry no arguments).
+fn strip_template_args(s: &str) -> String {
+    let mut out = String::new();
+    let mut d = 0;
+    for c in s.chars() {
+        match c {
+            '<' => d += 1,
+            '>' => d -= 1,
+            _ if d == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Can an object of class `t` be copied where the draft writes `T(x)` or passes it by value: no
+/// copy constructor declared non-public (an implicit one is public).
+pub fn copyable(db: &mwdec_core::TypeDb, t: &Type) -> bool {
+    let Some(cls) = named(strip_cv(t)) else { return false };
+    let base = strip_template_args(cls);
+    let last = crate::sig::split_scope(&base).1.to_string();
+    let key = format!("{base}::{last}");
+    let copy_ctor = |d: &&mwdec_core::DeclInfo| {
+        d.params.len() == 1 && matches!(strip_cv(&d.params[0].ty), Type::Ref(x) if named(strip_cv(x)).is_some_and(|n| strip_template_args(n) == base))
+    };
+    !db.decls.get(&key).is_some_and(|ds| ds.iter().filter(copy_ctor).any(|d| d.access != mwdec_core::Access::Public))
 }

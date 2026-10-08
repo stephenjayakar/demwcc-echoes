@@ -530,6 +530,64 @@ impl Expr {
         }
     }
 
+    /// Visit the sub-expressions every evaluation of `self` evaluates (pre-order): the right
+    /// operand of `&&` / `||` and the arms of `?:` are skipped. A side effect moved into an
+    /// expression must land in one of these, or it may stop happening.
+    pub fn walk_unconditional<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, l, .. } => {
+                f(self);
+                l.walk_unconditional(f);
+            }
+            Expr::Ternary { c, .. } => {
+                f(self);
+                c.walk_unconditional(f);
+            }
+            Expr::AddrOf(e) | Expr::Unary { e, .. } | Expr::Cast { e, .. } | Expr::IncDec { e, .. } => {
+                f(self);
+                e.walk_unconditional(f);
+            }
+            Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } => {
+                f(self);
+                base.walk_unconditional(f);
+            }
+            Expr::Index { base, index, .. } => {
+                f(self);
+                base.walk_unconditional(f);
+                index.walk_unconditional(f);
+            }
+            Expr::Binary { l, r, .. } => {
+                f(self);
+                l.walk_unconditional(f);
+                r.walk_unconditional(f);
+            }
+            Expr::Call { callee, args, .. } => {
+                f(self);
+                match callee {
+                    Callee::Method { this, .. } | Callee::Virtual { this, .. } => this.walk_unconditional(f),
+                    Callee::Indirect(e) => e.walk_unconditional(f),
+                    Callee::Direct { .. } => {}
+                }
+                for a in args {
+                    a.walk_unconditional(f);
+                }
+            }
+            Expr::New { placement, args, .. } => {
+                f(self);
+                for a in placement.iter().chain(args.iter()) {
+                    a.walk_unconditional(f);
+                }
+            }
+            Expr::Construct { args, .. } => {
+                f(self);
+                for a in args {
+                    a.walk_unconditional(f);
+                }
+            }
+            other => f(other),
+        }
+    }
+
     /// Mutable post-order rewrite.
     pub fn rewrite(&mut self, f: &mut dyn FnMut(&mut Expr)) {
         match self {

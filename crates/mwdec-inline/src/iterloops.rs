@@ -194,6 +194,34 @@ fn iterator_steps(ir: &mut IrFunction, db: &TypeDb) -> usize {
     n
 }
 
+/// The location an lvalue reads (`o.m`, `*(T*)((char*)p + k)`, `p->m`): (root, byte offset).
+fn word_at(e: &Expr) -> Option<(Expr, i64)> {
+    fn ptr(e: &Expr) -> Option<(Expr, i64)> {
+        match strip_casts(e) {
+            Expr::Binary { op: BinOp::Add, l, r, .. } => {
+                let (b, k) = ptr(l)?;
+                Some((b, k + r.as_int()?))
+            }
+            Expr::AddrOf(x) => word_at(x),
+            x @ Expr::Var(_) => Some((x.clone(), 0)),
+            _ => None,
+        }
+    }
+    match strip_casts(e) {
+        Expr::Load { base, offset, .. } => {
+            let (b, k) = ptr(base)?;
+            Some((b, k + *offset as i64))
+        }
+        Expr::Member { base, offset, .. } => {
+            let (b, k) = word_at(base)?;
+            Some((b, k + *offset as i64))
+        }
+        // (an object variable: its own address)
+        x @ Expr::Var(_) => Some((Expr::AddrOf(Box::new(x.clone())), 0)),
+        _ => None,
+    }
+}
+
 /// `*v.end() = x; ++v.mCount;` (the expansion of `reserved_vector::push_back`): `v.push_back(x)`,
 /// with `x` the object the element was copied from (a by-value or reference parameter).
 fn push_backs(ir: &mut IrFunction, db: &TypeDb) -> usize {
@@ -213,13 +241,13 @@ fn push_backs(ir: &mut IrFunction, db: &TypeDb) -> usize {
             }
             // the count increment right after: `v.mCount += 1` on the same container
             let Expr::AddrOf(cont) = &**obj else { return None };
-            let Expr::Load { base: cb, offset: coff, .. } = &**cont else { return None };
-            let Stmt::Assign { dst: Expr::Load { base: b2, offset: o2, .. }, src: inc } = &ir.body[k + 1] else { return None };
-            if **b2 != **cb || *o2 != *coff {
+            let at = word_at(cont)?;
+            let Stmt::Assign { dst: d2, src: inc } = &ir.body[k + 1] else { return None };
+            if word_at(d2) != Some(at.clone()) {
                 return None;
             }
             let Expr::Binary { op: BinOp::Add, l, r, .. } = strip_casts(inc) else { return None };
-            if r.as_int() != Some(1) || !matches!(strip_casts(l), Expr::Load { base, offset, .. } if **base == **cb && *offset == *coff) {
+            if r.as_int() != Some(1) || word_at(strip_casts(l)) != Some(at) {
                 return None;
             }
             // the copied object: a parameter's whole value
@@ -228,6 +256,8 @@ fn push_backs(ir: &mut IrFunction, db: &TypeDb) -> usize {
                     Expr::Var(p) if matches!(ir.vars[*p].kind, VarKind::Param { .. }) => Expr::Var(*p),
                     _ => return None,
                 },
+                // (a by-value parameter of the element's class, whole)
+                Expr::Var(p) if matches!(ir.vars[*p].kind, VarKind::Param { .. }) && crate::util::class_name(&ir.vars[*p].ty, db).is_some_and(|c| Some(c) == crate::util::class_name(&t, db)) => Expr::Var(*p),
                 e if crate::util::class_name(&t, db).is_none() => e.clone(),
                 _ => return None,
             };

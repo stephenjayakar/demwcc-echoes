@@ -276,7 +276,8 @@ impl Cfg {
         let mut idom = vec![usize::MAX; nb];
         idom[0] = 0;
         let mut changed = true;
-        while changed {
+        let mut fuel = crate::fuel::Fuel::new("cfg.dominators", crate::fuel::CAP_FIXPOINT);
+        while changed && fuel.burn() {
             changed = false;
             for &b in self.rpo.iter().skip(1) {
                 let mut new: Option<usize> = None;
@@ -360,7 +361,8 @@ impl Cfg {
         let mut ipdom = vec![usize::MAX; nb + 1];
         ipdom[exit] = exit;
         let mut changed = true;
-        while changed {
+        let mut fuel = crate::fuel::Fuel::new("cfg.postdominators", crate::fuel::CAP_FIXPOINT);
+        while changed && fuel.burn() {
             changed = false;
             for &b in post.iter().skip(1) {
                 let mut new: Option<usize> = None;
@@ -385,7 +387,11 @@ impl Cfg {
     }
 
     pub fn dominates(&self, a: usize, mut b: usize) -> bool {
+        let mut fuel = crate::fuel::Fuel::new("cfg.dominates", self.idom.len() + 1);
         loop {
+            if !fuel.burn() {
+                return false;
+            }
             if a == b {
                 return true;
             }
@@ -398,7 +404,11 @@ impl Cfg {
     }
 
     pub fn postdominates(&self, a: usize, mut b: usize) -> bool {
+        let mut fuel = crate::fuel::Fuel::new("cfg.postdominates", self.ipdom.len() + 1);
         loop {
+            if !fuel.burn() {
+                return false;
+            }
             if a == b {
                 return true;
             }
@@ -448,11 +458,21 @@ pub struct Loop {
 }
 
 fn intersect(idom: &[usize], order: &[usize], mut a: usize, mut b: usize) -> usize {
+    let mut fuel = crate::fuel::Fuel::new("cfg.intersect", 3 * idom.len() + 3);
     while a != b {
+        if !fuel.burn() {
+            return a;
+        }
         while order[a] > order[b] {
+            if !fuel.burn() {
+                return a;
+            }
             a = idom[a];
         }
         while order[b] > order[a] {
+            if !fuel.burn() {
+                return a;
+            }
             b = idom[b];
         }
     }

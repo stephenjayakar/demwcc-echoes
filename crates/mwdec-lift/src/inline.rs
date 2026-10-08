@@ -276,6 +276,17 @@ fn sibling_reads(e: &Expr, t: VarId) -> bool {
     r
 }
 
+/// Does `e` read `t` only after a branch (the right side of `&&` / `||`, an arm of `?:`)?
+fn used_conditionally(e: &Expr, t: VarId) -> bool {
+    let mut hit = false;
+    e.walk(&mut |x| match x {
+        Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, r, .. } => hit |= r.uses_var(t),
+        Expr::Ternary { t: a, f, .. } => hit |= a.uses_var(t) || f.uses_var(t),
+        _ => {}
+    });
+    hit
+}
+
 fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
     match s {
         Stmt::Assign { dst, src } => vec![dst, src],
@@ -310,6 +321,19 @@ fn uses_in_stmt(s: &Stmt, t: VarId) -> usize {
     let mut n = 0;
     for e in stmt_exprs(s) {
         e.walk(&mut |x| {
+            if matches!(x, Expr::Var(v) if *v == t) {
+                n += 1;
+            }
+        });
+    }
+    n
+}
+
+/// Uses of `t` that the statement evaluates every time it runs (see `Expr::walk_unconditional`).
+fn uses_unconditional(s: &Stmt, t: VarId) -> usize {
+    let mut n = 0;
+    for e in stmt_exprs(s) {
+        e.walk_unconditional(&mut |x| {
             if matches!(x, Expr::Var(v) if *v == t) {
                 n += 1;
             }
@@ -394,6 +418,11 @@ pub fn inline_list(items: &mut Vec<Stmt>, uses: &mut HashMap<VarId, usize>, is_t
         let fx = effects(&src, is_temp, vars);
         if total == 1 && local == 1 {
             let mut ok = (i + 1..j).all(|k| !conflicts(&fx, &items[k], is_temp, vars));
+            // a call lands only where it is always evaluated (not a `&&` / `||` right operand or a
+            // `?:` arm, where it might stop happening)
+            if ok && fx.calls && uses_unconditional(&items[j], t) != 1 {
+                ok = false;
+            }
             // MWCC never moves code across a call: a value computed before a call statement and
             // read after it was computed there in the source (a local), even when pure
             if ok && !fx.calls && (i + 1..j).any(|k| stmt_has_call(&items[k])) {
@@ -401,6 +430,11 @@ pub fn inline_list(items: &mut Vec<Stmt>, uses: &mut HashMap<VarId, usize>, is_t
             }
             // nor across a branch or loop: the value was computed in an earlier block
             if ok && (i + 1..j).any(|k| matches!(items[k], Stmt::If { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::Switch { .. })) {
+                ok = false;
+            }
+            // nor into a term evaluated only after a branch (the right side of `&&` / `||`, an arm
+            // of `?:`): a read or call before the branch was there in the source
+            if ok && (fx.calls || fx.reads_mem) && stmt_exprs(&items[j]).iter().any(|e| used_conditionally(e, t)) {
                 ok = false;
             }
             if ok && (fx.calls || fx.reads_mem) {

@@ -112,6 +112,22 @@ fn flat_into(db: &TypeDb, cls: &str, base: i32, out: &mut Vec<(i32, u32, bool)>,
     Some(())
 }
 
+/// Offsets of the scalar leaves of `t` that belong to a member object (not a direct scalar).
+fn nested_leaves(db: &TypeDb, t: &Type) -> std::collections::HashSet<i32> {
+    let mut out = std::collections::HashSet::new();
+    let Some(cls) = named(&types::resolve(Some(db), t)).map(|s| s.to_string()) else { return out };
+    let Some(c) = sig::find_class(db, &cls) else { return out };
+    for f in &c.fields {
+        let ft = types::resolve(Some(db), &f.ty).into_owned();
+        if types::is_aggregate(Some(db), &ft) {
+            for (o, _, _) in flat(db, &ft).unwrap_or_default() {
+                out.insert(f.offset as i32 + o);
+            }
+        }
+    }
+    out
+}
+
 struct Copy {
     stmt: usize,
     dst_base: Expr,
@@ -322,7 +338,11 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
                 _ => None,
             };
             let scls_opt = base_class(&c0.src_base, c0.src_ptr, vars, db);
-            let dcls_opt = base_class(&c0.dst_base, c0.dst_ptr, vars, db).or_else(|| untyped_dst.and(scls_opt.clone()).and_then(|s| {
+            // a byte pointer (an element of a strided array) receiving a whole object
+            // (several members: a one-scalar object stored through a byte pointer stays a scalar
+            // store, the shape inline templates such as `push_back` expand to)
+            let raw_ptr_dst = group.len() >= 2 && c0.dst_ptr && base_class(&c0.dst_base, true, vars, db).is_none() && pointee(&types::ty_of(&c0.dst_base, vars)).is_some_and(|t| scalar_size(t) == Some(1));
+            let dcls_opt = base_class(&c0.dst_base, c0.dst_ptr, vars, db).or_else(|| (untyped_dst.is_some() || raw_ptr_dst).then(|| scls_opt.clone()).flatten().and_then(|s| {
                 let ts = aggregate_at(db, &s, smin);
                 ts.iter().filter_map(|t| named(t).map(|n| n.to_string())).next()
             }));
@@ -331,6 +351,8 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
                     let (uv, usize_) = untyped_dst.unwrap();
                     let need = extent.get(&uv).copied().unwrap_or(0);
                     aggregate_at(db, &scls, smin).into_iter().filter(|t| types::size_of(Some(db), t).map_or(false, |s| s <= usize_ && s as i64 >= need)).collect::<Vec<_>>()
+                } else if raw_ptr_dst {
+                    aggregate_at(db, &scls, smin)
                 } else {
                     aggregate_at(db, &dcls, dmin)
                 };
@@ -345,7 +367,11 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
                     // an all-float object copied word by word through integer registers (a POD
                     // copy-construction: `new (p) T(x)`, a by-value copy) is a whole copy too
                     let words = group.iter().all(|c| !c.float && c.size == 4);
-                    let ok = fields.iter().all(|(o, s, f)| group.iter().any(|c| c.dst_off - dmin == *o && c.size == *s && (c.float == *f || (words && *f && *s == 4))));
+                    // a member object is one block region of the copy: its floats move as words
+                    let nested = nested_leaves(db, t);
+                    let ok = fields.iter().all(|(o, s, f)| {
+                        group.iter().any(|c| c.dst_off - dmin == *o && c.size == *s && (c.float == *f || ((words || nested.contains(o)) && *f && !c.float && *s == 4)))
+                    });
                     if !ok {
                         continue;
                     }

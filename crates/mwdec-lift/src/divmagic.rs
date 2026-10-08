@@ -65,7 +65,11 @@ impl Ctx<'_> {
     /// Like `res` but keeps the outer 32-bit cast of a mulh.
     fn res_keep_cast<'b>(&'b self, e: &'b Expr) -> &'b Expr {
         let mut e = e;
+        let mut fuel = crate::fuel::Fuel::new("divmagic.defs", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return e;
+            }
             match e {
                 Expr::Var(v) => match self.defs.get(v) {
                     Some(d) => e = d,

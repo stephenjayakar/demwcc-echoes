@@ -420,7 +420,7 @@ impl DefCache {
 
 const PROBE: &str = "__mwdec_dc";
 /// Version of the canonical form (part of the cache key).
-const VERSION: &str = "defctor v13";
+const VERSION: &str = "defctor v15";
 
 fn probe_text(spelled: &str, k: usize) -> String {
     format!("struct {PROBE}{k} {{ {spelled} m; {PROBE}{k}(); }};\n{PROBE}{k}::{PROBE}{k}() {{}}\n")
@@ -1233,6 +1233,17 @@ fn drop_unused_temps(body: &mut Vec<Stmt>, vars: &[mwdec_lift::Var]) {
 pub enum COp {
     Store(CStore),
     Call { name: String, args: Vec<CE> },
+    /// steps run when a condition holds (`if (other.m_valid) construct(m_data, other.data())`)
+    If { cond: CE, then: Vec<COp> },
+}
+
+/// `o` with `This(k)` shifted by `by` and the probe's source parameter bound to `bind`.
+fn bind_op(o: &COp, by: i32, src: usize, bind: usize) -> COp {
+    match o {
+        COp::Store(s) => COp::Store(CStore { addr: bind_ce(&s.addr, by, src, bind), size: s.size, val: bind_ce(&s.val, by, src, bind) }),
+        COp::Call { name, args } => COp::Call { name: name.clone(), args: args.iter().map(|a| bind_ce(a, by, src, bind)).collect() },
+        COp::If { cond, then } => COp::If { cond: bind_ce(cond, by, src, bind), then: then.iter().map(|x| bind_op(x, by, src, bind)).collect() },
+    }
 }
 
 /// Copy constructions of classes (canonical steps; the source object is `CE::Param`).
@@ -1331,6 +1342,19 @@ impl Canon<'_> {
                 };
                 Some(COp::Store(CStore { addr: self.addr(dst, 0)?, size: size_of(ty, self.db)?, val: self.val(src, 0)? }))
             }
+            // a conditional step (no else): its condition, and its own steps (temporaries
+            // defined in it are read through their definitions)
+            Stmt::If { cond, then, els } if els.is_empty() && !then.is_empty() => {
+                let c = self.val(cond, 0)?;
+                let mut t = vec![];
+                for x in then {
+                    match x {
+                        Stmt::Assign { dst: Expr::Var(v), .. } if self.defs.contains_key(v) => {}
+                        x => t.push(self.op(x)?),
+                    }
+                }
+                (!t.is_empty()).then_some(COp::If { cond: c, then: t })
+            }
             s => self.store(s).map(COp::Store),
         }
     }
@@ -1355,14 +1379,44 @@ fn ops_from_probe(ir: &IrFunction, db: &TypeDb) -> Option<Vec<COp>> {
         }
         out.push(COp::Call { name: format!("{}/{}", sig.qualified_name, sig.params.len()), args: a });
     }
-    for s in &ir.body {
+    out.extend(probe_steps(&c, &ir.body, &defs)?);
+    (!out.is_empty()).then_some(out)
+}
+
+/// The steps of a probe body; an early return (`if (!o.valid) return; ...`) guards the steps
+/// after it (`If { o.valid, ... }`).
+fn probe_steps(c: &Canon, body: &[Stmt], defs: &HashMap<VarId, Expr>) -> Option<Vec<COp>> {
+    let mut out = vec![];
+    for (i, s) in body.iter().enumerate() {
         match s {
             Stmt::Assign { dst: Expr::Var(v), .. } if defs.contains_key(v) => {}
             Stmt::Return(None) => {}
+            Stmt::If { cond, then, els } if els.is_empty() && matches!(then.as_slice(), [Stmt::Return(None)]) => {
+                let rest = probe_steps(c, &body[i + 1..], defs)?;
+                if !rest.is_empty() {
+                    out.push(COp::If { cond: negate_ce(c.val(cond, 0)?)?, then: rest });
+                }
+                return Some(out);
+            }
             s => out.push(c.op(s)?),
         }
     }
-    (!out.is_empty()).then_some(out)
+    Some(out)
+}
+
+/// The opposite comparison.
+fn negate_ce(e: CE) -> Option<CE> {
+    let CE::Bin(op, a, b) = e else { return None };
+    let op = match op.as_str() {
+        "Eq" => "Ne",
+        "Ne" => "Eq",
+        "Lt" => "Ge",
+        "Ge" => "Lt",
+        "Gt" => "Le",
+        "Le" => "Gt",
+        _ => return None,
+    };
+    Some(CE::Bin(op.into(), a, b))
 }
 
 /// Copy constructions of `classes`, from the cache or by compiling probes.
@@ -1446,6 +1500,7 @@ fn first_param(ops: &[COp]) -> Option<usize> {
     ops.iter().find_map(|o| match o {
         COp::Store(s) => find(&s.addr).or_else(|| find(&s.val)),
         COp::Call { args, .. } => args.iter().find_map(find),
+        COp::If { cond, then } => find(cond).or_else(|| first_param(then)),
     })
 }
 
@@ -1493,10 +1548,7 @@ fn residue_of_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors, c: &mwdec_
         let mut pick = vec![];
         let mut at = 0;
         for o in rest {
-            let want = match o {
-                COp::Store(s) => COp::Store(CStore { addr: bind_ce(&s.addr, off, src, p), size: s.size, val: bind_ce(&s.val, off, src, p) }),
-                COp::Call { name, args } => COp::Call { name: name.clone(), args: args.iter().map(|a| bind_ce(a, off, src, p)).collect() },
-            };
+            let want = bind_op(o, off, src, p);
             match (at..body_ops.len()).find(|&k| body_ops[k].as_ref() == Some(&want)) {
                 Some(k) => {
                     pick.push(k);
@@ -1556,10 +1608,7 @@ pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usiz
             let mut pick = vec![];
             let mut at = 0;
             for o in ops {
-                let want = match o {
-                    COp::Store(s) => COp::Store(CStore { addr: bind_ce(&s.addr, off, src, p), size: s.size, val: bind_ce(&s.val, off, src, p) }),
-                    COp::Call { name, args } => COp::Call { name: name.clone(), args: args.iter().map(|a| bind_ce(a, off, src, p)).collect() },
-                };
+                let want = bind_op(o, off, src, p);
                 match (at..body_ops.len()).find(|&k| body_ops[k].as_ref() == Some(&want)) {
                     Some(k) => {
                         pick.push(k);

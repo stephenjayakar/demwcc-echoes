@@ -121,7 +121,11 @@ impl<'a> Structurer<'a> {
     fn build(&mut self, start: usize, end: Option<usize>, first_ok: bool, out: &mut Vec<Stmt>) {
         let mut cur = start;
         let mut first = true;
+        let mut fuel = crate::fuel::Fuel::new("structure.build", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return;
+            }
             let skip_checks = first && first_ok;
             first = false;
             if cur == self.exit_node() {
@@ -478,7 +482,11 @@ impl<'a> Structurer<'a> {
             Some(defs)
         };
         let mut set: Vec<usize> = vec![s];
+        let mut fuel = crate::fuel::Fuel::new("structure.bool_region", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return None;
+            }
             let mut grew = false;
             let mut cands: Vec<usize> = vec![];
             for &n in &set {
@@ -676,7 +684,11 @@ impl<'a> Structurer<'a> {
         let mut conds = vec![];
         let mut cur = s;
         let end;
+        let mut fuel = crate::fuel::Fuel::new("structure.or_return_chain", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return None;
+            }
             let (t, f) = self.cond_edges(cur)?;
             if cur != s && (self.has_stmts(cur) || self.cfg.blocks[cur].preds.len() != 1 || self.emitted[cur] || self.loops.contains_key(&cur)) {
                 return None;
@@ -772,7 +784,11 @@ impl<'a> Structurer<'a> {
         let mut chain = vec![s];
         let mut defs: Vec<(VarId, Expr)> = vec![];
         let (_, mut cur) = self.cond_edges(s)?;
+        let mut fuel = crate::fuel::Fuel::new("structure.shared_return_or_chain", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return None;
+            }
             if cur >= nb || cur == r || self.emitted[cur] || self.cfg.blocks[cur].preds.len() != 1 || self.loops.contains_key(&cur) {
                 return None;
             }
@@ -878,7 +894,11 @@ impl<'a> Structurer<'a> {
         let mut chain = vec![s];
         let Term::CondReturn { fall } = self.cfg.blocks[s].term else { return None };
         let mut cur = fall;
+        let mut fuel = crate::fuel::Fuel::new("structure.leaf_or_return", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return None;
+            }
             if cur >= self.cfg.blocks.len() || self.has_stmts(cur) || self.emitted[cur] || self.cfg.blocks[cur].preds.len() != 1 || self.loops.contains_key(&cur) {
                 return None;
             }
@@ -1053,7 +1073,11 @@ impl<'a> Structurer<'a> {
     fn build_if(&mut self, start: usize, join: Option<usize>, out: &mut Vec<Stmt>) {
         let mut chain = vec![start];
         let mut cur = start;
+        let mut fuel = crate::fuel::Fuel::new("structure.build_if", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                break;
+            }
             let Some((_, fall)) = self.cond_edges(cur) else { break };
             let n = fall;
             let ok = self.cond_edges(n).is_some()
@@ -1155,7 +1179,11 @@ impl<'a> Structurer<'a> {
             allowed.remove(&n);
             edges.push((n, self.cond_of(n), t, f));
         }
+        let mut fuel = crate::fuel::Fuel::new("structure.try_make_cond", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return None;
+            }
             let mut did = false;
             let ids: Vec<usize> = edges.iter().map(|e| e.0).collect();
             for ci in 0..edges.len() {
@@ -1309,7 +1337,11 @@ impl<'a> Structurer<'a> {
             let mut chain: Vec<usize> = vec![];
             let mut conds: Vec<Expr> = vec![];
             let mut cur = h;
+            let mut fuel = crate::fuel::Fuel::new("structure.loop_test_chain", crate::fuel::CAP_WALK);
             loop {
+                if !fuel.burn() {
+                    return None;
+                }
                 let (t, f) = self.cond_edges(cur)?;
                 let (stay, next) = if t == x && l.body.contains(&f) {
                     (self.cond_of(cur).negate(self.vars), f)
@@ -1472,7 +1504,11 @@ impl<'a> Structurer<'a> {
     /// Common post-dominator of a set of blocks (the tree's exit).
     fn join_of_set(&self, nodes: &[usize]) -> Option<usize> {
         let mut j = *nodes.first()?;
+        let mut fuel = crate::fuel::Fuel::new("structure.join_of_set", crate::fuel::CAP_WALK);
         loop {
+            if !fuel.burn() {
+                return None;
+            }
             if nodes.iter().all(|&n| self.cfg.postdominates(j, n)) && !nodes.contains(&j) {
                 break;
             }
@@ -1919,7 +1955,11 @@ fn reg_const(insns: &[Insn], k: usize, r: u8, depth: u32) -> Option<i64> {
 /// m2c's reduction of a DAG of tests `(node, cond for taken, taken, fall)` rooted at `root` into
 /// one `&&`/`||` condition: (cond for taken, taken, fall) over the non-node targets.
 fn reduce_cond_dag(mut edges: Vec<(usize, Expr, usize, usize)>, root: usize, vars: &[Var]) -> Option<(Expr, usize, usize)> {
+    let mut fuel = crate::fuel::Fuel::new("structure.reduce_cond_dag", crate::fuel::CAP_WALK);
     loop {
+        if !fuel.burn() {
+            return None;
+        }
         let mut did = false;
         for ci in 0..edges.len() {
             let child = edges[ci].0;

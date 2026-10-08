@@ -106,6 +106,11 @@ pub fn register_only(f: &Fitness) -> bool {
 pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64, seen: &mut HashSet<String>) -> Vec<(String, &'static str)> {
     let Some(p) = Parsed::new(src, symbol) else { return vec![] };
     let mut out = vec![];
+    for c in hoist_loads_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "hoist_loads"));
+        }
+    }
     for c in loop_bound_variants(src, symbol) {
         if seen.insert(normalize(&c)) {
             out.push((c, "loop_bound"));
@@ -1847,6 +1852,67 @@ pub fn loop_bound_variants(src: &str, symbol: &str) -> Vec<String> {
         for &u in &reads {
             edits.push(Edit::replace(&c, u, c.text(val).to_string()));
         }
+        if let Some(s) = apply(src, &edits) {
+            if Cst::parse(&s).errors <= c.errors {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// The loads of a short-circuit condition (`a->x == 0 || a->y == 0 || ...`) read into locals
+/// before it (`T l0 = a->x; T l1 = a->y; ...`): every value is then loaded up front, as when the
+/// source copied the fields first.
+pub fn hoist_loads_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    for st in c.descendants(info.body) {
+        let cond = match c.kind(st) {
+            "if_statement" => c.child(st, "condition"),
+            "return_statement" => c.named(st).first().copied(),
+            _ => None,
+        };
+        let Some(cond) = cond else { continue };
+        if !c.parent(st).is_some_and(|p| c.kind(p) == "compound_statement") {
+            continue;
+        }
+        let logical = c.descendants(cond).into_iter().any(|d| c.kind(d) == "binary_expression" && matches!(c.op(d), Some("||" | "&&")));
+        if !logical || c.descendants(cond).into_iter().any(|d| matches!(c.kind(d), "call_expression" | "assignment_expression" | "update_expression")) {
+            continue;
+        }
+        let loads: Vec<usize> = c
+            .descendants(cond)
+            .into_iter()
+            .filter(|&d| (c.kind(d) == "pointer_expression" && c.op(d) == Some("*")) || c.kind(d) == "field_expression" || c.kind(d) == "subscript_expression")
+            .collect();
+        let outer: Vec<usize> = loads.iter().copied().filter(|&n| !loads.iter().any(|&m| m != n && c.contains(m, n))).collect();
+        if outer.len() < 2 {
+            continue;
+        }
+        let at = c.nodes[st].start;
+        let line_start = src[..at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+        let ind = &src[line_start..at];
+        let mut decls = String::new();
+        let mut edits = vec![];
+        let mut names: Vec<(String, String)> = vec![];
+        for n in outer {
+            let t = c.text(n).to_string();
+            let name = match names.iter().find(|x| x.0 == t) {
+                Some(x) => x.1.clone(),
+                None => {
+                    let nm = info.fresh_name(&c, &format!("load{}_", names.len()));
+                    decls.push_str(&format!("__typeof__({t}) {nm} = {t};\n{ind}"));
+                    names.push((t.clone(), nm.clone()));
+                    nm
+                }
+            };
+            edits.push(Edit::replace(&c, n, name));
+        }
+        edits.push(Edit::insert(at, decls));
         if let Some(s) = apply(src, &edits) {
             if Cst::parse(&s).errors <= c.errors {
                 out.push(s);

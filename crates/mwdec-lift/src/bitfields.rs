@@ -752,7 +752,11 @@ fn join_chains(body: &mut Vec<Stmt>, is_temp: &mut Vec<bool>) {
         return;
     }
     let resolve = |mut v: VarId| {
+        let mut fuel = crate::fuel::Fuel::new("bitfields.renames", renames.len() + 1);
         while let Some(&n) = renames.get(&v) {
+            if !fuel.burn() {
+                break;
+            }
             v = n;
         }
         v
@@ -865,7 +869,11 @@ fn insert_chains_inner(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut 
     if !renames.is_empty() {
         let map: std::collections::HashMap<VarId, VarId> = renames.into_iter().collect();
         let resolve = |mut v: VarId| {
+            let mut fuel = crate::fuel::Fuel::new("bitfields.renames", map.len() + 1);
             while let Some(&n) = map.get(&v) {
+                if !fuel.burn() {
+                    break;
+                }
                 v = n;
             }
             v

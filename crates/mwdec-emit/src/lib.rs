@@ -84,6 +84,8 @@ struct Em<'a> {
     /// Forward declarations of functions the context doesn't declare (file-local statics,
     /// anonymous-namespace helpers): symbol -> (confidence, declaration).
     fn_decls: std::collections::BTreeMap<String, (u8, String)>,
+    /// parameter types of the functions declared from a call's argument types
+    fn_param_tys: std::collections::HashMap<String, Vec<Type>>,
     /// Types the context lacks (classes of the unit's own source), synthesized from their uses.
     synth: std::collections::BTreeMap<String, Synth>,
     /// Their rendered definitions (first in the preamble).
@@ -153,7 +155,7 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
             }
         }
     });
-    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), obj_arrays: Default::default(), vt_count: 0, sret_local: None, gtypes: Default::default(), gstructs: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false, member_store: false };
+    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), obj_arrays: Default::default(), vt_count: 0, sret_local: None, gtypes: Default::default(), gstructs: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), fn_param_tys: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false, member_store: false };
     // a static initializer: the global definitions it is generated from
     if ir.symbol.starts_with("__sinit_") {
         let mut em = new_em();
@@ -2000,6 +2002,7 @@ impl<'a> Em<'a> {
             // C: unprototyped (K&R) unless float arguments would be promoted to double, narrow
             // integers extended, or the address is converted to a prototyped function pointer
             // type (MWCC checks those)
+            self.fn_param_tys.insert(symbol.to_string(), tys.to_vec());
             tys.iter().map(type_str).collect()
         } else {
             vec![]
@@ -3243,6 +3246,12 @@ impl<'a> Em<'a> {
                         let cst = if matches!(sr, Type::Const(_)) && is_const_method { "const " } else { "" };
                         return format!("(({cst}{}*){o})->", types::split_closers(c));
                     }
+                } else if matches!(this_e, Expr::Call { .. }) && sig::find_class(db, c).is_some() && matches!(strip_cv(&sr), Type::Int { size: 1, .. } | Type::Char | Type::Void) {
+                    // a call returning a byte pointer to the object (`AfterEnd()` of a header
+                    // followed by the next one): the object there
+                    let o = self.expr(this_e, 14);
+                    let cst = if matches!(sr, Type::Const(_)) && is_const_method { "const " } else { "" };
+                    return format!("(({cst}{}*){o})->", types::split_closers(c));
                 }
             }
         }
@@ -4074,7 +4083,13 @@ impl<'a> Em<'a> {
                     .collect();
                 self.declare_function(symbol, Some(s), Some((&arg_tys, ret)), 2);
                 let self_decl = sig::demangle(symbol).is_none() && self.fn_decls.contains_key(symbol);
-                let a = if self_decl { args.iter().map(|x| self.expr(x, 0)).collect::<Vec<_>>().join(", ") } else { self.args(args, Some(s)) };
+                // (later calls with other argument types: converted to the declared ones)
+                let declared_tys = if self_decl { self.fn_param_tys.get(symbol).cloned().filter(|t| t.len() == args.len()) } else { None };
+                let a = match declared_tys {
+                    Some(tys) => args.iter().zip(&tys).map(|(x, t)| if value_type(&ty_of(x, self.vars())) == *t { self.expr(x, 0) } else { self.coerce(x, t) }).collect::<Vec<_>>().join(", "),
+                    None if self_decl => args.iter().map(|x| self.expr(x, 0)).collect::<Vec<_>>().join(", "),
+                    None => self.args(args, Some(s)),
+                };
                 format!("{name}({a})")
             }
             Callee::Method { sig: s, this, qualified, .. } => {

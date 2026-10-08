@@ -24,6 +24,8 @@ pub mod divmagic;
 pub mod debug;
 pub mod frame;
 pub mod frameobj;
+pub mod fpcopy;
+pub mod fuel;
 pub mod idioms;
 pub mod indexing;
 pub mod inline;
@@ -120,6 +122,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     if f.code.is_empty() {
         anyhow::bail!("empty function {}", f.name);
     }
+    let fuel_mark = fuel::mark();
     let mut l = Lifter::new(obj, f, db);
     l.force_sret = force_sret == Some(true);
     l.no_sret_guess = force_sret.is_none();
@@ -161,6 +164,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     }
     // fold, drop dead temps, and fold again: a dead read (the vtable load of a virtual call)
     // can keep a temp at two uses in the first round
+    fpcopy::keep_copy_runs_named(&lists, &l.vars, &mut l.is_temp);
     for round in 0..2 {
         if opts.inline_temps {
             let mut uses = count_all(&lists);
@@ -169,7 +173,8 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
             }
         }
         let mut any = false;
-        loop {
+        let mut fuel = fuel::Fuel::new("lift.dce", fuel::CAP_FIXPOINT);
+        while fuel.burn() {
             let uses = count_all(&lists);
             let mut changed = false;
             for (items, _) in lists.iter_mut() {
@@ -302,11 +307,19 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     if opts.inline_temps {
         reinline(&mut body, &l.is_temp, &l.vars);
     }
-    indexing::pointer_walks(&mut body, &l.vars);
+    if indexing::pointer_walks(&mut body, &l.vars) > 0 {
+        if let Some(db) = db {
+            arrays::recover(&mut body, &l.vars, Some(db));
+        }
+    }
+    if indexing::invariant_reads(&mut body, &l.vars, &l.is_temp) > 0 {
+        objcmp::object_compares(&mut body, &l.vars, db);
+    }
     indexing::undo_strength_reduction(&mut body, &l.vars);
     indexing::recover(&mut body, &l.vars, db);
     indexing::raw_index(&mut body, &l.vars);
     arrays::type_indexed_globals(&mut body, &l.vars, db, &Default::default());
+    indexing::pointer_global_rows(&mut body, &l.vars, db);
     simplify::form_incdec(&mut body, &l.vars, &l.is_temp, db);
     simplify::fold_ternary_constants(&mut body);
     simplify::inline_ternary_results(&mut body);
@@ -393,18 +406,21 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     frameobj::fold_block_copies(&mut ir, db);
     frameobj::whole_object_copies(&mut ir, db);
     frameobj::unknown_callee_byval(&mut ir, db);
+    frameobj::fold_converting_return(&mut ir, db);
     idioms::apply(&mut ir, db);
     idioms::narrow_float_stores(&mut ir, db);
     scalars::regroup(&mut ir, db);
     debug::stage("idioms", &ir.body, &ir.vars);
     if opts.for_loops {
         simplify::form_for_loops(&mut ir.body);
+        simplify::narrow_counter_steps(&mut ir.body, &ir.vars);
     }
     simplify::name_vars(&ir.body, &mut ir.vars);
     structure::guard_not_swap(&mut ir.body);
     for w in structure::invariant_loop_conditions(&ir.body) {
         ir.warnings.push(w);
     }
+    ir.warnings.extend(fuel::since(fuel_mark));
     Ok(ir)
 }
 
@@ -983,7 +999,8 @@ pub fn reinline(body: &mut Vec<Stmt>, is_temp: &[bool], vars: &[Var]) {
     let mut uses: HashMap<VarId, usize> = HashMap::new();
     inline::count_uses(body, &mut uses);
     Stmt::for_each_block_mut(body, &mut |b| inline::inline_list(b, &mut uses, is_temp, vars, 0));
-    loop {
+    let mut fuel = fuel::Fuel::new("lift.reinline_dce", fuel::CAP_FIXPOINT);
+    while fuel.burn() {
         let mut uses: HashMap<VarId, usize> = HashMap::new();
         inline::count_uses(body, &mut uses);
         let mut changed = false;

@@ -165,6 +165,14 @@ pub fn serve(root: &Path, work: &Path, no_db: bool) -> Result<()> {
             });
             cur = Some((unit.clone(), ui));
         }
+        // Test hook for the request timeout: a request that never answers in time.
+        if let Ok(v) = std::env::var("MWDEC_DRAFT_TEST_SLEEP") {
+            if let Some((s, secs)) = v.split_once(':') {
+                if s == symbol {
+                    std::thread::sleep(Duration::from_secs(secs.parse().unwrap_or(0)));
+                }
+            }
+        }
         // Test hook for the guard: simulate an IR explosion on this symbol.
         if std::env::var("MWDEC_DRAFT_TEST_OOM").is_ok_and(|s| s == symbol) {
             let mut hog: Vec<Vec<u8>> = Vec::new();
@@ -201,7 +209,10 @@ pub struct DraftClient {
 
 impl DraftClient {
     pub fn new(root: &Path, work: &Path, no_db: bool) -> DraftClient {
-        DraftClient { root: root.into(), work: work.into(), no_db, timeout: Duration::from_secs(300), proc_: Mutex::new(None) }
+        // (`MWDEC_DRAFT_TIMEOUT` seconds per request; the first request of a unit builds its
+        // types and inline library in the child, so the default is generous)
+        let secs = std::env::var("MWDEC_DRAFT_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        DraftClient { root: root.into(), work: work.into(), no_db, timeout: Duration::from_secs(secs), proc_: Mutex::new(None) }
     }
 
     fn spawn(&self) -> std::io::Result<Proc> {
@@ -266,11 +277,21 @@ impl DraftClient {
                 let mut p = g.take().unwrap();
                 let timed_out = e == RecvTimeoutError::Timeout;
                 if timed_out {
-                    let _ = p.child.kill(); // our own child, by handle
+                    // our own child and the compilers it started (they hold its pipes), by PID
+                    kill_tree(p.child.id());
+                    let _ = p.child.kill();
                 }
                 let status = p.child.wait().ok();
+                // The stderr reader ends when every holder of the pipe is gone; a compiler the
+                // child started may still hold it, so wait for it only briefly (never forever).
                 if let Some(t) = p.err_thread.take() {
-                    let _ = t.join();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !t.is_finished() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    if t.is_finished() {
+                        let _ = t.join();
+                    }
                 }
                 let tail: Vec<String> = p.err_tail.lock().unwrap().iter().cloned().collect();
                 let last = tail.iter().rev().find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
@@ -286,10 +307,31 @@ impl DraftClient {
     }
 }
 
+/// Kill process `pid` and its descendants (our own draft child; `taskkill /T` by PID).
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+    }
+}
+
 impl Drop for DraftClient {
     fn drop(&mut self) {
         if let Some(mut p) = self.proc_.lock().unwrap().take() {
             drop(p.stdin); // EOF: the child exits
+            // (a child stuck in a request is killed rather than waited for)
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while matches!(p.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if matches!(p.child.try_wait(), Ok(None)) {
+                kill_tree(p.child.id());
+                let _ = p.child.kill();
+            }
             let _ = p.child.wait();
         }
     }

@@ -315,8 +315,10 @@ fn assigns_var(b: &[Stmt], v: VarId) -> usize {
 
 /// A pointer walking an array in lockstep with a loop counter that starts at 0 (`p = a; i = 0;
 /// do { .. *p ..; p = p + K; i = i + 1; } while (i < n);`, the compiler's strength reduction of
-/// `a[i]`): its element reads are `a[i]` again (`((T*)a)[i]`), and the pointer goes.
-pub fn pointer_walks(body: &mut Vec<Stmt>, vars: &[Var]) {
+/// `a[i]`): its element reads are `a[i]` again (`((T*)a)[i]`, or members `a[i].f`), and the
+/// pointer goes. Returns the walks rewritten as member accesses (for the array recovery).
+pub fn pointer_walks(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    let mut members = 0;
     Stmt::for_each_block_mut(body, &mut |b| {
         for k in 0..b.len() {
             // the loop: (counter, its body, the counter's step inside the body if any)
@@ -378,49 +380,270 @@ pub fn pointer_walks(body: &mut Vec<Stmt>, vars: &[Var]) {
             if base.has_call() || base_vars.iter().any(|&v| assigns_var(&b[pi + 1..=k], v) > 0) {
                 continue;
             }
-            // every read of p is a K-byte load through it
+            // every read of p is a load through it: K-byte elements read whole, or members of
+            // K-byte elements (`p->field`)
             let mut reads = 0;
             let mut loads = 0;
             let mut elem: Option<Type> = None;
-            let mut same = true;
+            let mut whole = true;
+            let mut inside = true;
             Stmt::walk_exprs(&lb[..at], &mut |e| {
                 if matches!(e, Expr::Var(y) if *y == p) {
                     reads += 1;
                 }
-                if let Expr::Load { base: lbase, offset: 0, ty } = e {
+                if let Expr::Load { base: lbase, offset, ty } = e {
                     if matches!(uncast(lbase), Expr::Var(y) if *y == p) {
                         loads += 1;
-                        if scalar_size(ty) != Some(kk as u32) {
-                            same = false;
+                        let sz = scalar_size(ty).unwrap_or(0) as i64;
+                        if *offset != 0 || sz != kk {
+                            whole = false;
+                        }
+                        if *offset < 0 || sz == 0 || *offset as i64 + sz > kk {
+                            inside = false;
                         }
                         match &elem {
-                            Some(t) if t != ty => same = false,
+                            Some(t) if t != ty => whole = false,
                             _ => elem = Some(ty.clone()),
                         }
                     }
                 }
             });
             let Some(ety) = elem else { continue };
-            if !same || reads != loads {
+            // (several members of one element per iteration: the source walked it through a
+            // pointer or reference of its own, which the walk spells better)
+            if reads != loads || !(whole || (inside && loads == 1)) {
                 continue;
             }
-            let ety = if matches!(strip_cv(&ety), Type::Unknown { .. }) { t_int(kk as u8, true) } else { ety };
-            let ebase = match base {
-                Expr::AddrOf(g) if matches!(&**g, Expr::Global { ty: Type::Unknown { .. }, .. }) => base.clone(),
-                Expr::Global { ty: Type::Unknown { .. }, .. } => Expr::AddrOf(Box::new(base.clone())),
-                _ => Expr::cast(t_ptr(ety.clone()), base.clone()),
-            };
+            let base = base.clone();
             let (Stmt::DoWhile { body: lb, .. } | Stmt::For { body: lb, .. }) = &mut b[k] else { unreachable!() };
             lb.remove(at);
-            Stmt::rewrite_exprs(lb, &mut |e| {
-                if let Expr::Load { base: lbase, offset: 0, .. } = &*e {
-                    if matches!(uncast(lbase), Expr::Var(y) if *y == p) {
-                        *e = Expr::Index { base: Box::new(ebase.clone()), index: Box::new(Expr::Var(i)), ty: ety.clone() };
+            if whole {
+                let ety = if matches!(strip_cv(&ety), Type::Unknown { .. }) { t_int(kk as u8, true) } else { ety };
+                let ebase = match &base {
+                    Expr::AddrOf(g) if matches!(&**g, Expr::Global { ty: Type::Unknown { .. }, .. }) => base.clone(),
+                    Expr::Global { ty: Type::Unknown { .. }, .. } => Expr::AddrOf(Box::new(base.clone())),
+                    _ => Expr::cast(t_ptr(ety.clone()), base.clone()),
+                };
+                Stmt::rewrite_exprs(lb, &mut |e| {
+                    if let Expr::Load { base: lbase, offset: 0, .. } = &*e {
+                        if matches!(uncast(lbase), Expr::Var(y) if *y == p) {
+                            *e = Expr::Index { base: Box::new(ebase.clone()), index: Box::new(Expr::Var(i)), ty: ety.clone() };
+                        }
                     }
-                }
-            });
+                });
+            } else {
+                // members: byte arithmetic from the object the walk starts in (`(u8*)P + i * K`
+                // at the start's offset), which the array recovery turns into `P->arr[i].f`
+                let (obj, c) = walk_origin(&base);
+                let u8p = t_ptr(t_int(1, false));
+                let at_i = Expr::bin(BinOp::Add, Expr::cast(u8p.clone(), obj), Expr::bin(BinOp::Mul, Expr::Var(i), Expr::int(kk), t_s32()), u8p);
+                Stmt::rewrite_exprs(lb, &mut |e| {
+                    if let Expr::Load { base: lbase, offset, ty } = &*e {
+                        if matches!(uncast(lbase), Expr::Var(y) if *y == p) {
+                            *e = Expr::Load { base: Box::new(at_i.clone()), offset: *offset + c, ty: ty.clone() };
+                        }
+                    }
+                });
+                members += 1;
+            }
             b.remove(pi);
             return;
         }
+    });
+    members
+}
+
+/// The object and byte offset a walk starts at: `&P->x` (raw), `(u8*)P + c`, else the start itself.
+fn walk_origin(base: &Expr) -> (Expr, i32) {
+    match base {
+        Expr::Cast { e, .. } => walk_origin(e),
+        Expr::AddrOf(x) => match &**x {
+            Expr::Load { base: p, offset, ty: Type::Unknown { size: 0 } } => ((**p).clone(), *offset),
+            _ => (base.clone(), 0),
+        },
+        Expr::Binary { op: BinOp::Add, l, r, .. } => match (r.as_int(), &**l) {
+            (Some(c), Expr::Cast { ty, e: p }) if matches!(pointee(ty), Some(t) if scalar_size(t) == Some(1)) => ((**p).clone(), c as i32),
+            _ => (base.clone(), 0),
+        },
+        _ => (base.clone(), 0),
+    }
+}
+
+/// Variant point [`crate::variants::LOOP_INVARIANT_READS`]: temps assigned just before a loop
+/// from memory reads the loop doesn't change (`n = v.size(); x = id.value; for (..; i < n; ..)
+/// if (a[i].id == x)`) and read once inside it are read there (`i < v.size()`, `a[i].id ==
+/// id`): the compiler hoisted them. Returns the reads moved.
+pub fn invariant_reads(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) -> usize {
+    let mut uses = std::collections::HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let mut defs: std::collections::HashMap<VarId, usize> = Default::default();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), .. } = s {
+                *defs.entry(*v).or_default() += 1;
+            }
+        }
+    });
+    let pure = |e: &Expr| {
+        let mut ok = !e.has_call();
+        // (globals stay: a read of one can't be shown loop-invariant like a member's)
+        e.walk(&mut |x| ok &= !matches!(x, Expr::IncDec { .. } | Expr::New { .. } | Expr::Global { .. }));
+        ok && { let mut m = false; e.walk(&mut |x| m |= matches!(x, Expr::Load { .. } | Expr::Member { .. })); m }
+    };
+    let mut asked = false;
+    let mut apply = false;
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut k = 0;
+        while k < b.len() {
+            if !matches!(&b[k], Stmt::For { .. }) {
+                k += 1;
+                continue;
+            }
+            let mut cands = vec![];
+            let mut j = k;
+            while j > 0 {
+                let Stmt::Assign { dst: Expr::Var(t), src } = &b[j - 1] else { break };
+                let t = *t;
+                let mut src_vars = vec![];
+                src.walk(&mut |x| {
+                    if let Expr::Var(v) = x {
+                        src_vars.push(*v);
+                    }
+                });
+                let ok = is_temp.get(t).copied().unwrap_or(false)
+                    && matches!(vars[t].kind, VarKind::Local)
+                    && defs.get(&t) == Some(&1)
+                    && uses.get(&t) == Some(&1)
+                    && crate::idioms::stmt_mentions(&b[k], t)
+                    && pure(src)
+                    && !src.uses_var(t)
+                    // nothing it reads changes between it and the loop or inside the loop
+                    && src_vars.iter().all(|&v| assigns_var(&b[j..k], v) == 0 && assigns_var(std::slice::from_ref(&b[k]), v) == 0);
+                if ok {
+                    cands.push(j - 1);
+                }
+                j -= 1;
+            }
+            if cands.is_empty() {
+                k += 1;
+                continue;
+            }
+            if !asked {
+                asked = true;
+                apply = crate::variants::alt(crate::variants::LOOP_INVARIANT_READS);
+            }
+            if !apply {
+                return;
+            }
+            // later temps first (indices stay valid)
+            cands.sort_unstable();
+            for &c in cands.iter().rev() {
+                let Stmt::Assign { dst: Expr::Var(t), src } = b[c].clone() else { unreachable!() };
+                b.remove(c);
+                k -= 1;
+                Stmt::rewrite_exprs(&mut b[k..k + 1], &mut |x| {
+                    if matches!(x, Expr::Var(y) if *y == t) {
+                        *x = src.clone();
+                    }
+                });
+                n += 1;
+            }
+            k += 1;
+        }
+    });
+    n
+}
+
+/// Undeclared word globals holding a pointer to rows of words (`FstStart`: a table of 12-byte
+/// entries read as `*(int*)((u8*)g + i * 12 + 4)`): the global becomes `u32 (*g)[K / 4]` and the
+/// reads `g[i][k]` (a byte-offset temp `t = i * 12` read only there goes). Every use of the global
+/// must be such a word read inside a row.
+pub fn pointer_global_rows(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) {
+    let declared = |s: &str| db.map_or(false, |d| d.globals.contains_key(s));
+    // single-definition locals defined as `i * K` (the shared byte offset)
+    let mut defs: std::collections::HashMap<VarId, (usize, Option<Expr>)> = Default::default();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+                let e = defs.entry(*v).or_insert((0, None));
+                e.0 += 1;
+                e.1 = Some(src.clone());
+            }
+        }
+    });
+    let scaled_of = |e: &Expr| -> Option<(Expr, i64)> {
+        match uncast(e) {
+            Expr::Var(v) if matches!(vars[*v].kind, VarKind::Local) => match defs.get(v) {
+                Some((1, Some(d))) => scaled(d),
+                _ => None,
+            },
+            x => scaled(x),
+        }
+    };
+    // (global, index, row size) of a row address `g + off` / `(u8*)g + off`
+    let row = |b: &Expr| -> Option<(String, Expr, i64)> {
+        let Expr::Binary { op: BinOp::Add, l, r, .. } = uncast(b) else { return None };
+        let Expr::Global { symbol, ty } = uncast(l) else { return None };
+        if declared(symbol) || scalar_size(ty) != Some(4) || is_ptr(ty) {
+            return None;
+        }
+        let (i, k) = scaled_of(r)?;
+        Some((symbol.clone(), i, k))
+    };
+    let mut rows: std::collections::HashMap<String, (i64, bool)> = Default::default();
+    let mut reads: std::collections::HashMap<String, usize> = Default::default();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Global { symbol, .. } = e {
+            *reads.entry(symbol.clone()).or_default() += 1;
+        }
+        if let Expr::Load { base, offset, ty } = e {
+            if let Some((g, _, k)) = row(base) {
+                let ok = k >= 8 && k % 4 == 0 && k <= 64 && *offset >= 0 && offset % 4 == 0 && (*offset as i64) + 4 <= k && scalar_size(ty) == Some(4) && !matches!(strip_cv(ty), Type::Float { .. });
+                let r = rows.entry(g).or_insert((k, true));
+                r.1 &= ok && r.0 == k;
+            }
+        }
+    });
+    // every mention of the global is the base of such a read
+    let mut counted: std::collections::HashMap<String, usize> = Default::default();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Load { base, .. } = e {
+            if let Some((g, _, _)) = row(base) {
+                *counted.entry(g).or_default() += 1;
+            }
+        }
+    });
+    let chosen: std::collections::HashMap<String, i64> = rows.into_iter().filter(|(g, (_, ok))| *ok && counted.get(g) == reads.get(g)).map(|(g, (k, _))| (g, k)).collect();
+    if chosen.is_empty() {
+        return;
+    }
+    let u32t = Type::Int { size: 4, signed: false };
+    let mut offset_temps = std::collections::HashSet::new();
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Load { base, offset, ty } = &*e else { return };
+        let Some((g, i, k)) = row(base) else { return };
+        if chosen.get(&g) != Some(&k) {
+            return;
+        }
+        if let Expr::Binary { r, .. } = uncast(base) {
+            if let Expr::Var(t) = uncast(r) {
+                offset_temps.insert(*t);
+            }
+        }
+        let rt = Type::Array(Box::new(u32t.clone()), (k / 4) as u32);
+        let gl = Expr::Global { symbol: g, ty: Type::Ptr(Box::new(rt.clone())) };
+        let r = Expr::Index { base: Box::new(gl), index: Box::new(i), ty: rt };
+        let ety = if matches!(strip_cv(ty), Type::Unknown { .. }) { u32t.clone() } else { ty.clone() };
+        *e = Expr::Index { base: Box::new(r), index: Box::new(Expr::int((*offset / 4) as i64)), ty: ety };
+    });
+    // byte-offset temps no longer read
+    let mut uses = std::collections::HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    Stmt::for_each_block_mut(body, &mut |b| {
+        b.retain(|s| match s {
+            Stmt::Assign { dst: Expr::Var(v), src } => !(offset_temps.contains(v) && uses.get(v).copied().unwrap_or(0) == 0 && !src.has_call()),
+            _ => true,
+        });
     });
 }

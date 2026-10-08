@@ -174,11 +174,13 @@ fn finish_standin(ir: &mut IrFunction, mut body: Vec<Stmt>, first: usize, fields
 
 /// A guessed struct return (`StructRet` pointing at an unknown type) takes the class of the
 /// object constructed into it.
-fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) {
-    let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return };
+/// True when the class is a guessed `rstl::optional_object<T>` (its returns are rewritten).
+fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
+    let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return false };
     if !matches!(pointee(&ir.vars[sret].ty), Some(Type::Unknown { .. })) {
-        return;
+        return false;
     }
+    let mut optional = false;
     let mut cls = None;
     Stmt::walk_exprs(&ir.body, &mut |e| {
         if let Expr::Call { callee: Callee::Method { sig: s, this, .. }, .. } = e {
@@ -222,6 +224,11 @@ fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) {
             });
         }
     }
+    // or an optional value of one of the function's template argument types
+    if let (None, Some(db)) = (&cls, db) {
+        cls = optional_object_return(ir, sret, db);
+        optional = cls.is_some();
+    }
     // or the one class of the context whose layout and constructor fit the stores (a variant:
     // nothing in the code names it)
     if let (None, Some(db)) = (&cls, db) {
@@ -264,10 +271,11 @@ fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) {
         ir.vars[sret].ty = t_ptr(Type::Named(c.clone()));
         ir.sig.ret = Type::Named(c);
     }
+    optional
 }
 
 pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
-    type_guessed_sret(ir, db);
+    let guessed_optional = type_guessed_sret(ir, db);
     let vars = ir.vars.clone();
     fold_new(&mut ir.body, &vars);
     let this = ir.this_var;
@@ -324,6 +332,10 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
     }
     if let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) {
         let rt = ir.sig.ret.clone();
+        let vars = ir.vars.clone();
+        if guessed_optional {
+            optional_object_returns(&mut ir.body, sret, &rt, &vars, db);
+        }
         fold_struct_return(&mut ir.body, sret, &rt, db);
     }
     let body = ir.body.clone();
@@ -1620,7 +1632,9 @@ fn forward_into(e: &mut Expr, v: VarId, src: &Expr, ref_src: &Expr, ok: &mut boo
             for (n, a) in args.iter_mut().enumerate() {
                 let is_ref = sig.as_ref().and_then(|s| s.params.get(n)).map_or(false, |p| matches!(strip_cv(&p.ty), Type::Ref(_)));
                 if is_ref && matches!(a, Expr::AddrOf(i) if is_v(i)) {
-                    *a = Expr::AddrOf(Box::new(ref_src.clone()));
+                    // (a temporary binds to a const reference only: a non-const one gets the object)
+                    let const_ref = sig.as_ref().and_then(|s| s.params.get(n)).is_some_and(|p| matches!(strip_cv(&p.ty), Type::Ref(x) if matches!(**x, Type::Const(_))));
+                    *a = Expr::AddrOf(Box::new(if const_ref { ref_src.clone() } else { src.clone() }));
                 } else {
                     forward_into(a, v, src, ref_src, ok);
                 }
@@ -1632,11 +1646,20 @@ fn forward_into(e: &mut Expr, v: VarId, src: &Expr, ref_src: &Expr, ok: &mut boo
             forward_into(base, v, src, ref_src, ok);
             forward_into(index, v, src, ref_src, ok);
         }
-        Expr::Binary { l, r, .. } => {
+        Expr::Binary { op, l, r, .. } => {
+            // a call must not land where it might not be evaluated (`a && f()`)
+            if matches!(op, BinOp::LogAnd | BinOp::LogOr) && src.has_call() && r.uses_var(v) {
+                *ok = false;
+                return;
+            }
             forward_into(l, v, src, ref_src, ok);
             forward_into(r, v, src, ref_src, ok);
         }
         Expr::Ternary { c, t, f, .. } => {
+            if src.has_call() && (t.uses_var(v) || f.uses_var(v)) {
+                *ok = false;
+                return;
+            }
             forward_into(c, v, src, ref_src, ok);
             forward_into(t, v, src, ref_src, ok);
             forward_into(f, v, src, ref_src, ok);
@@ -1742,12 +1765,16 @@ fn constructed_arg_temporaries(body: &mut Vec<Stmt>, vars: &[Var]) {
                     e.walk(&mut |x| {
                         if let Expr::Call { callee, args, .. } = x {
                             calls += 1;
-                            let params = match callee {
-                                Callee::Direct { sig, .. } | Callee::Method { sig, .. } => Some(&sig.params),
-                                _ => None,
+                            // (a member function called directly takes `this` as its first argument)
+                            let (params, skip) = match callee {
+                                Callee::Direct { sig, .. } => (Some(&sig.params), usize::from(sig.this_class.is_some() && !sig.is_static)),
+                                Callee::Method { sig, .. } => (Some(&sig.params), 0),
+                                _ => (None, 0),
                             };
+                            // a temporary binds only to a const reference (never to `T&`)
+                            let const_ref = |t: &Type| matches!(strip_cv(t), Type::Ref(x) if matches!(&**x, Type::Const(_)));
                             for (k, a) in args.iter().enumerate() {
-                                if on(a) == Some(v) && params.and_then(|p| p.get(k)).is_some_and(|p| matches!(&p.ty, Type::Ref(_))) {
+                                if on(a) == Some(v) && k >= skip && params.and_then(|p| p.get(k - skip)).is_some_and(|p| const_ref(&p.ty)) {
                                     hit = true;
                                 }
                             }
@@ -2020,7 +2047,7 @@ pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&Typ
                     // an object copied into the frame from another object, then passed by
                     // reference: the copy is the source's (`f(T(x))`), not `f(x)`
                     let sty = types::ty_of(&src, vars);
-                    let ref_src = if src.is_lvalue() && named(strip_cv(&sty)).is_some() && db.is_some() && types::is_aggregate(db, strip_cv(&sty)) {
+                    let ref_src = if src.is_lvalue() && named(strip_cv(&sty)).is_some() && db.is_some_and(|d| types::is_aggregate(Some(d), strip_cv(&sty)) && crate::frameobj::copyable(d, &sty)) {
                         Expr::Construct { class: strip_cv(&sty).clone(), ctor: None, args: vec![src.clone()] }
                     } else {
                         src.clone()
@@ -2334,3 +2361,208 @@ fn return_kept_values(body: &mut Vec<Stmt>, vars: &[Var]) {
         }
     });
 }
+
+/// Template arguments named in a function's own name and parameter types (`f<float, 20>(const
+/// rstl::reserved_vector<CVector2f, 20>&)`): `float`, `CVector2f`, ... (types only).
+fn template_arg_types(sig: &mwdec_core::FuncSig, db: &TypeDb) -> Vec<Type> {
+    fn args_of(s: &str, out: &mut Vec<String>) {
+        let mut depth = 0;
+        let mut cur = String::new();
+        for ch in s.chars() {
+            match ch {
+                '<' => {
+                    if depth > 0 {
+                        cur.push(ch);
+                    }
+                    depth += 1;
+                }
+                '>' => {
+                    depth -= 1;
+                    if depth > 0 {
+                        cur.push(ch);
+                    } else {
+                        out.push(std::mem::take(&mut cur).trim().to_string());
+                    }
+                }
+                ',' if depth == 1 => out.push(std::mem::take(&mut cur).trim().to_string()),
+                _ if depth > 0 => cur.push(ch),
+                _ => {}
+            }
+        }
+    }
+    let mut names = vec![];
+    args_of(&sig.qualified_name, &mut names);
+    for p in &sig.params {
+        let mut t = strip_cv(&p.ty);
+        while let Type::Ref(x) | Type::Ptr(x) = t {
+            t = strip_cv(x);
+        }
+        if let Some(n) = named(t) {
+            args_of(n, &mut names);
+        }
+    }
+    let mut out: Vec<Type> = vec![];
+    for n in names {
+        let t = match n.as_str() {
+            "float" => Type::Float { size: 4 },
+            "double" => Type::Float { size: 8 },
+            "int" => Type::Int { size: 4, signed: true },
+            "unsigned int" => Type::Int { size: 4, signed: false },
+            _ if crate::sig::find_class(db, &n).is_some() => Type::Named(n),
+            _ => continue,
+        };
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// An unnamed struct return holding a `T` at 0 and a flag byte right after it, `T` one of the
+/// function's template argument types: `rstl::optional_object<T>` (declared by the context).
+fn optional_object_return(ir: &IrFunction, sret: VarId, db: &TypeDb) -> Option<String> {
+    if !db.classes.keys().any(|k| k.starts_with("rstl::optional_object")) {
+        return None;
+    }
+    let mut stores: Vec<(i32, Option<u32>, Expr)> = vec![];
+    each_stmt(&ir.body, &mut |s| {
+        if let Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } = s {
+            if matches!(&**base, Expr::Var(v) if *v == sret) {
+                stores.push((*offset, scalar_size(ty), src.clone()));
+            }
+        }
+    });
+    let flags: Vec<i32> = stores.iter().filter(|(_, w, e)| *w == Some(1) && matches!(e.as_int(), Some(0 | 1))).map(|(o, _, _)| *o).collect();
+    let b = *flags.first()?;
+    if flags.iter().any(|&o| o != b) || !stores.iter().any(|(o, _, e)| *o == b && e.as_int() == Some(0)) {
+        return None;
+    }
+    // the value's stores lie before the flag
+    if stores.iter().any(|(o, w, _)| *o != b && (*o < 0 || *o as i64 + w.unwrap_or(4) as i64 > b as i64)) {
+        return None;
+    }
+    let t = template_arg_types(&ir.sig, db).into_iter().find(|t| types::size_of(Some(db), t) == Some(b as u32))?;
+    let tn = match &t {
+        Type::Named(n) => n.clone(),
+        Type::Float { size: 4 } => "float".into(),
+        Type::Float { size: 8 } => "double".into(),
+        Type::Int { signed: true, .. } => "int".into(),
+        _ => "unsigned int".into(),
+    };
+    Some(format!("rstl::optional_object<{tn}>"))
+}
+
+/// Returns of an `rstl::optional_object<T>` filled in place: the flag cleared alone is `return
+/// rstl::optional_object_null();`, the flag set with the value's members is `return value;`
+/// (members read from one object: that object).
+fn optional_object_returns(body: &mut Vec<Stmt>, sret: VarId, ret: &Type, vars: &[Var], db: Option<&TypeDb>) {
+    let Some(n) = named(ret) else { return };
+    let Some(inner) = n.strip_prefix("rstl::optional_object<").and_then(|s| s.strip_suffix('>')) else { return };
+    let t = match inner {
+        "float" => Type::Float { size: 4 },
+        "double" => Type::Float { size: 8 },
+        "int" => Type::Int { size: 4, signed: true },
+        "unsigned int" => Type::Int { size: 4, signed: false },
+        c => Type::Named(c.to_string()),
+    };
+    let Some(b) = types::size_of(db, &t).map(|s| s as i32) else { return };
+    if !matches!(body.last(), Some(Stmt::Return(_))) {
+        body.push(Stmt::Return(None));
+    }
+    Stmt::for_each_block_mut(body, &mut |bl| distribute_sret_return(bl, sret));
+    let mut defs: std::collections::HashMap<VarId, (usize, Expr)> = Default::default();
+    {
+        let mut snap = body.clone();
+        Stmt::for_each_block_mut(&mut snap, &mut |bl| {
+            for s in bl.iter() {
+                if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+                    let e = defs.entry(*v).or_insert((0, src.clone()));
+                    e.0 += 1;
+                }
+            }
+        });
+    }
+    let mut uses = std::collections::HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let null = Expr::Construct { class: Type::Named("rstl::optional_object_null".into()), ctor: None, args: vec![] };
+    Stmt::for_each_block_mut(body, &mut |bl| {
+        let Some(rp) = bl.iter().position(|s| matches!(s, Stmt::Return(None))) else { return };
+        // the stores into the slot before the return (other statements stay)
+        let mut flag = None;
+        let mut vals: Vec<(i32, Expr)> = vec![];
+        let mut drop: Vec<usize> = vec![];
+        for k in 0..rp {
+            if let Stmt::Assign { dst: Expr::Load { base, offset, .. }, src } = &bl[k] {
+                if matches!(&**base, Expr::Var(v) if *v == sret) {
+                    if *offset == b {
+                        let mut f = src;
+                        while let Expr::Cast { e, .. } = f {
+                            f = e;
+                        }
+                        flag = f.as_int();
+                    } else {
+                        vals.push((*offset, src.clone()));
+                    }
+                    drop.push(k);
+                }
+            }
+        }
+        let value = match flag {
+            Some(0) if vals.is_empty() => null.clone(),
+            Some(1) if !vals.is_empty() => {
+                // temps read once, by these stores
+                let mut temps = vec![];
+                for (_, e) in vals.iter_mut() {
+                    if let Expr::Var(tv) = e {
+                        if let Some((1, d)) = defs.get(tv) {
+                            if uses.get(tv) == Some(&1) && matches!(d, Expr::Load { .. } | Expr::Member { .. }) {
+                                temps.push(*tv);
+                                *e = d.clone();
+                            }
+                        }
+                    }
+                }
+                vals.sort_by_key(|(o, _)| *o);
+                let v = if vals.len() == 1 && vals[0].0 == 0 {
+                    vals[0].1.clone()
+                } else {
+                    // members of one object, in order from its start
+                    let parts: Option<Vec<(Expr, i32)>> = vals.iter().map(|(o, e)| match e {
+                        Expr::Load { base, offset, .. } => Some(((**base).clone(), offset - o)),
+                        _ => None,
+                    }).collect();
+                    let Some(parts) = parts else { return };
+                    let (pb, po) = parts[0].clone();
+                    if parts.iter().any(|(x, o)| *x != pb || *o != po) || vals[0].0 != 0 {
+                        return;
+                    }
+                    Expr::Load { base: Box::new(pb), offset: po, ty: t.clone() }
+                };
+                for (k, s) in bl.iter().enumerate().take(rp) {
+                    if let Stmt::Assign { dst: Expr::Var(tv), .. } = s {
+                        if temps.contains(tv) {
+                            drop.push(k);
+                        }
+                    }
+                }
+                v
+            }
+            _ => return,
+        };
+        bl[rp] = Stmt::Return(Some(value));
+        drop.sort_unstable();
+        drop.dedup();
+        for k in drop.into_iter().rev() {
+            bl.remove(k);
+        }
+    });
+    // (no fall-off return after arms that both return)
+    let ret_some = |b: &Vec<Stmt>| matches!(b.last(), Some(Stmt::Return(Some(_))));
+    if let [.., Stmt::If { then, els, .. }, Stmt::Return(None)] = body.as_slice() {
+        if ret_some(then) && ret_some(els) {
+            body.pop();
+        }
+    }
+    let _ = vars;
+}
+
