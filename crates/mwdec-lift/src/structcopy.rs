@@ -53,6 +53,18 @@ pub fn apply(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> usize {
         *body = b;
         n += k;
     }
+    // word-copy runs: 64-bit copies or one block copy (variants)
+    for (point, ll) in [(variants::STRUCTCOPY_WORDS_LL, true), (variants::STRUCTCOPY_WORDS_BLOCK, false)] {
+        let mut b = body.clone();
+        let uses = var_uses(&b);
+        let mut k = 0;
+        Stmt::for_each_block_mut(&mut b, &mut |l| k += word_runs(l, &uses, ll));
+        if k > 0 && variants::alt(point) {
+            *body = b;
+            n += k;
+            break;
+        }
+    }
     let mut b = body.clone();
     let mut k = 0;
     Stmt::for_each_block_mut(&mut b, &mut |l| k += setters(l, vars, db));
@@ -363,6 +375,113 @@ fn returned_whole_in(body: &mut Vec<Stmt>, rv: VarId, vars: &[Var]) -> bool {
     }
     *body = vec![Stmt::Return(Some(Expr::Load { base: Box::new(base), offset: dist, ty: class }))];
     true
+}
+
+// ------------------------------------------------------------------ word runs
+
+/// Uses of each variable anywhere in `body` (reads and writes).
+fn var_uses(body: &[Stmt]) -> std::collections::HashMap<VarId, usize> {
+    let mut m = std::collections::HashMap::new();
+    let mut b = body.to_vec();
+    for s in b.iter_mut() {
+        stmt_exprs(s, &mut |e| {
+            e.walk(&mut |x| {
+                if let Expr::Var(v) = x {
+                    *m.entry(*v).or_insert(0) += 1;
+                }
+            })
+        });
+    }
+    m
+}
+
+fn word_access(e: &Expr) -> Option<(&Expr, i32)> {
+    match e {
+        Expr::Load { base, offset, ty } if scalar_size(ty) == Some(4) && !is_float(ty) && !matches!(strip_cv(ty), Type::Named(_)) => Some((base, *offset)),
+        _ => None,
+    }
+}
+
+/// Runs of word copies `*(int*)(D + d + 4k) = *(int*)(S + s + 4k)` (a value read directly, or
+/// through a single-use temporary defined just before), covering consecutive words: become
+/// 64-bit copies per word pair (`ll`) or one block copy through `mwdec_words_<N>`.
+fn word_runs(b: &mut Vec<Stmt>, uses: &std::collections::HashMap<VarId, usize>, ll: bool) -> usize {
+    // one copy at statement k: (dst base, dst off, src base, src off, temp def index)
+    let copy_at = |b: &[Stmt], k: usize| -> Option<(Expr, i32, Expr, i32, Option<usize>)> {
+        let Stmt::Assign { dst, src } = &b[k] else { return None };
+        let (db_, doff) = word_access(dst)?;
+        if let Some((sb, so)) = word_access(src) {
+            return Some((db_.clone(), doff, sb.clone(), so, None));
+        }
+        let Expr::Var(t) = src else { return None };
+        if uses.get(t).copied() != Some(2) {
+            return None;
+        }
+        // (the temporary is loaded up to a few statements earlier: `t = s[0]; d[1] = s[1]; d[0] = t;`)
+        let j = (k.saturating_sub(4)..k).rev().find(|&j| matches!(&b[j], Stmt::Assign { dst: Expr::Var(td), .. } if td == t))?;
+        let Stmt::Assign { src: ld, .. } = &b[j] else { return None };
+        let (sb, so) = word_access(ld)?;
+        Some((db_.clone(), doff, sb.clone(), so, Some(j)))
+    };
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let Some(first) = copy_at(b, i) else {
+            i += 1;
+            continue;
+        };
+        let (dbase, sbase, delta) = (first.0.clone(), first.2.clone(), first.3 - first.1);
+        if mentions_any(&sbase, &dbase) {
+            i += 1;
+            continue;
+        }
+        let mut run: Vec<(usize, i32, Option<usize>)> = vec![(i, first.1, first.4)];
+        let mut j = i + 1;
+        while j < b.len() {
+            let k = if copy_at(b, j).is_none() && j + 1 < b.len() { j + 1 } else { j };
+            match copy_at(b, k) {
+                Some((d2, o2, s2, so2, td)) if d2 == dbase && s2 == sbase && so2 - o2 == delta && (k == j || td == Some(j)) => {
+                    run.push((k, o2, td));
+                    j = k + 1;
+                }
+                _ => break,
+            }
+        }
+        let mut offs: Vec<i32> = run.iter().map(|r| r.1).collect();
+        offs.sort();
+        let contiguous = offs.windows(2).all(|w| w[1] == w[0] + 4) && offs.len() >= 2 && (!ll || offs.len() % 2 == 0);
+        // the statements of the run hold only its copies and their temporaries
+        let first_stmt = run.iter().map(|(k, _, td)| td.unwrap_or(*k)).min().unwrap();
+        let members = (first_stmt..j).all(|k| run.iter().any(|(r, _, td)| *r == k || *td == Some(k)));
+        if !contiguous || !members || offs[0] + delta < 0 {
+            i = j.max(i + 1);
+            continue;
+        }
+        let lo = offs[0];
+        let copies: Vec<Stmt> = if ll {
+            let t = Type::Int { size: 8, signed: true };
+            offs.chunks(2)
+                .map(|c| Stmt::Assign {
+                    dst: Expr::Load { base: Box::new(dbase.clone()), offset: c[0], ty: t.clone() },
+                    src: Expr::Load { base: Box::new(sbase.clone()), offset: c[0] + delta, ty: t.clone() },
+                })
+                .collect()
+        } else {
+            let t = crate::helpers::words(4 * offs.len() as u32);
+            vec![Stmt::Assign { dst: Expr::Load { base: Box::new(dbase.clone()), offset: lo, ty: t.clone() }, src: Expr::Load { base: Box::new(sbase.clone()), offset: lo + delta, ty: t } }]
+        };
+        let len = copies.len();
+        b.splice(first_stmt..j, copies);
+        n += 1;
+        i = first_stmt + len;
+    }
+    n
+}
+
+fn mentions_any(a: &Expr, b: &Expr) -> bool {
+    let mut f = false;
+    a.walk(&mut |x| f |= x == b);
+    f
 }
 
 // ------------------------------------------------------------------ member runs

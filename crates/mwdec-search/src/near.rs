@@ -307,3 +307,222 @@ pub fn op_ctor_copy(m: &mut M) -> Option<Vec<Edit>> {
     let (n, text) = m.pick_one(&cands)?;
     Some(vec![Edit::replace(c, n, text)])
 }
+
+/// `return T(x);` with `T` the function's return type -> `return x;` (the converting constructor
+/// called implicitly), and back. The two forms build the returned object in a different order
+/// against the epilogue (the explicit temporary is a separate object until it is copied).
+pub fn op_return_implicit(m: &mut M) -> Option<Vec<Edit>> {
+    let c = m.cst;
+    let ret = m.info.ret_ty.split_whitespace().collect::<String>();
+    if ret.is_empty() || ret == "void" || ret.ends_with('&') || ret.ends_with('*') {
+        return None;
+    }
+    let mut cands: Vec<(usize, String)> = Vec::new();
+    for n in m.nodes.clone() {
+        if c.kind(n) != "return_statement" {
+            continue;
+        }
+        let Some(&e) = c.named(n).first() else { continue };
+        let explicit = c.kind(e) == "call_expression" && c.child(e, "function").is_some_and(|f| c.text(f).split_whitespace().collect::<String>() == ret);
+        if explicit {
+            let Some(args) = c.child(e, "arguments") else { continue };
+            let a: Vec<usize> = c.named(args).into_iter().filter(|&x| c.kind(x) != "comment").collect();
+            if a.len() == 1 {
+                cands.push((e, c.text(a[0]).to_string()));
+            }
+        } else if !matches!(c.kind(e), "number_literal" | "true" | "false" | "null" | "nullptr") {
+            cands.push((e, format!("{}({})", m.info.ret_ty.trim(), c.text(e))));
+        }
+    }
+    let (e, text) = m.pick_one(&cands)?;
+    Some(vec![Edit::replace(c, e, text)])
+}
+
+/// Call the `const` overload of a member function: `E->M(a)` -> `((const __typeof__(*E)*)(E))->M(a)`
+/// (`E.M(a)` -> `((const __typeof__(E)&)(E)).M(a)`); a result whose address is taken is cast
+/// back to the non-const pointer type (`(__typeof__(&E->M(a)))&...`). For targets that call
+/// `M() const` where the draft resolves the non-const overload (a relocation to `M__1CFv` instead
+/// of `M__1CCFv`).
+pub fn op_const_call(m: &mut M) -> Option<Vec<Edit>> {
+    let c = m.cst;
+    let mut cands: Vec<(usize, String)> = Vec::new();
+    for n in m.nodes.clone() {
+        if c.kind(n) != "call_expression" {
+            continue;
+        }
+        let Some(f) = c.child(n, "function") else { continue };
+        if c.kind(f) != "field_expression" {
+            continue;
+        }
+        let (Some(obj), Some(field)) = (c.child(f, "argument"), c.child(f, "field")) else { continue };
+        let Some(args) = c.child(n, "arguments") else { continue };
+        let o = c.text(obj);
+        if o.contains("__typeof__") {
+            continue;
+        }
+        let arrow = c.text(f)[c.nodes[obj].end - c.nodes[f].start..].trim_start().starts_with("->");
+        let new_call = if arrow {
+            format!("((const __typeof__(*{o})*)({o}))->{}{}", c.text(field), c.text(args))
+        } else {
+            format!("((const __typeof__({o})&)({o})).{}{}", c.text(field), c.text(args))
+        };
+        // `&call`: back to the non-const pointer type
+        match c.parent(n).filter(|&p| c.kind(p) == "pointer_expression" && c.text(p).trim_start().starts_with('&')) {
+            Some(p) => cands.push((p, format!("(__typeof__({}))&{new_call}", c.text(p)))),
+            None => cands.push((n, new_call)),
+        }
+    }
+    let (n, text) = m.pick_one(&cands)?;
+    Some(vec![Edit::replace(c, n, text)])
+}
+
+/// A comparison used as a number (`(a == b) + 1`, `x = a < b;`) <-> a select of the constants
+/// (`(a == b ? 1 : 0) + 1`): the compiler extracts the comparison bit with a byte (bool) width
+/// for the first and an int width for the second.
+pub fn op_cmp_select(m: &mut M) -> Option<Vec<Edit>> {
+    let c = m.cst;
+    let mut cands: Vec<(usize, String)> = Vec::new();
+    for n in m.nodes.clone() {
+        match c.kind(n) {
+            "binary_expression" if matches!(c.op(n), Some("==" | "!=" | "<" | ">" | "<=" | ">=")) => {
+                // used as a value: an arithmetic operand, an initializer / assignment source, or returned
+                let Some(p) = c.parent(n).map(|p| {
+                    let mut p = p;
+                    while c.kind(p) == "parenthesized_expression" {
+                        match c.parent(p) {
+                            Some(q) => p = q,
+                            None => break,
+                        }
+                    }
+                    p
+                }) else { continue };
+                let value_use = match c.kind(p) {
+                    "binary_expression" => matches!(c.op(p), Some("+" | "-" | "*" | "&" | "|" | "^" | "<<" | ">>")),
+                    "init_declarator" | "assignment_expression" | "return_statement" | "cast_expression" => true,
+                    _ => false,
+                };
+                if value_use {
+                    cands.push((n, format!("({} ? 1 : 0)", c.text(n))));
+                }
+            }
+            "conditional_expression" => {
+                let (Some(cond), Some(t), Some(f)) = (c.child(n, "condition"), c.child(n, "consequence"), c.child(n, "alternative")) else { continue };
+                match (c.text(t).trim(), c.text(f).trim()) {
+                    ("1", "0") => cands.push((n, format!("({})", c.text(cond)))),
+                    ("0", "1") => cands.push((n, format!("!({})", c.text(cond)))),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let (n, t) = m.pick_one(&cands)?;
+    Some(vec![Edit::replace(c, n, t)])
+}
+
+/// The value of a flag-if chain folded back into one logical expression:
+/// `T v = false; if (A) { t = E; if (B) { v = true; } } return !v;` -> `return !(A && B[t := E]);`
+/// (also `return v;`, and a direct `if (A && B)`). Inline expansions of `&&` in value context
+/// come out of the lifter as such chains.
+pub fn op_flag_and(m: &mut M) -> Option<Vec<Edit>> {
+    let c = m.cst;
+    let mut cands: Vec<(usize, usize, String)> = Vec::new(); // (first stmt, last stmt, replacement)
+    for b in m.nodes.clone() {
+        if c.kind(b) != "compound_statement" {
+            continue;
+        }
+        let l = stmts(c, b);
+        for i in 0..l.len().saturating_sub(2) {
+            // `T v = false;` / `T v = 0;`
+            let d = l[i];
+            if c.kind(d) != "declaration" {
+                continue;
+            }
+            let Some(decl) = c.child(d, "declarator").filter(|&x| c.kind(x) == "init_declarator") else { continue };
+            let (Some(name), Some(val)) = (c.child(decl, "declarator"), c.child(decl, "value")) else { continue };
+            let v = c.text(name).trim().to_string();
+            if !matches!(c.text(val).trim(), "false" | "0") {
+                continue;
+            }
+            // `if (A) { [t = E;]* if (B) { v = true; } }`
+            let outer = l[i + 1];
+            if c.kind(outer) != "if_statement" || c.child(outer, "alternative").is_some() {
+                continue;
+            }
+            let (Some(ca), Some(body)) = (c.child(outer, "condition"), c.child(outer, "consequence")) else { continue };
+            let inner_list = if c.kind(body) == "compound_statement" { stmts(c, body) } else { vec![body] };
+            let Some((&inner, defs)) = inner_list.split_last() else { continue };
+            let set_true = |s: usize| {
+                let s = single(c, s);
+                s.is_some_and(|s| c.kind(s) == "expression_statement" && {
+                    let t = c.text(s).split_whitespace().collect::<String>();
+                    t == format!("{v}=true;") || t == format!("{v}=1;")
+                })
+            };
+            let (cond, ok) = if c.kind(inner) == "if_statement" && c.child(inner, "alternative").is_none() {
+                let (Some(cb), Some(ib)) = (c.child(inner, "condition"), c.child(inner, "consequence")) else { continue };
+                // inline the temporaries defined before the inner if into its condition
+                let mut cb_text = strip_parens(c.text(cb)).to_string();
+                let mut ok = set_true(ib);
+                for &s in defs.iter().rev() {
+                    let t = c.text(s).trim().trim_end_matches(';').to_string();
+                    let Some((lhs, rhs)) = t.split_once('=') else {
+                        ok = false;
+                        break;
+                    };
+                    // (`T t = E` declares it here)
+                    let lhs = lhs.trim().rsplit([' ', '*', '&']).next().unwrap_or("");
+                    if lhs.is_empty() || !lhs.chars().all(|ch| ch.is_alphanumeric() || ch == '_') || rhs.starts_with('=') {
+                        ok = false;
+                        break;
+                    }
+                    cb_text = replace_ident(&cb_text, lhs, &format!("({})", rhs.trim()));
+                }
+                (format!("({}) && ({cb_text})", strip_parens(c.text(ca))), ok)
+            } else {
+                (strip_parens(c.text(ca)).to_string(), defs.is_empty() && set_true(inner))
+            };
+            if !ok {
+                continue;
+            }
+            // `return v;` / `return !v;` right after
+            let ret = l[i + 2];
+            if c.kind(ret) != "return_statement" {
+                continue;
+            }
+            let rt = c.text(ret).split_whitespace().collect::<String>();
+            let text = if rt == format!("return{v};") {
+                format!("return {cond};")
+            } else if rt == format!("return!{v};") || rt == format!("return!({v});") {
+                format!("return !({cond});")
+            } else {
+                continue;
+            };
+            // `v` used nowhere else
+            if l.iter().enumerate().any(|(k, &s)| (k < i || k > i + 2) && !crate::ops::uses_of(c, s, &v).is_empty()) {
+                continue;
+            }
+            cands.push((d, ret, text));
+        }
+    }
+    let (a, b, t) = m.pick_one(&cands)?;
+    Some(vec![Edit { start: c.nodes[a].start, end: c.nodes[b].end, text: t }])
+}
+
+/// `s` with identifier `name` replaced by `with` (whole words only).
+fn replace_ident(s: &str, name: &str, with: &str) -> String {
+    let mut out = String::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    let is_id = |ch: u8| ch.is_ascii_alphanumeric() || ch == b'_';
+    while i < s.len() {
+        if s[i..].starts_with(name) && (i == 0 || !is_id(b[i - 1])) && b.get(i + name.len()).is_none_or(|&ch| !is_id(ch)) {
+            out.push_str(with);
+            i += name.len();
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}

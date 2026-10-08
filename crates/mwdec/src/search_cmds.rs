@@ -201,7 +201,7 @@ pub fn unit_inputs(p: &Project, u: &Unit, cc: &Compilers, module_objs: &[Arc<Obj
     if u.cflags.is_empty() {
         bail!("unit {} has no compiler flags", u.name);
     }
-    let context = harness::context_tu(p, u)?;
+    let context = crate::ctxext::extended_context(p, u, &harness::context_tu(p, u)?);
     unit_inputs_with_context(p, u, cc, module_objs, with_db, context, lit_ext)
 }
 
@@ -230,6 +230,17 @@ pub fn unit_inputs_with_context(p: &Project, u: &Unit, cc: &Compilers, module_ob
                 }
                 let vt = mwdec_ctx::vtables_from_object(&target, &db);
                 mwdec_ctx::apply_vtables(&mut db, &vt);
+                for sym in target.functions.iter().map(|f| f.name.as_str()).chain(target.functions.iter().flat_map(|f| f.relocs.iter().map(|r| r.target.as_str()))) {
+                    if sym.starts_with("__dt__") {
+                        if let Some(c) = mwdec_lift::sig::sig_of(sym, None).this_class {
+                            db.object_dtors.insert(c);
+                        }
+                    }
+                }
+                if std::env::var_os("MWDEC_NO_DECLARED_VTABLES").is_none() {
+                    mwdec_ctx::vtable::declared_vtables(&mut db);
+                    mwdec_ctx::resolve::fill_methods(&mut db);
+                }
                 if !c_mode && std::env::var("MWDEC_NO_INLINE").is_err() {
                     // (the probe driver caches its compiles on disk across runs)
                     mwdec_inline::complete::complete_in(&mut db, &context, &u.cflags, &cc.probe_driver(p, &u.name), &ctx, &plain);
@@ -312,6 +323,30 @@ pub fn choose_draft(ui: &UnitInputs, f: &Function, scorer: &Scorer, with_inlines
 /// that is not exact: the best variant, repaired too, replaces it only if strictly better (so a
 /// variant never costs a match the default pipeline finds).
 pub fn repair_or_variant(scorer: &Scorer, chosen: String, variants: Vec<String>, tracer: Option<&mwdec_search::trace::Tracer>) -> String {
+    let best = repair_or_variant_only(scorer, chosen, variants, tracer);
+    near_miss_pass(scorer, best, tracer)
+}
+
+/// Compiles the draft-time near-miss pass may spend.
+pub const NEAR_MISS_COMPILES: usize = 40;
+
+/// A small function whose best draft is a near miss (score >= 95) gets a bounded systematic
+/// neighbourhood pass (`mwdec_search::search::quick_pass`, at most [`NEAR_MISS_COMPILES`]
+/// compiles); an exact neighbour replaces it. `MWDEC_NO_NEAR_PASS` turns it off.
+pub fn near_miss_pass(scorer: &Scorer, src: String, tracer: Option<&mwdec_search::trace::Tracer>) -> String {
+    if std::env::var_os("MWDEC_NO_NEAR_PASS").is_some() || scorer.tf.code.len() > 128 {
+        return src;
+    }
+    let (e, _) = scorer.eval(&src);
+    let Some(f) = e.fitness().cloned() else { return src };
+    if f.exact || f.score < 95.0 {
+        return src;
+    }
+    scorer.mwcc.enable_fast(4);
+    mwdec_search::search::quick_pass_with(scorer, &src, &f, NEAR_MISS_COMPILES, tracer).unwrap_or(src)
+}
+
+fn repair_or_variant_only(scorer: &Scorer, chosen: String, variants: Vec<String>, tracer: Option<&mwdec_search::trace::Tracer>) -> String {
     let base = repair_registers(scorer, chosen, tracer);
     if variants.is_empty() {
         return base;
@@ -321,13 +356,35 @@ pub fn repair_or_variant(scorer: &Scorer, chosen: String, variants: Vec<String>,
     if bf.as_ref().is_some_and(|f| f.exact) {
         return base;
     }
+    // (the best-scoring variant whose diff is register/order-only gets repaired too: its penalty
+    // may rank it below another variant that no register edit can fix)
+    let reg_only = variants
+        .iter()
+        .filter_map(|c| fit(c).filter(mwdec_search::regfix::register_only).map(|f| (c.clone(), f.score)))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|x| x.0);
     let Some(v) = choose_among(scorer, variants) else { return base };
-    let v = repair_registers(scorer, v, tracer);
-    match (fit(&v), bf) {
-        (Some(x), Some(y)) if x.better_than(&y) => v,
-        (Some(_), None) => v,
-        _ => base,
+    let mut best = base;
+    let mut best_fit = bf;
+    let mut tried = vec![];
+    for c in std::iter::once(v).chain(reg_only) {
+        if tried.contains(&c) {
+            continue;
+        }
+        tried.push(c.clone());
+        let r = repair_registers(scorer, c, tracer);
+        let rf = fit(&r);
+        let better = match (&rf, &best_fit) {
+            (Some(x), Some(y)) => x.better_than(y),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if better {
+            best = r;
+            best_fit = rf;
+        }
     }
+    best
 }
 
 /// Kind of a function the compiler emits without a definition in the unit (`hdr-inline` or an
@@ -482,6 +539,12 @@ pub fn choose_between(scorer: &Scorer, with_inlines: String, plain: Option<Strin
     let Some(plain) = plain.filter(|p| *p != with_inlines) else { return with_inlines };
     let (a, _) = scorer.eval(&with_inlines);
     let (b, _) = scorer.eval(&plain);
+    if std::env::var_os("MWDEC_SHOW_VARIANTS").is_some() {
+        eprintln!("--- with inlines ({:?}):
+{with_inlines}
+--- plain ({:?}):
+{plain}", a.fitness().map(|f| f.score), b.fitness().map(|f| f.score));
+    }
     match (a.fitness(), b.fitness()) {
         (Some(x), Some(y)) if y.better_than(x) => plain,
         (None, Some(_)) => plain,
@@ -553,8 +616,23 @@ pub fn variant_drafts(ui: &UnitInputs, f: &Function, include_implicit: bool) -> 
             }
         }
     }
+    // text variants: source rewrites of the search that settle an ambiguity of the draft's
+    // form (a flag-if chain or `&&`, a comparison used as a number or a select of 0/1)
+    for (name, k) in TEXT_VARIANT_OPS {
+        let Some(op) = mwdec_search::ops::op_index(name) else { continue };
+        let mut w = vec![0.0; mwdec_search::ops::OPS.len()];
+        w[op] = 1.0;
+        for n in mwdec_search::ops::neighbours(&base, &f.name, &w, None, None, 8, 1, *k) {
+            if n.src != base && !out.contains(&n.src) {
+                out.push(n.src);
+            }
+        }
+    }
     out
 }
+
+/// Search operators whose rewrites are also draft variants (operator, at most this many sites).
+pub const TEXT_VARIANT_OPS: &[(&str, usize)] = &[("flag_and", 2), ("cmp_select", 2)];
 
 /// One draft with the given variant points flipped; also returns the points it asked.
 fn draft_flipped(
@@ -940,7 +1018,7 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
     let workers = a.workers.unwrap_or(6usize.div_ceil(jobs)).max(1);
     // Drafts alone compile each unit context once or twice per function: starting persistent
     // compilers costs more than it saves there (measured), so the fast path is for searches.
-    let cc = Compilers::new(root, work, 6).with_fast_workers(if a.budget_secs == 0 { 0 } else { 4 });
+    let cc = Compilers::new(root, work, 6).with_fast_workers(if a.budget_secs == 0 { 0 } else { mwdec_mwcc::fast_workers_from_env(4) });
     let out_path = a.out.clone().unwrap_or_else(|| {
         eval_dir().join(format!("eval_{}_s{}_b{}_{}.jsonl", a.split, a.seed, a.budget_secs, std::process::id()))
     });

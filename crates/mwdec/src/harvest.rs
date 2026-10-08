@@ -246,7 +246,7 @@ struct UnitSlot {
 
 fn unit_context(p: &Project, u: &Unit, idx: &autoctx::HeaderIndex) -> Result<(Unit, String)> {
     if u.source.is_some() && !u.cflags.is_empty() {
-        return Ok((u.clone(), harness::context_tu(p, u)?));
+        return Ok((u.clone(), crate::ctxext::extended_context(p, u, &harness::context_tu(p, u)?)));
     }
     autoctx::auto_unit(p, u, idx)
 }

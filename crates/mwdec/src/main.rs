@@ -12,7 +12,9 @@ use std::time::Instant;
 
 mod draft_server;
 mod autoctx;
+mod ctxext;
 mod harvest;
+mod inline_why;
 mod search_cmds;
 mod placeholders;
 
@@ -255,6 +257,17 @@ enum Cmd {
         #[arg(long)]
         drafts_only: bool,
     },
+    /// Inline-fold diagnostics: header inline templates that nearly match what a function's
+    /// draft leaves unfolded, and why (one function, or a --list with a ranked summary).
+    InlineWhy {
+        unit: Option<String>,
+        symbol: Option<String>,
+        #[arg(long)]
+        list: Option<PathBuf>,
+        /// Per-function rows (JSONL) for --list.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Internal: first drafts for `eval`, one JSON request/reply per line (stdin/stdout).
     #[command(hide = true)]
     DraftServer {
@@ -293,6 +306,7 @@ fn real_main() -> Result<()> {
             &cli.work.clone().unwrap_or_else(|| search_cmds::search_work()),
             search_cmds::MatchArgs { unit, symbol, budget_secs, init, max_compiles, workers, seed, no_db, verbose, out, no_locate, disable_ops },
         ),
+        Cmd::InlineWhy { unit, symbol, list, out } => inline_why::cmd_inline_why(&root, &work, unit, symbol, list, out),
         Cmd::DraftServer { no_db } => draft_server::serve(&root, &cli.work.clone().unwrap_or_else(search_cmds::search_work), no_db),
         Cmd::Harvest { max_size, min_size, budget_secs, max_compiles, jobs, workers, unit, symbol, out_dir, limit, tag, scope, report, no_supervise, seed, list, summary, min_best } => {
             let out_dir = out_dir.unwrap_or_else(|| harvest::harvest_dir());
@@ -394,7 +408,7 @@ fn cmd_check(
         m = Mwcc::new(root, &work.join(compiler.replace(['/', '.'], "_")), 6);
         m.compiler = compiler;
     }
-    let context = if no_context { String::new() } else { harness::context_tu(&p, u)? };
+    let context = if no_context { String::new() } else { ctxext::extended_context(&p, u, &harness::context_tu(&p, u)?) };
     let t = Instant::now();
     let plain = m.plain_context(&context, &u.cflags).named(&u.name);
     let ctx = if no_pch || context.is_empty() {
@@ -633,7 +647,7 @@ fn cmd_dataset(root: &Path, stats: bool, split: Option<&str>) -> Result<()> {
 fn cmd_context(root: &Path, unit: &str) -> Result<()> {
     let p = load_project(root)?;
     let u = find_unit(&p, unit)?;
-    print!("{}", harness::context_tu(&p, u)?);
+    print!("{}", ctxext::extended_context(&p, u, &harness::context_tu(&p, u)?));
     Ok(())
 }
 

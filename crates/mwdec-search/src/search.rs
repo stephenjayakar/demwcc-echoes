@@ -227,6 +227,11 @@ struct State {
     diag_q: Option<(Arc<String>, Fitness, u128)>,
 }
 
+/// Time spent generating children / evaluating them, all searches of the process (µs):
+/// `MWDEC_SEARCH_PROFILE` prints them after each search.
+pub static PROF_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROF_EVAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Open candidates kept for systematic expansion.
 const OPEN_CAP: usize = 512;
 /// Share of evaluations that stay random children while a neighbourhood is being evaluated.
@@ -746,6 +751,7 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
                         (p, w, directed, focus, chain)
                     };
                     // Generate a child.
+                    let t_gen = Instant::now();
                     let k = {
                         let mut k = 1;
                         while k < chain && rng.chance(if chain > cfg.max_chain { 0.5 } else { 0.35 }) {
@@ -796,7 +802,10 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
                         }
                         g.dup_streak = 0;
                     }
+                    let t_eval = Instant::now();
+                    PROF_GEN.fetch_add((t_eval - t_gen).as_micros() as u64, Ordering::Relaxed);
                     let (ev, ran) = scorer.eval(&src);
+                    PROF_EVAL.fetch_add(t_eval.elapsed().as_micros() as u64, Ordering::Relaxed);
                     let mut g = state.lock().unwrap();
                     g.evals += 1;
                     g.compiles += ran as u64;
@@ -881,6 +890,9 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
     });
 
     let g = state.into_inner().unwrap();
+    if std::env::var_os("MWDEC_SEARCH_PROFILE").is_some() {
+        eprintln!("search profile: generate {:.1}s, evaluate {:.1}s (cumulative, all threads)", PROF_GEN.load(Ordering::Relaxed) as f64 / 1e6, PROF_EVAL.load(Ordering::Relaxed) as f64 / 1e6);
+    }
     let mut best = g.best.clone();
     let mut polished = 0;
     if let Some(b) = &mut best {
@@ -920,6 +932,55 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
         save(cfg, b, &serde_json::to_string_pretty(&res).unwrap_or_default());
     }
     res
+}
+
+/// Bounded systematic pass for near misses at draft time: the distinct one-step neighbours of
+/// `src` (`ops::neighbours`, operators weighted by what differs), best first, at most
+/// `max_compiles` real compiles, the first exact one returned. Deterministic for a given source
+/// and target.
+pub fn quick_pass(scorer: &Scorer, src: &str, fit: &Fitness, max_compiles: usize) -> Option<String> {
+    quick_pass_with(scorer, src, fit, max_compiles, None)
+}
+
+/// [`quick_pass`]; with a tracer, an instruction-order difference first asks the real scheduler
+/// which statements to move (`mwdec_oracle::advice::statement_moves_in`, one traced compile and
+/// one `-sym on` compile) and tries those moves before the neighbourhood.
+pub fn quick_pass_with(scorer: &Scorer, src: &str, fit: &Fitness, max_compiles: usize, tracer: Option<&crate::trace::Tracer>) -> Option<String> {
+    if fit.exact {
+        return None;
+    }
+    let mut compiles = 0;
+    if let (Some(tr), true) = (tracer, fit.profile.reorder > 0 && std::env::var_os("MWDEC_NO_NEAR_ADVICE").is_none()) {
+        let tf = crate::locate::to_asm(scorer.tf);
+        let tobj = mwdec_oracle::asm::Obj { funcs: vec![tf.clone()], ..Default::default() };
+        let cand = mwdec_oracle::advice::Candidate { context: &tr.context, src, symbol: &scorer.symbol };
+        if let Ok(diag) = mwdec_oracle::advice::statement_moves_in(&tr.comp, &cand, &tobj, &tf) {
+            for mv in diag.moves.iter().take(4) {
+                for c in crate::locate::move_before(src, &scorer.symbol, mv.line, mv.before) {
+                    let (e, ran) = scorer.eval(&c);
+                    compiles += ran as usize;
+                    if e.fitness().is_some_and(|f| f.exact) {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+    }
+    let weights: Vec<f64> = ops::base_weights().iter().zip(OPS).map(|(w, o)| w * affinity_mult(&fit.profile, o.aff)).collect();
+    let hints = crate::hints::target_hints(scorer.tf);
+    let hints_ref = (!hints.is_empty()).then_some(&hints);
+    let nb = ops::neighbours(src, &scorer.symbol, &weights, hints_ref, None, 12, 1, max_compiles * 3);
+    for n in nb {
+        if compiles >= max_compiles {
+            break;
+        }
+        let (e, ran) = scorer.eval(&n.src);
+        compiles += ran as usize;
+        if e.fitness().is_some_and(|f| f.exact) {
+            return Some(n.src);
+        }
+    }
+    None
 }
 
 /// Readability pass over an exact match: random cleanup edits ([`ops::POLISH_OPS`]) are kept

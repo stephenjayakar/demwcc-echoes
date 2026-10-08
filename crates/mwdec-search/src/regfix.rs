@@ -61,8 +61,9 @@ pub const REG_OPS: &[&str] = &[
 pub struct RepairConfig {
     /// Real compiles at most (cache hits don't count).
     pub max_compiles: usize,
-    /// Compile budget and extra levels when compiles turn out cheap (persistent compilers: level 1
-    /// averaged under `cheap_ms` of wall time per compile).
+    /// Compile budget and extra levels when compiles turn out cheap (level 1 averaged under
+    /// `cheap_ms` of wall time per compile). The default treats every context as cheap: a
+    /// wall-clock rule made results depend on machine load.
     pub cheap_max_compiles: usize,
     pub cheap_levels: usize,
     pub cheap_ms: f64,
@@ -78,7 +79,7 @@ pub struct RepairConfig {
 
 impl Default for RepairConfig {
     fn default() -> Self {
-        RepairConfig { max_compiles: 160, cheap_max_compiles: 480, cheap_levels: 1, cheap_ms: 12.0, beam: 4, threads: 4, seeds: 48, max_time: std::time::Duration::from_secs(20) }
+        RepairConfig { max_compiles: 320, cheap_max_compiles: 320, cheap_levels: 1, cheap_ms: f64::INFINITY, beam: 4, threads: 4, seeds: 48, max_time: std::time::Duration::from_secs(20) }
     }
 }
 
@@ -104,6 +105,26 @@ pub fn register_only(f: &Fitness) -> bool {
 pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64, seen: &mut HashSet<String>) -> Vec<(String, &'static str)> {
     let Some(p) = Parsed::new(src, symbol) else { return vec![] };
     let mut out = vec![];
+    for c in accumulate_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "accumulate"));
+        }
+    }
+    for c in member_ref_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "member_ref"));
+        }
+    }
+    for c in mask_type_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "mask_type"));
+        }
+    }
+    for c in fold_call_up_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "fold_call_up"));
+        }
+    }
     for c in narrow_ret_variants(src, symbol) {
         if seen.insert(normalize(&c)) {
             out.push((c, "narrow_ret"));
@@ -1201,6 +1222,313 @@ pub fn narrow_ret_variants(src: &str, symbol: &str) -> Vec<String> {
     }
 }
 
+/// A call result kept in a local and used once inside arithmetic later (`t = f(); ...; *p = a *
+/// t;`) computed at the call instead (`z = a * f(); ...; *p = z;`): the product is then created
+/// right after the call, before whatever the statements in between create.
+pub fn fold_call_up_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    for blk in c.descendants(info.body) {
+        if c.kind(blk) != "compound_statement" {
+            continue;
+        }
+        let sibs: Vec<usize> = c.named(blk).into_iter().filter(|&n| crate::func::is_stmt(c.kind(n))).collect();
+        for (i, &t) in sibs.iter().enumerate() {
+            let (name, val) = match c.kind(t) {
+                "declaration" => {
+                    let ds: Vec<usize> = c.children_by_field(t, "declarator").collect();
+                    if ds.len() != 1 || c.kind(ds[0]) != "init_declarator" {
+                        continue;
+                    }
+                    let Some((n, suf)) = crate::func::declarator_name(&c, ds[0]) else { continue };
+                    let Some(v) = c.child(ds[0], "value") else { continue };
+                    if !suf.is_empty() {
+                        continue;
+                    }
+                    (n, v)
+                }
+                "expression_statement" => {
+                    let Some(a) = c.named(t).first().copied().filter(|&a| c.kind(a) == "assignment_expression" && c.op(a) == Some("=")) else { continue };
+                    let Some(l) = c.child(a, "left").filter(|&l| c.kind(l) == "identifier") else { continue };
+                    let Some(r) = c.child(a, "right") else { continue };
+                    (c.text(l).to_string(), r)
+                }
+                _ => continue,
+            };
+            if c.kind(val) != "call_expression" || !info.vars.get(&name).is_some_and(|v| !v.is_param) {
+                continue;
+            }
+            let uses: Vec<usize> = c.descendants(info.body).into_iter().filter(|&d| c.kind(d) == "identifier" && c.text(d) == name && c.nodes[d].start > c.nodes[val].end).collect();
+            let [u] = uses.as_slice() else { continue };
+            let Some(j) = sibs.iter().position(|&x| c.contains(x, *u)) else { continue };
+            if j <= i + 1 {
+                continue;
+            }
+            // the arithmetic around the use: binary operators over locals only
+            let mut e = *u;
+            while let Some(p) = c.parent(e) {
+                if matches!(c.kind(p), "binary_expression" | "parenthesized_expression") {
+                    e = p;
+                } else {
+                    break;
+                }
+            }
+            if e == *u {
+                continue;
+            }
+            let ids: Vec<String> = c.descendants(e).into_iter().filter(|&d| c.kind(d) == "identifier").map(|d| c.text(d).to_string()).collect();
+            let pure = c.descendants(e).into_iter().all(|d| !matches!(c.kind(d), "call_expression" | "field_expression" | "pointer_expression" | "subscript_expression" | "assignment_expression" | "update_expression"));
+            if !pure || ids.iter().any(|x| !info.vars.contains_key(x)) {
+                continue;
+            }
+            // the other operands are not written between the call and the use
+            let written = sibs[i..j].iter().any(|&s2| {
+                c.descendants(s2).into_iter().any(|d| {
+                    (matches!(c.kind(d), "assignment_expression" | "update_expression") && c.child(d, "left").or(c.child(d, "argument")).is_some_and(|l| ids.contains(&c.text(l).to_string()) && c.text(l) != name))
+                        || (c.kind(d) == "init_declarator" && crate::func::declarator_name(&c, d).is_some_and(|x| ids.contains(&x.0) && x.0 != name))
+                })
+            });
+            if written {
+                continue;
+            }
+            let z = info.fresh_name(&c, "value");
+            let etext = {
+                let es = c.nodes[e].start;
+                let us = c.nodes[*u].start - es;
+                let ue = c.nodes[*u].end - es;
+                let et = c.text(e);
+                format!("{}{}{}", &et[..us], c.text(val), &et[ue..])
+            };
+            let at = c.nodes[t].start;
+            let line_start = src[..at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+            let _ = line_start;
+            let edits = vec![Edit::replace(&c, t, format!("__typeof__({etext}) {z} = {etext};")), Edit::replace(&c, e, z)];
+            if let Some(s) = apply(src, &edits) {
+                if Cst::parse(&s).errors <= c.errors {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A 32-bit local only ever read through a 16/8-bit mask (`x & 0xffff`) declared that narrow
+/// instead (`unsigned short x;`, masks dropped), and unsigned casts before a masked shift dropped
+/// (`(unsigned int)x >> 8 & 255` -> `x >> 8 & 255`, the mask clears the sign bits anyway): the
+/// drafts spell out extensions the source left to the types (one candidate each).
+pub fn mask_type_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    let lit = |n: usize| parse_int(c.text(n));
+    // narrow locals
+    let mut edits = vec![];
+    for t in c.descendants(info.body) {
+        if c.kind(t) != "declaration" {
+            continue;
+        }
+        let Some(ty) = c.child(t, "type") else { continue };
+        let tt = c.text(ty).split_whitespace().collect::<Vec<_>>().join(" ");
+        if !matches!(tt.as_str(), "int" | "unsigned int" | "u32" | "s32" | "uint") || c.children_by_field(t, "declarator").count() != 1 {
+            continue;
+        }
+        let Some((name, suf)) = c.child(t, "declarator").and_then(|d| crate::func::declarator_name(&c, d)) else { continue };
+        if !suf.is_empty() {
+            continue;
+        }
+        // reads of the variable: all masked the same way?
+        let reads: Vec<usize> = c
+            .descendants(info.body)
+            .into_iter()
+            .filter(|&d| c.kind(d) == "identifier" && c.text(d) == name && c.parent(d).is_some_and(|p| !(c.kind(p) == "assignment_expression" && c.child(p, "left") == Some(d)) && c.kind(p) != "init_declarator" && c.kind(p) != "declaration"))
+            .collect();
+        let masks: Vec<Option<(usize, i64)>> = reads
+            .iter()
+            .map(|&d| {
+                let p = c.parent(d)?;
+                if c.kind(p) == "binary_expression" && c.op(p) == Some("&") {
+                    let other = if c.child(p, "left") == Some(d) { c.child(p, "right")? } else { c.child(p, "left")? };
+                    lit(other).map(|m| (p, m))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let masked: Vec<(usize, i64)> = masks.iter().flatten().copied().collect();
+        if masked.is_empty() {
+            continue;
+        }
+        let m = masked[0].1;
+        let nt = match m {
+            0xffff => "unsigned short",
+            0xff => "unsigned char",
+            _ => continue,
+        };
+        if !masked.iter().all(|x| x.1 == m) {
+            continue;
+        }
+        edits.push(Edit::replace(&c, ty, nt.to_string()));
+        for (p, _) in &masked {
+            edits.push(Edit::replace(&c, *p, name.clone()));
+        }
+    }
+    if !edits.is_empty() {
+        if let Some(s) = apply(src, &edits) {
+            if Cst::parse(&s).errors <= c.errors {
+                out.push(s);
+            }
+        }
+    }
+    // unsigned casts before masked shifts
+    let mut edits = vec![];
+    for n in c.descendants(info.body) {
+        if c.kind(n) != "binary_expression" || c.op(n) != Some("&") {
+            continue;
+        }
+        let (Some(l), Some(r)) = (c.child(n, "left"), c.child(n, "right")) else { continue };
+        let Some(m) = lit(r) else { continue };
+        if c.kind(l) != "binary_expression" || c.op(l) != Some(">>") {
+            continue;
+        }
+        let (Some(x), Some(k)) = (c.child(l, "left"), c.child(l, "right")) else { continue };
+        let Some(k) = lit(k) else { continue };
+        if c.kind(x) != "cast_expression" || !c.child(x, "type").is_some_and(|t| matches!(c.text(t).trim(), "unsigned int" | "u32" | "uint")) {
+            continue;
+        }
+        if k <= 0 || k >= 32 || m < 0 || m >= (1i64 << (32 - k)) {
+            continue;
+        }
+        let Some(v) = c.child(x, "value") else { continue };
+        edits.push(Edit::replace(&c, x, c.text(v).to_string()));
+    }
+    if !edits.is_empty() {
+        if let Some(s) = apply(src, &edits) {
+            if Cst::parse(&s).errors <= c.errors {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// A member object used several times (`this->mBounds.GetMax()`, `this->mBounds.GetMin()`)
+/// through a reference bound at the top (`__typeof__(this->mBounds)& ref = this->mBounds;`): its
+/// address is then computed once, into a register of its own.
+pub fn member_ref_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let sibs: Vec<usize> = c.named(info.body).into_iter().filter(|&n| crate::func::is_stmt(c.kind(n))).collect();
+    let Some(&first) = sibs.first() else { return vec![] };
+    // object-valued member accesses: `X` in `X.y` / `X.f()` with `X` a `->` member access of `this`
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for n in c.descendants(info.body) {
+        if c.kind(n) != "field_expression" || c.op(n) != Some("->") {
+            continue;
+        }
+        if !c.child(n, "argument").is_some_and(|a| c.kind(a) == "this") {
+            continue;
+        }
+        if c.parent(n).is_some_and(|p| c.kind(p) == "field_expression" && c.op(p) == Some(".") && c.child(p, "argument") == Some(n)) {
+            groups.entry(c.text(n).to_string()).or_default().push(n);
+        }
+    }
+    let mut out = vec![];
+    let at = c.nodes[first].start;
+    let line_start = src[..at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+    let ind = &src[line_start..at];
+    for (k, (x, ns)) in groups.iter().enumerate() {
+        if ns.len() < 2 {
+            continue;
+        }
+        let name = info.fresh_name(&c, &format!("ref{k}_"));
+        let mut edits = vec![Edit::insert(at, format!("__typeof__({x})& {name} = {x};\n{ind}"))];
+        for &n in ns {
+            edits.push(Edit::replace(&c, n, name.clone()));
+        }
+        if let Some(s) = apply(src, &edits) {
+            if Cst::parse(&s).errors <= c.errors {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// A sum of three or more terms (`a + b + c`, or a vector's `v.MagSquared()` written out with its
+/// `GetX/Y/Z` accessors) accumulated in a local before the statement (`T s = a; s += b; s += c;`):
+/// the front end keeps the accumulation order instead of reassociating the sum.
+pub fn accumulate_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    fn terms(c: &Cst, n: usize, out: &mut Vec<usize>) {
+        let n0 = if c.kind(n) == "parenthesized_expression" { c.named(n).first().copied().unwrap_or(n) } else { n };
+        if c.kind(n0) == "binary_expression" && c.op(n0) == Some("+") {
+            if let (Some(l), Some(r)) = (c.child(n0, "left"), c.child(n0, "right")) {
+                terms(c, l, out);
+                terms(c, r, out);
+                return;
+            }
+        }
+        out.push(n0);
+    }
+    let mut out = vec![];
+    let mut k = 0;
+    for n in c.descendants(info.body) {
+        // (sum expression, its terms as text)
+        let ts: Vec<String> = if c.kind(n) == "binary_expression" && c.op(n) == Some("+") && !c.parent(n).is_some_and(|p| (c.kind(p) == "binary_expression" && c.op(p) == Some("+")) || c.kind(p) == "parenthesized_expression") {
+            let mut t = vec![];
+            terms(&c, n, &mut t);
+            if t.len() < 3 {
+                continue;
+            }
+            t.iter().map(|&x| c.text(x).to_string()).collect()
+        } else if c.kind(n) == "call_expression" && c.child(n, "arguments").is_some_and(|a| c.named(a).is_empty()) {
+            let Some(f) = c.child(n, "function").filter(|&f| c.kind(f) == "field_expression") else { continue };
+            if !c.child(f, "field").is_some_and(|x| c.text(x) == "MagSquared") {
+                continue;
+            }
+            let Some(o) = c.child(f, "argument") else { continue };
+            if !matches!(c.kind(o), "identifier" | "this" | "field_expression" | "parenthesized_expression") {
+                continue;
+            }
+            let acc = format!("{}{}", c.text(o), c.op(f).unwrap_or("."));
+            ["GetX", "GetY", "GetZ"].iter().map(|g| format!("{acc}{g}() * {acc}{g}()")).collect()
+        } else {
+            continue;
+        };
+        let Some(stmt) = c.ancestors(n).into_iter().find(|&x| crate::func::is_stmt(c.kind(x)) && c.parent(x).is_some_and(|p| c.kind(p) == "compound_statement")) else { continue };
+        if matches!(c.kind(stmt), "while_statement" | "for_statement" | "do_statement") {
+            continue;
+        }
+        let at = c.nodes[stmt].start;
+        let line_start = src[..at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+        let ind = &src[line_start..at];
+        let name = info.fresh_name(&c, &format!("sum{k}_"));
+        k += 1;
+        let mut decl = format!("__typeof__({}) {name} = {};\n{ind}", c.text(n), ts[0]);
+        for t in &ts[1..] {
+            decl.push_str(&format!("{name} += {t};\n{ind}"));
+        }
+        let edits = vec![Edit::insert(at, decl), Edit::replace(&c, n, name)];
+        if let Some(s) = apply(src, &edits) {
+            if Cst::parse(&s).errors <= c.errors {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 struct Scored {
     src: String,
     fit: Fitness,
@@ -1304,7 +1632,7 @@ pub fn repair(scorer: &Scorer, src: &str, fit: &Fitness, tracer: Option<&crate::
     let t1 = std::time::Instant::now();
     let mut level = score_all(scorer, cands, cfg.threads, &compiles, cfg.max_compiles, deadline);
     let n1 = compiles.load(Ordering::Relaxed);
-    let cheap_now = |t: std::time::Instant, n: usize| n >= 8 && t.elapsed().as_secs_f64() * 1000.0 / (n as f64) < cfg.cheap_ms;
+    let cheap_now = |t: std::time::Instant, n: usize| cfg.cheap_ms.is_infinite() || n >= 8 && t.elapsed().as_secs_f64() * 1000.0 / (n as f64) < cfg.cheap_ms;
     let mut cheap = cheap_now(t1, n1);
     let mut max_compiles = if cheap { cfg.cheap_max_compiles } else { cfg.max_compiles };
     if verbose {

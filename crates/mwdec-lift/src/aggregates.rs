@@ -138,6 +138,7 @@ pub fn merge_copies_typing(body: &mut Vec<Stmt>, vars: &mut [Var], is_temp: &dyn
     // a region that is a by-value argument's copy stays as it is (the by-value forwarding
     // turns `S = x; f(S)` into `f(x)`)
     let mut byval_arg: Vec<VarId> = vec![];
+    let mut rvalue_arg: Vec<VarId> = vec![];
     Stmt::walk_exprs(body, &mut |e| {
         if let Expr::Call { callee, args, .. } = e {
             let sig = match callee {
@@ -218,12 +219,13 @@ pub fn merge_copies_typing(body: &mut Vec<Stmt>, vars: &mut [Var], is_temp: &dyn
         });
         for (v, n) in addr_args {
             if n == 1 && mentions.get(&v).copied().unwrap_or(0) == 1 + dst_mentions.get(&v).copied().unwrap_or(0) {
-                byval_arg.push(v);
+                rvalue_arg.push(v);
             }
         }
     }
     let mut retype: Vec<(VarId, Type)> = vec![];
-    // (by-value copies are left to the by-value forwarding: no typing for them)
+    // (by-value copies are left to the by-value forwarding: no typing for them; a whole copy
+    // into an rvalue temporary still merges, `f(T(x))`, but the region stays untyped)
     let mut snapshot: Vec<Var> = vars.to_vec();
     for v in &byval_arg {
         if matches!(snapshot[*v].ty, Type::Unknown { .. }) {
@@ -242,7 +244,7 @@ pub fn merge_copies_typing(body: &mut Vec<Stmt>, vars: &mut [Var], is_temp: &dyn
     for (v, t) in seen {
         if let Some(t) = t {
             let size = types::size_of(Some(db), &t).unwrap_or(0) as i64;
-            if !byval_arg.contains(&v) && extent.get(&v).map_or(true, |e| *e <= size) {
+            if !byval_arg.contains(&v) && !rvalue_arg.contains(&v) && extent.get(&v).map_or(true, |e| *e <= size) {
                 vars[v].ty = t;
             }
         }
@@ -269,8 +271,19 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
                     };
                     let (db_, doff, dptr, dty) = split_access(dst).unwrap();
                     let (sb, soff, sptr, sty) = split_access(&s_expr).unwrap();
-                    let size = scalar_size(dty).unwrap_or(0);
-                    if size == 0 || scalar_size(sty) != Some(size) {
+                    // an enum member copied into an untyped word of the destination buffer
+                    let enum_size = |t: &Type| -> Option<u32> {
+                        match t {
+                            Type::Named(n) if db.enums.contains_key(n.as_str()) => types::size_of(Some(db), t),
+                            _ => None,
+                        }
+                    };
+                    let (dsize, ssize) = match (dty, enum_size(sty)) {
+                        (Type::Unknown { size }, Some(n)) => (Some(*size), Some(n)),
+                        _ => (scalar_size(dty), scalar_size(sty).or_else(|| enum_size(sty))),
+                    };
+                    let size = dsize.unwrap_or(0);
+                    if size == 0 || ssize != Some(size) {
                         break;
                     }
                     copies.push(Copy {
@@ -324,6 +337,8 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
                 let sts = aggregate_at(db, &scls, smin);
                 for t in dts.iter().filter(|t| sts.iter().any(|s| sig::norm_name(&format!("{s:?}")) == sig::norm_name(&format!("{t:?}")))) {
                     let Some(fields) = flat(db, t) else { continue };
+                    // a 64-bit integer member is copied as two words
+                    let fields: Vec<_> = fields.into_iter().flat_map(|(o, s, f)| if s == 8 && !f { vec![(o, 4, f), (o + 4, 4, f)] } else { vec![(o, s, f)] }).collect();
                     if fields.len() != group.len() {
                         continue;
                     }

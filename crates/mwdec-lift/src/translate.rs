@@ -177,6 +177,8 @@ pub struct Lifter<'a> {
     mfcr_vals: HashMap<usize, Vec<Option<Expr>>>,
     /// string literal -> (pool symbol, offset) it was read from
     str_origin: HashMap<Vec<u8>, (String, i64)>,
+    /// The one-byte zero literal read as `""` (a `const char&` argument's constant).
+    empty_str_origin: Option<(String, i64)>,
     /// Stack objects whose constructor's return value (`this`) is used afterwards.
     pub ctor_ret_used: HashSet<VarId>,
 }
@@ -324,6 +326,7 @@ impl<'a> Lifter<'a> {
             out_stack: HashSet::new(),
             mfcr_vals: HashMap::new(),
             str_origin: HashMap::new(),
+            empty_str_origin: None,
             ctor_ret_used: HashSet::new(),
         }
     }
@@ -545,15 +548,24 @@ impl<'a> Lifter<'a> {
             && s.params.is_empty()
             && !self.db.map_or(false, |db| db.decls.contains_key(&r.target) || db.functions.contains_key(&r.target))
         {
-            if let Some(g) = (3..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q))) {
+            // words stored to the outgoing parameter area: the GPR arguments are all used, and
+            // registers still holding this function's own arguments are passed on
+            let outgoing = self.outgoing_stack_words(k);
+            let gmax = if outgoing > 0 { Some(10) } else { (3..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q))) };
+            if let Some(g) = gmax {
                 for _ in 3..=g {
                     s.params.push(mwdec_core::Param { name: None, ty: t_s32() });
                 }
             }
-            if let Some(fm) = (1..=8u8).rev().find(|q| self.reg_set_for_call(k, fpr(*q))) {
+            let fset = (1..=8u8).rev().find(|q| self.reg_set_for_call(k, fpr(*q)));
+            let fpass = if outgoing > 0 { (1..=8u8).rev().find(|q| self.entry_val_intact(k, fpr(*q))) } else { None };
+            if let Some(fm) = fset.max(fpass) {
                 for _ in 1..=fm {
                     s.params.push(mwdec_core::Param { name: None, ty: t_f32() });
                 }
+            }
+            for _ in 0..outgoing {
+                s.params.push(mwdec_core::Param { name: None, ty: t_s32() });
             }
         }
         let sret = !sig::ret_unknown(&s) && types::is_aggregate(self.db, &s.ret);
@@ -682,6 +694,52 @@ impl<'a> Lifter<'a> {
 
     /// Was `reg` last written in this block (since the previous call) and not read again before
     /// the call at `k` (i.e. set up as an argument)?
+    /// Words stored right before call `k` (same block) to the outgoing parameter area
+    /// `8(r1)`, `12(r1)`, ... and never read back: stack-passed arguments.
+    fn outgoing_stack_words(&self, k: usize) -> usize {
+        if self.frame.info.size == 0 {
+            return 0;
+        }
+        let b = self.cfg.block_of[k];
+        let mut offs = vec![];
+        for j in self.cfg.blocks[b].start..k {
+            let i = &self.insns[j];
+            if self.frame.skip.contains(&j) || i.reloc.is_some() || i.ra() != 1 {
+                continue;
+            }
+            if i.is_call() || i.is_bctrl() {
+                offs.clear();
+                continue;
+            }
+            if matches!(i.op(), ppc750cl::Opcode::Stw) && i.disp() >= 8 && !self.frame.save_slots.contains_key(&i.disp()) {
+                offs.push(i.disp());
+            }
+        }
+        offs.sort();
+        offs.dedup();
+        if offs.is_empty() || offs.iter().enumerate().any(|(n, o)| *o != 8 + 4 * n as i32) {
+            return 0;
+        }
+        // never read back (not a local)
+        let read = self.insns.iter().enumerate().any(|(j, i)| {
+            !self.frame.skip.contains(&j) && i.ra() == 1 && i.reloc.is_none() && matches!(i.op(), ppc750cl::Opcode::Lwz | ppc750cl::Opcode::Lhz | ppc750cl::Opcode::Lbz | ppc750cl::Opcode::Lha) && offs.contains(&i.disp())
+                || (matches!(i.op(), ppc750cl::Opcode::Addi) && i.ra() == 1 && offs.contains(&(i.simm() as i32)))
+        });
+        if read {
+            return 0;
+        }
+        offs.len()
+    }
+
+    /// `reg` still holds this function's incoming argument at instruction `k` (nothing before
+    /// `k` writes it, no call in between).
+    fn entry_val_intact(&self, k: usize, reg: Reg) -> bool {
+        self.entry_vals.contains_key(&reg)
+            && !self.insns[..k].iter().enumerate().any(|(j, i)| {
+                !self.frame.skip.contains(&j) && (i.is_call() || i.is_bctrl() || defs_uses(i).0.contains(&reg))
+            })
+    }
+
     fn reg_set_for_call(&self, k: usize, reg: Reg) -> bool {
         let b = self.cfg.block_of[k];
         let start = self.cfg.blocks[b].start;
@@ -1492,16 +1550,16 @@ impl<'a> Lifter<'a> {
     /// Whether the address `addi rd, r1, X` at instruction `k` is the struct-return pointer of
     /// the next call.
     fn addr_is_sret(&self, k: usize, rd: u8) -> bool {
-        self.addr_call_role(k, rd, |lay| lay.sret == Some(rd))
+        self.addr_call_role(k, rd, |_, lay| lay.sret == Some(rd))
     }
 
     /// Whether the address `addi rd, r1, X` at instruction `k` is the receiver (`this`) of the
-    /// next call.
+    /// next call, other than a constructor (a member constructed in place is part of its object).
     fn addr_is_receiver(&self, k: usize, rd: u8) -> bool {
-        self.addr_call_role(k, rd, |lay| lay.this == Some(rd))
+        self.addr_call_role(k, rd, |sig, lay| lay.this == Some(rd) && !sig::is_ctor(sig))
     }
 
-    fn addr_call_role(&self, k: usize, rd: u8, role: impl Fn(&Layout) -> bool) -> bool {
+    fn addr_call_role(&self, k: usize, rd: u8, role: impl Fn(&FuncSig, &Layout) -> bool) -> bool {
         let mut b = self.cfg.block_of[k];
         let mut from = k + 1;
         // through a null test of the address (`addic. rd, r1, X; beq`) into its fall-through
@@ -1509,7 +1567,7 @@ impl<'a> Lifter<'a> {
             for j in from..self.cfg.blocks[b].end {
                 let i = &self.insns[j];
                 if i.is_call() || (i.is_jump() && i.reloc.is_some()) {
-                    return self.call_layouts.get(&j).map_or(false, |(_, lay, _)| role(lay));
+                    return self.call_layouts.get(&j).map_or(false, |(sg, lay, _)| role(sg, lay));
                 }
                 if i.is_bctrl() || defs_uses(i).0.contains(&gpr(rd)) {
                     return false;
@@ -1685,6 +1743,24 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Bytes of the word / double-word literal symbols the function references.
+    pub fn literal_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        self.globals
+            .keys()
+            .filter(|s| is_literal_name(s))
+            .filter_map(|s| {
+                let d = self.obj.data.get(s)?;
+                // (only constants: read-only pools, or compiler-named literals; a writable
+                // splitter-named word may be a variable)
+                let ro = matches!(d.section.as_str(), ".sdata2" | ".rodata");
+                if !matches!(d.size, 4 | 8) || !d.relocs.is_empty() || !(ro || s.starts_with('@')) {
+                    return None;
+                }
+                Some((s.clone(), self.data_bytes(s, 0, d.size as usize)?))
+            })
+            .collect()
+    }
+
     /// Strings of the string pool before (and including) the last string the function uses,
     /// when some used string is not at the start of its pool; empty otherwise or when strings
     /// come from more than one pool.
@@ -1744,7 +1820,10 @@ impl<'a> Lifter<'a> {
                             self.str_origin.insert(s.to_vec(), (sym.to_string(), addend));
                             return Expr::Str { bytes: s.to_vec() };
                         }
-                        if s.is_empty() && d.size == 1 {
+                        // an empty string: a lone byte, or a string pool's entry (`""` ahead of
+                        // the unit's other literals)
+                        if s.is_empty() && (d.size == 1 || sym.contains("stringBase")) {
+                            self.empty_str_origin = Some((sym.to_string(), addend));
                             return Expr::Str { bytes: vec![] };
                         }
                     }
@@ -1773,9 +1852,41 @@ impl<'a> Lifter<'a> {
             // the compiler only does that for an object larger than the small-data limit, so a
             // scalar declaration would turn its accesses into SDA ones
             // (static initializers define their objects from the constructor calls instead)
-            None if self.far_only(sym) && !self.f.name.starts_with("__sinit_") => t_unk(FAR_EXTERN_SIZE),
+            // (static initializers define the objects they construct from the constructor calls:
+            // only an object written through its address keeps the rule there)
+            None if self.far_only(sym) && (!self.f.name.starts_with("__sinit_") || self.addressed_by_memory_ops(sym)) => t_unk(FAR_EXTERN_SIZE),
             None => t_unk(0),
         }
+    }
+
+    /// The address of `sym` (`addi rD, rX, sym@l`) is used as the base of loads/stores before
+    /// rD is redefined, and never passed to a call.
+    fn addressed_by_memory_ops(&self, sym: &str) -> bool {
+        let mut based = false;
+        for (k, i) in self.insns.iter().enumerate() {
+            if !(i.op() == ppc750cl::Opcode::Addi && i.reloc.as_ref().is_some_and(|r| r.target == sym)) {
+                continue;
+            }
+            let rd = i.rd();
+            let end = self.cfg.blocks[self.cfg.block_of[k]].end;
+            for j in k + 1..end {
+                let n = &self.insns[j];
+                let (d, u) = defs_uses(n);
+                if n.is_call() || n.is_bctrl() {
+                    if (3..=10).contains(&rd) {
+                        return false;
+                    }
+                    break;
+                }
+                if u.contains(&gpr(rd)) && n.ra() == rd && matches!(n.op(), ppc750cl::Opcode::Stw | ppc750cl::Opcode::Sth | ppc750cl::Opcode::Stb | ppc750cl::Opcode::Lwz | ppc750cl::Opcode::Lhz | ppc750cl::Opcode::Lbz | ppc750cl::Opcode::Stfs | ppc750cl::Opcode::Stfd | ppc750cl::Opcode::Lfs | ppc750cl::Opcode::Lfd) {
+                    based = true;
+                }
+                if d.contains(&gpr(rd)) {
+                    break;
+                }
+            }
+        }
+        based
     }
 
     fn far_only(&self, sym: &str) -> bool {
@@ -2105,6 +2216,11 @@ impl<'a> Lifter<'a> {
         (8 + area + saves + 7) & !7
     }
 
+    /// Lowest r1 offset of a stack object (see `lowest_local_offset`).
+    pub fn lowest_stack_offset(&self) -> Option<i32> {
+        self.lowest_local_offset()
+    }
+
     /// Any r1-relative access outside the prologue/epilogue (a stack object).
     pub fn has_stack_objects(&self) -> bool {
         self.lowest_local_offset().is_some()
@@ -2428,6 +2544,53 @@ impl<'a> Lifter<'a> {
                 }
             };
             args.push(a);
+        }
+        // a constant bound to a `const T&` parameter: the compiler materialised it as an
+        // anonymous object (`@N` / a splitter label); the source passed the value
+        for (n, a) in args.iter_mut().enumerate() {
+            let Some(pt) = sig.params.get(n).map(|p| p.ty.clone()) else { continue };
+            let Type::Ref(inner) = strip_cv(&pt) else { continue };
+            if !matches!(**inner, Type::Const(_)) {
+                continue;
+            }
+            let t = types::resolve(self.db, strip_cv(inner)).into_owned();
+            let Some(sz) = scalar_size(&t).filter(|z| matches!(z, 1 | 2 | 4 | 8)) else { continue };
+            let (sym, add) = match &*a {
+                Expr::AddrOf(g) => match &**g {
+                    Expr::Global { symbol, .. } => (symbol.clone(), 0i64),
+                    Expr::Member { base, offset, .. } => match &**base {
+                        Expr::Global { symbol, .. } => (symbol.clone(), *offset as i64),
+                        _ => continue,
+                    },
+                    _ => continue,
+                },
+                Expr::Str { bytes } => match self.str_origin.get(bytes).or(if bytes.is_empty() { self.empty_str_origin.as_ref() } else { None }) {
+                    Some((s, o)) => (s.clone(), *o),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if !is_literal_name(&sym) || !self.obj.data.get(&sym).is_some_and(|d| matches!(d.section.as_str(), ".sdata" | ".sdata2" | ".rodata") && d.size as i64 >= add + sz as i64) {
+                continue;
+            }
+            let Some(b) = self.data_bytes(&sym, add, sz as usize) else { continue };
+            let raw = b.iter().fold(0u64, |acc, &x| (acc << 8) | x as u64);
+            let lit = match strip_cv(&t) {
+                Type::Float { size: 4 } => Expr::Float { bits: raw, double: false },
+                Type::Float { size: 8 } => Expr::Float { bits: raw, double: true },
+                tt if types::is_enum(self.db, tt) || matches!(tt, Type::Int { .. } | Type::Char | Type::Bool | Type::WChar | Type::Long { .. }) => {
+                    let signed = is_signed(tt).unwrap_or(true);
+                    let v = match (sz, signed) {
+                        (1, true) => raw as u8 as i8 as i64,
+                        (2, true) => raw as u16 as i16 as i64,
+                        (4, true) => raw as u32 as i32 as i64,
+                        _ => raw as i64,
+                    };
+                    Expr::Int { value: v, ty: tt.clone() }
+                }
+                _ => continue,
+            };
+            *a = lit;
         }
         if has_this && self.deleting_dtor_call(st, k, &sig) {
             args.push(Expr::int(1));
@@ -2818,7 +2981,8 @@ impl<'a> Lifter<'a> {
                 let class = pointee(&ty_of(&obj, &self.vars)).and_then(|t| named(t).map(|s| s.to_string()));
                 let mut vsig = None;
                 if let (Some(db), Some(cls)) = (self.db, class.as_deref()) {
-                    if let Some(m) = types::vmethod(db, cls, *slot as u32) {
+                    // (an unnamed pure slot says nothing about the arguments: keep the ones set up)
+                    if let Some(m) = types::vmethod(db, cls, *slot as u32).filter(|m| !sig::split_scope(&m.sig.qualified_name).1.is_empty()) {
                         vsig = Some(m.sig.clone());
                         if !sig::ret_unknown(&m.sig) {
                             ret = m.sig.ret.clone();
@@ -3616,6 +3780,9 @@ impl<'a> Lifter<'a> {
                         e => e,
                     };
                     matches!(e, Expr::Binary { op: BinOp::And, l, r, .. } if r.as_int().is_some() && matches!(&**l, Expr::Binary { op: BinOp::Shr, r: k, .. } if k.as_int().is_some_and(|k| k > 0)))
+                        // a register word started as a shifted value (`reg = (0xE0 + id * 2) << 24;
+                        // SET_REG_FIELD(reg, ..)`)
+                        || matches!(e, Expr::Binary { op: BinOp::Shl, r: k, .. } if k.as_int().is_some_and(|k| k >= 16))
                 };
                 let v = if extracted || konst || base_konst || !known_zero(&a, m, &self.vars, &|t| self.temp_def.get(&t), 0) {
                     // inserting a constant or into a constant (C shift/mask forms would fold to a

@@ -149,6 +149,8 @@ pub struct RawDecl {
     pub access: mwdec_core::Access,
     /// Constructor initializer list tokens (definitions only).
     pub init_list: Option<String>,
+    /// Default argument tokens per parameter (empty when none has one).
+    pub defaults: Vec<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -970,6 +972,7 @@ fn parse_fn_decl(scope: &str, in_class: bool, decl: &[&Tok], body: Option<String
     }
     let inner: Vec<&Tok> = toks[lparen + 1..rparen].to_vec();
     let mut params = Vec::new();
+    let mut defaults: Vec<Option<String>> = Vec::new();
     let mut variadic = false;
     if !(inner.is_empty() || (inner.len() == 1 && inner[0].is("void"))) {
         for part in split_top(&inner, ",") {
@@ -996,7 +999,11 @@ fn parse_fn_decl(scope: &str, in_class: bool, decl: &[&Tok], body: Option<String
                 c
             };
             params.push(p[..cut].to_vec());
+            defaults.push((cut < p.len()).then(|| p[cut + 1..].join(" ")));
         }
+    }
+    if defaults.iter().all(|d| d.is_none()) {
+        defaults.clear();
     }
     let tail: Vec<&str> = toks[rparen + 1..].iter().map(|t| t.s.as_str()).collect();
     // tail up to ctor-initializer ':' (definitions) is const/throw/=0
@@ -1020,6 +1027,7 @@ fn parse_fn_decl(scope: &str, in_class: bool, decl: &[&Tok], body: Option<String
         template_params: Vec::new(),
         access: mwdec_core::Access::Public,
         init_list,
+        defaults,
     })
 }
 

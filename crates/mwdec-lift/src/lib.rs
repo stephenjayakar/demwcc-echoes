@@ -30,11 +30,16 @@ pub mod inline;
 pub mod localtypes;
 pub mod objcmp;
 pub mod postinline;
+pub mod reread;
 pub mod insn;
 pub mod ir;
 pub mod sig;
 pub mod scalars;
+pub mod sdkframe;
+pub mod samereg;
+pub mod namedindex;
 pub mod simplify;
+pub mod helpers;
 pub mod structcopy;
 pub mod variants;
 pub mod structure;
@@ -228,11 +233,13 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         bool_return(&body, &l.vars, &mut l.ret_ty);
     }
     wide::merge_halves(&mut body, &l.vars, &l.is_temp, l.param_home_slots);
+    wide::set_adjacent_labels(obj);
     wide::merge_or_assigns(&mut body, &l.vars, &l.is_temp);
     wide::merge_compares(&mut body, &l.vars);
     // compiler-made stack copies the source never names, then fold the temps they kept alive
     let mut dead_stores = idioms::drop_dead_stack_stores_kept(&mut body, &l.vars);
     localtypes::fold_delete_checks(&mut body);
+    simplify::fold_double_delete_checks(&mut body);
     if l.sig.variadic {
         varargs::recover(&mut body, &mut l.vars, l.params.last().copied());
     }
@@ -297,10 +304,12 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::fold_ternary_constants(&mut body);
     simplify::inline_ternary_results(&mut body);
     bitfields::insert_chains(&mut body, &mut l.vars, &mut l.is_temp, l.param_home_slots);
+    namedindex::name_scaled_index(&mut body, &mut l.vars, &mut l.is_temp);
     localtypes::forward_global_pointers(&mut body, &l.vars, &l.is_temp);
     if ret_void {
         simplify::drop_trailing_return(&mut body);
     }
+    reread::reread_temps(&mut body, &l.vars);
     simplify::drop_garbage_return(&mut body);
 
     // GC/1.2.5n reserves a frame slot for every declared local once the frame has a local area,
@@ -318,9 +327,34 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         }
     }
 
+    // more volatile-register locals in the draft than the target's frame has scalar slots for
+    // (each costs this compiler a slot): fold the extra ones into their uses (variant)
+    if l.param_home_slots && l.frame.info.size > 0 {
+        let np = l.sig.params.iter().map(|p| if crate::types::size_of(db, &p.ty).unwrap_or(4) > 4 { 2 } else { 1 }).sum::<i32>();
+        let vol = sdkframe::volatile_locals(&body, &l.vars) as i32;
+        let target_slots = match l.lowest_stack_offset() {
+            Some(lo) => Some((lo - 8) / 4 - np),
+            None => (0..=vol).find(|&k| l.sdk_frame_size((np + k) as u32) == l.frame.info.size),
+        };
+        if let Some(t) = target_slots.filter(|t| *t >= 0 && vol > *t) {
+            let mut probe = body.clone();
+            if sdkframe::fold_volatile_locals(&mut probe, &l.vars, (vol - t) as usize) > 0 && variants::alt(variants::SDK_FOLD_SLOT_LOCALS) {
+                body = probe;
+            }
+        }
+    }
+
+    {
+        let mut probe = body.clone();
+        if samereg::merge_register_webs(&mut probe, &mut l.vars) && variants::alt(variants::MERGE_REGISTER_WEBS) {
+            body = probe;
+        }
+    }
+
     let mut sig = l.sig.clone();
     sig.ret = l.ret_ty.clone();
     let string_pool = l.string_pool_prefix();
+    let literal_bytes = l.literal_bytes();
     let mut ir = IrFunction {
         symbol: f.name.clone(),
         sig,
@@ -333,12 +367,16 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         globals: l.globals.into_values().collect(),
         frame: l.frame.info,
         string_pool,
+        literal_bytes,
         warnings: l.warnings,
         decl_params: l.decl_params,
         dead_stores,
     };
     debug::stage("late simplify", &ir.body, &ir.vars);
     frameobj::fold_single_reads(&mut ir);
+    frameobj::fold_block_copies(&mut ir, db);
+    frameobj::whole_object_copies(&mut ir, db);
+    frameobj::unknown_callee_byval(&mut ir, db);
     idioms::apply(&mut ir, db);
     scalars::regroup(&mut ir, db);
     debug::stage("idioms", &ir.body, &ir.vars);
@@ -631,6 +669,9 @@ fn early_returns(l: &mut Lifter) {
             let cont = match l.cfg.blocks[p].preds.as_slice() {
                 [c] if Some(p) != tail => match l.cfg.blocks[*c].term {
                     cfg::Term::Cond { taken, fall } if fall == p && taken != p => Some(taken),
+                    // jumped to forward over the other arm: `if (c) { .. } else { return x; }`,
+                    // the arms meet at the function's last return
+                    cfg::Term::Cond { taken, fall } if taken == p && fall != p && tail.is_some() && l.cfg.blocks[p].start > l.cfg.blocks[fall].start && real_arm(l, fall) => tail,
                     cfg::Term::Cond { taken, fall } if taken == p && fall != p => Some(fall),
                     _ => tail,
                 },
@@ -700,7 +741,7 @@ fn early_returns(l: &mut Lifter) {
         }
         let jumps: Vec<usize> = l.cfg.blocks[r].preds.iter().copied().filter(|&p| p != tail && matches!(l.cfg.blocks[p].term, cfg::Term::Jump(t) if t == r)).collect();
         let forward = |p: usize, l: &Lifter| match l.cfg.blocks[p].preds.as_slice() {
-            [c] => matches!(l.cfg.blocks[*c].term, cfg::Term::Cond { taken, fall } if taken == p && fall != p && l.cfg.blocks[p].start > l.cfg.blocks[fall].start),
+            [c] => matches!(l.cfg.blocks[*c].term, cfg::Term::Cond { taken, fall } if taken == p && fall != p && l.cfg.blocks[p].start > l.cfg.blocks[fall].start && real_arm(l, fall)),
             _ => false,
         };
         let jumps: Vec<usize> = jumps.into_iter().filter(|&p| !forward_only || (forward(p, l) && sets_ret(p, l))).collect();
@@ -713,7 +754,7 @@ fn early_returns(l: &mut Lifter) {
                     // a returning arm the test jumps forward to, over the other arm: the source
                     // had the other arm first (`if (!c) { B } else { A; return x; }`), the two
                     // meet at the shared tail
-                    cfg::Term::Cond { taken, fall } if taken == p && fall != p && l.cfg.blocks[p].start > l.cfg.blocks[fall].start => tail,
+                    cfg::Term::Cond { taken, fall } if taken == p && fall != p && l.cfg.blocks[p].start > l.cfg.blocks[fall].start && real_arm(l, fall) => tail,
                     cfg::Term::Cond { taken, fall } if taken == p && fall != p => fall,
                     _ => tail,
                 },
@@ -778,6 +819,12 @@ fn shared_return_tail(l: &mut Lifter) {
     for (p, cont) in todo {
         make_return_at(l, p, cont);
     }
+}
+
+/// An arm with code of its own (not a lone `b x`, as in a compare tree's leaves): a test jumping
+/// over it to a return had that arm first in the source.
+fn real_arm(l: &Lifter, b: usize) -> bool {
+    !(l.blocks_out[b].stmts.is_empty() && matches!(l.cfg.blocks[b].term, cfg::Term::Jump(_)))
 }
 
 /// Does every path from `b` return within a small region (blocks already turned into returns,

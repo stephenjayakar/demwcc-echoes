@@ -133,15 +133,211 @@ pub fn apply(ir: &mut IrFunction, db: &TypeDb) -> usize {
     let mut n = 0;
     let mut k = 0;
     while k < ir.body.len() {
-        if let Some(()) = try_loop(ir, db, k) {
+        if try_loop(ir, db, k).or_else(|| try_index_loop(ir, db, k)).is_some() {
             n += 1;
         }
         k += 1;
     }
     if n > 0 {
         unsigned_locals(ir);
+        object_pointer_locals(ir);
+        n += push_backs(ir, db);
     }
     n
+}
+
+/// `*v.end() = x; ++v.mCount;` (the expansion of `reserved_vector::push_back`): `v.push_back(x)`,
+/// with `x` the object the element was copied from (a by-value or reference parameter).
+fn push_backs(ir: &mut IrFunction, db: &TypeDb) -> usize {
+    let mut n = 0;
+    let mut k = 0;
+    while k + 1 < ir.body.len() {
+        let hit = (|| {
+            let Stmt::Assign { dst: Expr::Load { base, offset: 0, ty }, src } = &ir.body[k] else { return None };
+            let Expr::Call { callee: Callee::Method { sig, this: obj, .. }, .. } = &**base else { return None };
+            let cls = sig.this_class.clone()?;
+            if !sig.qualified_name.ends_with("::end") {
+                return None;
+            }
+            let (t, size, _) = pointer_container(db, &cls)?;
+            if mwdec_lift::types::size_of(Some(db), ty).map(|s| s as i64) != Some(size) {
+                return None;
+            }
+            // the count increment right after: `v.mCount += 1` on the same container
+            let Expr::AddrOf(cont) = &**obj else { return None };
+            let Expr::Load { base: cb, offset: coff, .. } = &**cont else { return None };
+            let Stmt::Assign { dst: Expr::Load { base: b2, offset: o2, .. }, src: inc } = &ir.body[k + 1] else { return None };
+            if **b2 != **cb || *o2 != *coff {
+                return None;
+            }
+            let Expr::Binary { op: BinOp::Add, l, r, .. } = strip_casts(inc) else { return None };
+            if r.as_int() != Some(1) || !matches!(strip_casts(l), Expr::Load { base, offset, .. } if **base == **cb && *offset == *coff) {
+                return None;
+            }
+            // the copied object: a parameter's whole value
+            let arg = match strip_casts(src) {
+                Expr::Member { base: pb, offset: 0, .. } => match &**pb {
+                    Expr::Var(p) if matches!(ir.vars[*p].kind, VarKind::Param { .. }) => Expr::Var(*p),
+                    _ => return None,
+                },
+                e if crate::util::class_name(&t, db).is_none() => e.clone(),
+                _ => return None,
+            };
+            let ps = vec![mwdec_core::Param { name: None, ty: Type::Ref(Box::new(Type::Const(Box::new(t.clone())))) }];
+            let sig = FuncSig { qualified_name: format!("{cls}::push_back"), mangled: None, ret: Type::Void, params: ps, this_class: Some(cls.clone()), is_const: false, is_static: false, is_virtual: false, variadic: false };
+            Some(Stmt::Expr(Expr::Call { callee: Callee::Method { symbol: String::new(), sig, this: obj.clone(), qualified: false }, args: vec![arg], ret: Type::Void }))
+        })();
+        if let Some(st) = hit {
+            ir.body[k] = st;
+            ir.body.remove(k + 1);
+            n += 1;
+        }
+        k += 1;
+    }
+    n
+}
+
+/// An untyped local holding the address of an element's member object (`t = &it->second`) and
+/// used as a pointer to its class: typed so, and calls on that object go through it (the
+/// source's `CAdditiveAnimPlayback& anim = it->second;`).
+fn object_pointer_locals(ir: &mut IrFunction) {
+    let vars = ir.vars.clone();
+    for v in 0..vars.len() {
+        if vars[v].kind != VarKind::Local || !matches!(strip(&vars[v].ty), Type::Ptr(x) if matches!(strip(x), Type::Void | Type::Unknown { .. } | Type::Int { size: 1, .. } | Type::Char)) {
+            continue;
+        }
+        let defs: Vec<Expr> = ir.body.iter().flat_map(|s| collect_defs(s, v)).collect();
+        let [src] = defs.as_slice() else { continue };
+        let Expr::AddrOf(lv) = strip_casts(src) else { continue };
+        let lt = mwdec_lift::types::ty_of(lv, &vars);
+        // the class: the object's type, or that of the methods called on it
+        let mut recv: Option<String> = None;
+        Stmt::walk_exprs(&ir.body, &mut |e| {
+            if let Expr::Call { callee: Callee::Method { this, sig, .. }, .. } = e {
+                if matches!(&**this, Expr::Var(x) if *x == v) {
+                    recv = recv.clone().or(sig.this_class.clone());
+                }
+            }
+        });
+        let cls = match strip(&lt) {
+            Type::Named(c) => c.clone(),
+            _ => match recv {
+                Some(c) => c,
+                None => continue,
+            },
+        };
+        let pt = Type::Ptr(Box::new(Type::Named(cls.clone())));
+        // every use: a cast to that pointer type
+        let (mut uses, mut casts) = (0usize, 0usize);
+        let same_cls = |c: &Option<String>| c.as_deref().is_some_and(|c| mwdec_lift::sig::norm_name(c) == mwdec_lift::sig::norm_name(&cls));
+        Stmt::walk_exprs(&ir.body, &mut |e| match e {
+            Expr::Var(x) if *x == v => uses += 1,
+            Expr::Cast { ty, e } if *ty == pt && matches!(&**e, Expr::Var(x) if *x == v) => casts += 1,
+            // (a method of the class called on it)
+            Expr::Call { callee: Callee::Method { this, sig, .. }, .. } if matches!(&**this, Expr::Var(x) if *x == v) && same_cls(&sig.this_class) => casts += 1,
+            _ => {}
+        });
+        if casts == 0 || casts + 1 != uses {
+            continue;
+        }
+        ir.vars[v].ty = pt.clone();
+        let lv = (**lv).clone();
+        // reads of the object's members through the element pointer go through it too
+        let (obase, ooff) = match &lv {
+            Expr::Load { base, offset, .. } => ((**base).clone(), *offset),
+            _ => (Expr::Unknown { text: String::new(), ty: Type::Void }, i32::MIN),
+        };
+        let osize = mwdec_lift::types::size_of(None, &Type::Named(cls.clone())).unwrap_or(0) as i32;
+        let def_at = ir.body.iter().position(|s| !collect_defs(s, v).is_empty());
+        Stmt::rewrite_exprs(&mut ir.body, &mut |e| {
+            if matches!(e, Expr::Cast { ty, e: x } if *ty == pt && matches!(&**x, Expr::Var(y) if *y == v)) {
+                *e = Expr::Var(v);
+            }
+            if let Expr::Call { callee: Callee::Method { this, .. }, .. } = e {
+                if matches!(&**this, Expr::AddrOf(x) if **x == lv) {
+                    **this = Expr::Var(v);
+                }
+            }
+        });
+        if ooff != i32::MIN {
+            // (after the definition, in the same statement list)
+            let at = def_at.unwrap_or(0);
+            fn rebase(body: &mut [Stmt], v: VarId, obase: &Expr, ooff: i32, size: i32) {
+                Stmt::rewrite_exprs(body, &mut |e| {
+                    if let Expr::Load { base, offset, ty } = e {
+                        if **base == *obase && *offset > ooff && (size <= 0 || *offset < ooff + size) {
+                            *e = Expr::Load { base: Box::new(Expr::Var(v)), offset: *offset - ooff, ty: ty.clone() };
+                        }
+                    }
+                });
+            }
+            for s in ir.body.iter_mut().skip(at + 1) {
+                rebase(std::slice::from_mut(s), v, &obase, ooff, osize);
+            }
+            if let Some(Stmt::If { then, .. }) = ir.body.get_mut(at) {
+                // the definition inside an `if`: its siblings after it
+                if let Some(k) = then.iter().position(|s| !collect_defs(s, v).is_empty()) {
+                    rebase(&mut then[k + 1..], v, &obase, ooff, osize);
+                }
+            }
+        }
+    }
+}
+
+fn collect_defs(s: &Stmt, v: VarId) -> Vec<Expr> {
+    let mut out = vec![];
+    match s {
+        Stmt::Assign { dst: Expr::Var(x), src } if *x == v => out.push(src.clone()),
+        Stmt::If { then, els, .. } => {
+            for t in then.iter().chain(els) {
+                out.extend(collect_defs(t, v));
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            for t in body {
+                out.extend(collect_defs(t, v));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Marker of a rewritten list loop kept out of inline folding (see [`lists_prefold`]).
+const STASH: &str = "mwdec iterloop ";
+
+/// Rewrite list walks before inline folding (which would merge the walking pointer with its
+/// first value), keeping the rewritten loops out of the folding: each `it = l.begin(); while
+/// (...) {...}` pair is replaced by a marker until [`unstash`] puts it back.
+pub fn lists_prefold(ir: &mut IrFunction, db: &TypeDb) -> Vec<Vec<Stmt>> {
+    let mut stash = vec![];
+    let mut k = 0;
+    while k < ir.body.len() {
+        if let Some(w) = try_list_loop(ir, db, k) {
+            // (its init just before it)
+            if w >= 1 && matches!(ir.body[w], Stmt::While { .. }) {
+                k = w;
+                let pair: Vec<Stmt> = ir.body.drain(w - 1..=w).collect();
+                ir.body.insert(w - 1, Stmt::Comment(format!("{STASH}{}", stash.len())));
+                stash.push(pair);
+            }
+        }
+        k += 1;
+    }
+    if !stash.is_empty() {
+        unsigned_locals(ir);
+    }
+    stash
+}
+
+/// Put the loops [`lists_prefold`] kept aside back.
+pub fn unstash(ir: &mut IrFunction, stash: Vec<Vec<Stmt>>) {
+    for (i, pair) in stash.into_iter().enumerate().rev() {
+        let mark = format!("{STASH}{i}");
+        if let Some(at) = ir.body.iter().position(|s| matches!(s, Stmt::Comment(c) if *c == mark)) {
+            ir.body.splice(at..=at, pair);
+        }
+    }
 }
 
 /// Signed locals defined once and only read as unsigned (`(unsigned
@@ -295,5 +491,453 @@ fn try_loop(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<()> {
         w -= 1;
     }
     ir.body.insert(w, init);
+    let w = sink_param_reads(ir, w + 1);
+    as_find(ir, db, w, p, &cls, size);
+    Some(())
+}
+
+/// `it = v.begin(); while (it != v.end() && *it != x) ++it;` is `rstl::find`'s expansion:
+/// `it = rstl::find(v.begin(), v.end(), x);`.
+fn as_find(ir: &mut IrFunction, db: &TypeDb, w: usize, p: VarId, cls: &str, size: i64) -> Option<()> {
+    let Stmt::While { cond, body } = &ir.body[w] else { return None };
+    if !matches!(body.as_slice(), [Stmt::Expr(Expr::IncDec { e, .. })] if matches!(&**e, Expr::Var(x) if *x == p)) {
+        return None;
+    }
+    let Expr::Binary { op: BinOp::LogAnd, l: test, r: cmp, .. } = cond else { return None };
+    let Expr::Binary { op: BinOp::Ne, r: end, .. } = &**test else { return None };
+    let Expr::Binary { op: BinOp::Ne, l: a, r: b, .. } = strip_casts(cmp) else { return None };
+    // one side the element (its only scalar, the element's whole size), the other the value
+    let elem = |e: &Expr| matches!(strip_casts(e), Expr::Load { base, offset: 0, ty } if matches!(&**base, Expr::Var(x) if *x == p) && mwdec_lift::types::size_of(Some(db), ty).map(|s| s as i64) == Some(size));
+    let value = |e: &Expr| -> Option<Expr> {
+        if e.uses_var(p) {
+            return None;
+        }
+        match strip_casts(e) {
+            // a parameter object's only member: the object
+            Expr::Member { base, offset: 0, ty } if matches!(&**base, Expr::Var(v) if matches!(ir.vars[*v].kind, VarKind::Param { .. })) && mwdec_lift::types::size_of(Some(db), ty).map(|s| s as i64) == Some(size) => Some((**base).clone()),
+            Expr::Var(v) if matches!(ir.vars[*v].kind, VarKind::Param { .. }) => Some(e.clone()),
+            _ => None,
+        }
+    };
+    let val = if elem(a) { value(b)? } else if elem(b) { value(a)? } else { return None };
+    let Stmt::Assign { dst: Expr::Var(x), src: begin } = &ir.body[w - 1] else { return None };
+    if *x != p {
+        return None;
+    }
+    let pt = ir.vars[p].ty.clone();
+    let find = FuncSig { qualified_name: "rstl::find".into(), mangled: None, ret: pt.clone(), params: vec![], this_class: None, is_const: false, is_static: false, is_virtual: false, variadic: false };
+    let call = Expr::Call { callee: Callee::Direct { symbol: "rstl::find".into(), sig: find }, args: vec![begin.clone(), (**end).clone(), val], ret: pt };
+    let _ = cls;
+    ir.body[w - 1] = Stmt::Assign { dst: Expr::Var(p), src: call };
+    ir.body.remove(w);
+    Some(())
+}
+
+// ---------------------------------------------------------------- rstl::list
+
+/// `rstl::list<T, A>`: offsets of `mStart` and `mEnd`, and the node's `mNext` / item offsets.
+fn list_layout(db: &TypeDb, cls: &str) -> Option<(i32, i32, i32, i32)> {
+    if cls.split('<').next()?.trim() != "rstl::list" {
+        return None;
+    }
+    let c = mwdec_lift::sig::find_class(db, cls)?;
+    let off = |n: &str| c.fields.iter().find(|f| f.name == n).map(|f| f.offset as i32);
+    let (start, end) = (off("mStart")?, off("mEnd")?);
+    let (next, item) = match mwdec_lift::sig::find_class(db, &format!("{cls}::node")) {
+        Some(n) => {
+            let o = |x: &str| n.fields.iter().find(|f| f.name == x).map(|f| f.offset as i32);
+            (o("mNext").unwrap_or(4), o("mItem").unwrap_or(8))
+        }
+        None => (4, 8),
+    };
+    Some((start, end, next, item))
+}
+
+/// The list a node pointer `begin` (`l.mStart`) starts: (list lvalue, class, layout, const).
+fn list_of(ir: &IrFunction, db: &TypeDb, begin: &Expr) -> Option<(Expr, String, (i32, i32, i32, i32), bool)> {
+    let Expr::Load { base, offset, .. } = strip_casts(begin) else { return None };
+    let Expr::Var(v) = strip_casts(base) else { return None };
+    let k = *offset;
+    if Some(*v) == ir.this_var {
+        let own = ir.sig.this_class.as_deref()?;
+        let c = mwdec_lift::sig::find_class(db, own)?;
+        for f in &c.fields {
+            let ft = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
+            let Some(cls) = crate::util::class_name(&ft, db) else { continue };
+            let Some(lay) = list_layout(db, &cls) else { continue };
+            if f.offset as i32 + lay.0 == k {
+                let lv = Expr::Load { base: Box::new(Expr::Var(*v)), offset: f.offset as i32, ty: ft.clone() };
+                return Some((lv, cls, lay, ir.sig.is_const));
+            }
+        }
+        return None;
+    }
+    if matches!(ir.vars[*v].kind, VarKind::Param { .. }) {
+        let pt = ir.vars[*v].ty.clone();
+        let (inner, cst) = match &pt {
+            Type::Ref(x) | Type::Ptr(x) => (strip(x).clone(), matches!(&**x, Type::Const(_))),
+            Type::Const(x) => ((**x).clone(), true),
+            t => (t.clone(), false),
+        };
+        let cls = crate::util::class_name(&inner, db)?;
+        let lay = list_layout(db, &cls)?;
+        if lay.0 == k {
+            let lv = match &pt {
+                Type::Ptr(_) => Expr::Load { base: Box::new(Expr::Var(*v)), offset: 0, ty: inner.clone() },
+                _ => Expr::Var(*v),
+            };
+            return Some((lv, cls, lay, cst));
+        }
+    }
+    None
+}
+
+/// `(base var, offset)` of a container lvalue built by `list_of`.
+fn lv_loc(e: &Expr) -> Option<(VarId, i32)> {
+    match e {
+        Expr::Var(v) => Some((*v, 0)),
+        Expr::Load { base, offset, .. } => match strip_casts(base) {
+            Expr::Var(v) => Some((*v, *offset)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A walk over a list's nodes as an iterator loop:
+/// `for (iterator it = l.begin(); it != l.end(); ++it) { ... it->m ... return it; } return l.end();`
+fn try_list_loop(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<usize> {
+    let Stmt::While { cond, body } = &ir.body[w] else { return None };
+    let Expr::Binary { op: BinOp::Ne, l, r, .. } = cond else { return None };
+    let (a, b) = (strip_casts(l).clone(), strip_casts(r).clone());
+    // the node pointer: the local defined from the list's start
+    let mut found = None;
+    for (pv, other) in [(&a, &b), (&b, &a)] {
+        let Expr::Var(p) = pv else { continue };
+        if !matches!(ir.vars[*p].kind, VarKind::Local) {
+            continue;
+        }
+        let defs: Vec<usize> = (0..w).filter(|&i| matches!(&ir.body[i], Stmt::Assign { dst: Expr::Var(x), .. } if x == p)).collect();
+        let [d] = defs.as_slice() else { continue };
+        let Stmt::Assign { src, .. } = &ir.body[*d] else { continue };
+        if let Some(l) = list_of(ir, db, src) {
+            found = Some((*p, *d, other.clone(), l));
+            break;
+        }
+    }
+    let (p, d, end, (cont, cls, (_start, endo, next, item), cst)) = found?;
+    let (bv, boff) = lv_loc(&cont)?;
+    // the end: `l.mEnd`, directly or through a local
+    let is_end_load = |e: &Expr| matches!(strip_casts(e), Expr::Load { base, offset, .. } if matches!(strip_casts(base), Expr::Var(v) if *v == bv) && *offset == boff + endo);
+    let end_var = match &end {
+        Expr::Var(e) => {
+            let ds: Vec<usize> = (0..w).filter(|&i| matches!(&ir.body[i], Stmt::Assign { dst: Expr::Var(x), .. } if x == e)).collect();
+            let [de] = ds.as_slice() else { return None };
+            let Stmt::Assign { src, .. } = &ir.body[*de] else { return None };
+            if !is_end_load(src) {
+                return None;
+            }
+            Some((*e, *de))
+        }
+        e if is_end_load(e) => None,
+        _ => return None,
+    };
+    // not used between its definition and the loop
+    if (d + 1..w).any(|i| Some(i) != end_var.map(|x| x.1) && mentions(&ir.body[i], p)) {
+        return None;
+    }
+    let iter_cls = format!("{cls}::{}", if cst { "const_iterator" } else { "iterator" });
+    let it_ty = Type::Named(iter_cls.clone());
+    // the element type: the list's first template argument
+    let elem = cls.find('<').and_then(|i| cls.rfind('>').map(|j| &cls[i + 1..j])).and_then(|inner| mwdec_lift::sig::split_top(inner, ',').first().map(|t| mwdec_lift::sig::parse_type(t.trim()))).unwrap_or(Type::Unknown { size: 0 });
+    let elem = if cst { Type::Const(Box::new(elem)) } else { elem };
+    let elem_ptr = Type::Ptr(Box::new(elem));
+    let obj = Box::new(Expr::AddrOf(Box::new(cont.clone())));
+    let call = |name: &str| Expr::Call { callee: Callee::Method { symbol: String::new(), sig: method(&cls, name, it_ty.clone(), cst), this: obj.clone(), qualified: false }, args: vec![], ret: it_ty.clone() };
+    let arrow = Expr::Call {
+        callee: Callee::Method { symbol: String::new(), sig: FuncSig { qualified_name: format!("{iter_cls}::operator->"), mangled: None, ret: elem_ptr.clone(), params: vec![], this_class: Some(iter_cls.clone()), is_const: true, is_static: false, is_virtual: false, variadic: false }, this: Box::new(Expr::AddrOf(Box::new(Expr::Var(p)))), qualified: false },
+        args: vec![],
+        ret: elem_ptr,
+    };
+    // the loop body: `p = p->mNext` steps become `++it`, element reads `it->m`, `iterator(p)`
+    // `it`; any other use of the node pointer and the rewrite is off
+    let mut new_body = body.clone();
+    let mut ok = true;
+    let mut stepped = false;
+    fn walk_steps(b: &mut [Stmt], p: VarId, next: i32, stepped: &mut bool, ok: &mut bool) {
+        for s in b.iter_mut() {
+            let is_step = matches!(s, Stmt::Assign { dst: Expr::Var(x), src } if *x == p && matches!(strip_casts(src), Expr::Load { base, offset, .. } if matches!(strip_casts(base), Expr::Var(y) if *y == p) && *offset == next));
+            if is_step {
+                *s = Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(p)), delta: 1, post: false });
+                *stepped = true;
+                continue;
+            }
+            match s {
+                Stmt::Assign { dst: Expr::Var(x), .. } if *x == p => *ok = false,
+                Stmt::If { then, els, .. } => {
+                    walk_steps(then, p, next, stepped, ok);
+                    walk_steps(els, p, next, stepped, ok);
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => walk_steps(body, p, next, stepped, ok),
+                _ => {}
+            }
+        }
+    }
+    walk_steps(&mut new_body, p, next, &mut stepped, &mut ok);
+    if !ok || !stepped {
+        return None;
+    }
+    let rewrite = |e: &mut Expr, ok: &mut bool| {
+        e.rewrite(&mut |x| {
+            let repl = match x {
+                Expr::Load { base, offset, ty } if matches!(strip_casts(base), Expr::Var(y) if *y == p) && *offset >= item => Some(Expr::Load { base: Box::new(arrow.clone()), offset: *offset - item, ty: ty.clone() }),
+                Expr::Construct { args, .. } if matches!(args.as_slice(), [a] if matches!(strip_casts(a), Expr::Var(y) if *y == p)) => Some(Expr::Var(p)),
+                _ => None,
+            };
+            if let Some(r) = repl {
+                *x = r;
+            }
+        });
+        // (the node pointer left anywhere but as the iterator itself)
+        e.walk(&mut |x| {
+            if let Expr::Load { base, offset, .. } = x {
+                if matches!(strip_casts(base), Expr::Var(y) if *y == p) && *offset < item {
+                    *ok = false;
+                }
+            }
+        });
+    };
+    Stmt::rewrite_exprs(&mut new_body, &mut |e| rewrite(e, &mut ok));
+    if !ok {
+        return None;
+    }
+    // after the loop: the end local and `*(iterator*)&l.mEnd` are `l.end()`, element reads too
+    let end_call = call("end");
+    let mut tail: Vec<Stmt> = ir.body[w + 1..].to_vec();
+    Stmt::rewrite_exprs(&mut tail, &mut |x| {
+        x.rewrite(&mut |y| {
+            let is_end = match &*y {
+                Expr::Var(e) => end_var.is_some_and(|(v, _)| v == *e),
+                Expr::Load { base, offset, ty } => matches!(strip_casts(base), Expr::Var(v) if *v == bv) && *offset == boff + endo && crate::util::class_name(ty, db).is_some(),
+                _ => false,
+            };
+            if is_end {
+                *y = end_call.clone();
+            }
+        });
+    });
+    Stmt::rewrite_exprs(&mut tail, &mut |e| rewrite(e, &mut ok));
+    if !ok {
+        return None;
+    }
+    let mut cond_ok = true;
+    // (the body may not read the end local)
+    if let Some((e, _)) = end_var {
+        cond_ok = !new_body.iter().any(|s| mentions(s, e));
+    }
+    if !cond_ok {
+        return None;
+    }
+    ir.vars[p].ty = it_ty.clone();
+    ir.body.truncate(w + 1);
+    ir.body.extend(tail);
+    ir.body[w] = Stmt::While { cond: Expr::Binary { op: BinOp::Ne, l: Box::new(Expr::Var(p)), r: Box::new(call("end")), ty: Type::Bool }, body: new_body };
+    let mut gone = vec![d];
+    if let Some((_, de)) = end_var {
+        gone.push(de);
+    }
+    gone.sort_unstable();
+    let mut w = w;
+    for &i in gone.iter().rev() {
+        ir.body.remove(i);
+        w -= 1;
+    }
+    ir.body.insert(w, Stmt::Assign { dst: Expr::Var(p), src: call("begin") });
+    // (returns where the loop ends up)
+    Some(sink_param_reads(ir, w + 1))
+}
+
+/// Locals set before the loop at `w` from a by-value parameter's member (`t = id.value`) and used
+/// only in the loop: read where used, as the source's `it->m == id` does.
+fn sink_param_reads(ir: &mut IrFunction, w: usize) -> usize {
+    let mut i = 0;
+    let mut w = w;
+    while i < w {
+        let Stmt::Assign { dst: Expr::Var(t), src } = &ir.body[i] else {
+            i += 1;
+            continue;
+        };
+        let (t, src) = (*t, src.clone());
+        let param_read = match &src {
+            Expr::Member { base, .. } => matches!(&**base, Expr::Var(v) if matches!(ir.vars[*v].kind, VarKind::Param { .. })),
+            _ => false,
+        };
+        let only_loop = ir.vars[t].kind == VarKind::Local && ir.body.iter().enumerate().all(|(k, s)| k == i || k == w || !mentions(s, t));
+        let single = {
+            let mut n = 0;
+            Stmt::walk_exprs(&ir.body, &mut |e| n += matches!(e, Expr::Var(x) if *x == t) as usize);
+            n >= 2
+        };
+        if !(param_read && only_loop && single) {
+            i += 1;
+            continue;
+        }
+        ir.body.remove(i);
+        w -= 1;
+        Stmt::rewrite_exprs(std::slice::from_mut(&mut ir.body[w]), &mut |e| {
+            if matches!(e, Expr::Var(x) if *x == t) {
+                *e = src.clone();
+            }
+        });
+    }
+    w
+}
+
+// ---------------------------------------------------------------- index loops over vectors
+
+/// `rstl::vector<T, A>`: offsets of `mCount` and `mItems`, and the element size.
+fn vector_layout(db: &TypeDb, cls: &str) -> Option<(i32, i32, Type)> {
+    if cls.split('<').next()?.trim() != "rstl::vector" {
+        return None;
+    }
+    let c = mwdec_lift::sig::find_class(db, cls)?;
+    let off = |n: &str| c.fields.iter().find(|f| f.name == n).map(|f| f.offset as i32);
+    let inner = &cls[cls.find('<')? + 1..cls.rfind('>')?];
+    let t = mwdec_lift::sig::parse_type(mwdec_lift::sig::split_top(inner, ',').first()?.trim());
+    Some((off("mCount")?, off("mItems")?, t))
+}
+
+/// `(this, member offset, class)` of the vector member whose field at `k` (from `this`) is read.
+fn vector_member_at(ir: &IrFunction, db: &TypeDb, e: &Expr, field: fn(&(i32, i32, Type)) -> i32) -> Option<(Expr, String, (i32, i32, Type))> {
+    let Expr::Load { base, offset, .. } = strip_casts(e) else { return None };
+    let Expr::Var(v) = strip_casts(base) else { return None };
+    if Some(*v) != ir.this_var {
+        return None;
+    }
+    let own = ir.sig.this_class.as_deref()?;
+    let c = mwdec_lift::sig::find_class(db, own)?;
+    for f in &c.fields {
+        let ft = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
+        let Some(cls) = crate::util::class_name(&ft, db) else { continue };
+        let Some(lay) = vector_layout(db, &cls) else { continue };
+        if f.offset as i32 + field(&lay) == *offset {
+            return Some((Expr::Load { base: Box::new(Expr::Var(*v)), offset: f.offset as i32, ty: ft.clone() }, cls, lay));
+        }
+    }
+    None
+}
+
+fn def_of(ir: &IrFunction, upto: usize, v: VarId) -> Option<(usize, Expr)> {
+    let ds: Vec<usize> = (0..upto).filter(|&i| matches!(&ir.body[i], Stmt::Assign { dst: Expr::Var(x), .. } if *x == v)).collect();
+    let [d] = ds.as_slice() else { return None };
+    let Stmt::Assign { src, .. } = &ir.body[*d] else { return None };
+    Some((*d, src.clone()))
+}
+
+/// An index loop over a vector member with the element address strength-reduced to a byte
+/// offset (`o += sizeof(T)` beside `++i`): `v[i]`, `i < v.size()`, the offset gone.
+fn try_index_loop(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<()> {
+    let Stmt::While { cond, body } = &ir.body[w] else { return None };
+    let Expr::Binary { op: BinOp::Lt, l, r, .. } = cond else { return None };
+    let Expr::Var(i) = strip_casts(l) else { return None };
+    let i = *i;
+    // the bound: the vector's count (directly or through a local)
+    let (n_def, bound) = match strip_casts(r) {
+        Expr::Var(n) => {
+            let (d, src) = def_of(ir, w, *n)?;
+            (Some((*n, d)), src)
+        }
+        e => (None, e.clone()),
+    };
+    let (cont, cls, (_, _, t)) = vector_member_at(ir, db, &bound, |l| l.0)?;
+    let size = mwdec_lift::types::size_of(Some(db), &t)? as i64;
+    // the steps at the end of the body: `o += size` and `i += 1` (either order)
+    let step_of = |s: &Stmt| match s {
+        Stmt::Assign { dst: Expr::Var(x), src } => match strip_casts(src) {
+            Expr::Binary { op: BinOp::Add, l, r, .. } if matches!(strip_casts(l), Expr::Var(y) if y == x) => Some((*x, r.as_int()?)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let k = body.len();
+    if k < 2 {
+        return None;
+    }
+    let (s1, s2) = (step_of(&body[k - 2])?, step_of(&body[k - 1])?);
+    let (o, so) = if s1.0 == i { s2 } else { s1 };
+    if (s1.0 != i && s2.0 != i) || so != size || o == i {
+        return None;
+    }
+    if [s1, s2].iter().find(|s| s.0 == i)?.1 != 1 {
+        return None;
+    }
+    // i and o start at 0; the data pointer is the vector's
+    let (di, si) = def_of(ir, w, i)?;
+    let (dof, so0) = def_of(ir, w, o)?;
+    if si.as_int() != Some(0) || so0.as_int() != Some(0) {
+        return None;
+    }
+    // the element pointer `(char*)base + o` / `&((char*)base)[o]` with base the data pointer
+    let mut base_var = None;
+    for s in &body[..k - 2] {
+        Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+            if let Expr::Index { base, index, .. } = e {
+                if matches!(strip_casts(index), Expr::Var(x) if *x == o) {
+                    if let Expr::Var(b) = strip_casts(base) {
+                        base_var = Some(*b);
+                    }
+                }
+            }
+        });
+    }
+    let b = base_var?;
+    let (db_, bsrc) = def_of(ir, w, b)?;
+    let (bcont, _, _) = vector_member_at(ir, db, &bsrc, |l| l.1)?;
+    if bcont != cont {
+        return None;
+    }
+    // nothing else uses o or the data pointer
+    let mut body2: Vec<Stmt> = body[..k - 2].to_vec();
+    let istep = if s1.0 == i { body[k - 2].clone() } else { body[k - 1].clone() };
+    let obj = Box::new(Expr::AddrOf(Box::new(cont.clone())));
+    let elem = Expr::Call {
+        callee: Callee::Method { symbol: String::new(), sig: FuncSig { qualified_name: format!("{cls}::operator[]"), mangled: None, ret: Type::Ref(Box::new(t.clone())), params: vec![mwdec_core::Param { name: None, ty: Type::Int { size: 4, signed: true } }], this_class: Some(cls.clone()), is_const: ir.sig.is_const, is_static: false, is_virtual: false, variadic: false }, this: obj.clone(), qualified: false },
+        args: vec![Expr::Var(i)],
+        ret: Type::Ref(Box::new(t.clone())),
+    };
+    let mut ok = true;
+    Stmt::rewrite_exprs(&mut body2, &mut |e| {
+        e.rewrite(&mut |x| {
+            let hit = matches!(x, Expr::AddrOf(y) if matches!(&**y, Expr::Index { base, index, .. } if matches!(strip_casts(base), Expr::Var(v) if *v == b) && matches!(strip_casts(index), Expr::Var(v) if *v == o)));
+            if hit {
+                *x = Expr::AddrOf(Box::new(elem.clone()));
+            }
+        });
+    });
+    Stmt::walk_exprs(&body2, &mut |e| ok &= !matches!(e, Expr::Var(v) if *v == o || *v == b));
+    if !ok {
+        return None;
+    }
+    // (o, the data pointer and the bound local used nowhere else)
+    let others = |v: VarId, skip: &[usize]| ir.body.iter().enumerate().any(|(j, s)| j != w && !skip.contains(&j) && mentions(s, v));
+    if others(o, &[dof]) || others(b, &[db_]) || n_def.is_some_and(|(n, d)| others(n, &[d])) {
+        return None;
+    }
+    body2.push(istep);
+    let size_call = Expr::Call { callee: Callee::Method { symbol: String::new(), sig: method(&cls, "size", Type::Int { size: 4, signed: true }, true), this: obj, qualified: false }, args: vec![], ret: Type::Int { size: 4, signed: true } };
+    ir.body[w] = Stmt::While { cond: Expr::Binary { op: BinOp::Lt, l: Box::new(Expr::Var(i)), r: Box::new(size_call), ty: Type::Bool }, body: body2 };
+    // the counter starts right before the loop; the offset, data pointer and bound go
+    let mut gone = vec![dof, db_, di];
+    if let Some((_, d)) = n_def {
+        gone.push(d);
+    }
+    gone.sort_unstable();
+    gone.dedup();
+    let mut w = w;
+    for &j in gone.iter().rev() {
+        ir.body.remove(j);
+        w -= 1;
+    }
+    ir.body.insert(w, Stmt::Assign { dst: Expr::Var(i), src: Expr::int(0) });
     Some(())
 }

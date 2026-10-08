@@ -180,6 +180,39 @@ impl<'a, 'e> M<'a, 'e> {
         self.env.defs
     }
 
+    /// Every dead-store pattern of the template has a distinct target dead store of its size
+    /// whose value matches under the current bindings; the number matched.
+    fn dead_stores_match(&self) -> Option<usize> {
+        TARGET_DEAD.with(|d| {
+            let d = d.borrow();
+            let mut used: Vec<usize> = vec![];
+            for (size, pat) in &self.t.dead {
+                let found = d.iter().enumerate().find(|(k, (sz, v))| {
+                    if used.contains(k) || sz != size {
+                        return false;
+                    }
+                    let mut m2 = M { env: self.env, t: self.t, b: self.b.clone(), folded: vec![] };
+                    if m2.m(pat, v) {
+                        return true;
+                    }
+                    // a member of a named object read through its address, as stores see it
+                    let mut v2 = v.clone();
+                    v2.rewrite(&mut |x| {
+                        if let Expr::Member { base, offset, ty } = x {
+                            if matches!(**base, Expr::Global { .. } | Expr::Var(_)) {
+                                *x = Expr::Load { base: Box::new(Expr::AddrOf(base.clone())), offset: *offset, ty: ty.clone() };
+                            }
+                        }
+                    });
+                    let mut m3 = M { env: self.env, t: self.t, b: self.b.clone(), folded: vec![] };
+                    v2 != *v && m3.m(pat, &v2)
+                });
+                used.push(found?.0);
+            }
+            Some(used.len())
+        })
+    }
+
     /// Bind object hole `h` to an address (unifying with components bound before).
     fn bind_addr(&mut self, h: usize, addr: Expr) -> bool {
         let defs = self.defs();
@@ -233,8 +266,21 @@ impl<'a, 'e> M<'a, 'e> {
         }
         if let Expr::Var(h) = p {
             if matches!(self.t.holes.get(*h), Some(HoleKind::ScalarRef(_))) {
-                // the reference itself (an address) is not supported
-                return false;
+                // the referenced value (how the probe's reference parameter reads): bound to the
+                // lvalue read, or to the literal the compiler made for a constant argument
+                let rt = res(t, defs);
+                let ok = matches!(rt, Expr::Load { .. } | Expr::Member { .. } | Expr::Global { .. }) || literal_value(rt, &Type::Unknown { size: 4 }, self.env.db).is_some();
+                if !ok {
+                    return false;
+                }
+                return match &self.b[*h] {
+                    None => {
+                        self.b[*h] = Some(Bind::Val(rt.clone()));
+                        true
+                    }
+                    Some(Bind::Val(x)) => teq(x, rt, defs),
+                    _ => false,
+                };
             }
         }
         // the address of (a member of) an object hole: compare canonical addresses
@@ -272,7 +318,15 @@ impl<'a, 'e> M<'a, 'e> {
                     true
                 }
                 Some(Bind::Comps(m)) => match m.get(&off) {
-                    Some(x) => teq(x, t, defs),
+                    // (the same member reached through another pointer to the object)
+                    Some(x) => {
+                        let x = x.clone();
+                        teq(&x, t, defs) || {
+                            let a = crate::addr::access(res(&x, defs), self.env);
+                            let b = crate::addr::access(rt, self.env);
+                            matches!((a, b), (Some((p1, o1)), Some((p2, o2))) if o1 == o2 && teq(&p1, &p2, defs))
+                        }
+                    }
                     None => {
                         m.insert(off, t.clone());
                         true
@@ -291,6 +345,13 @@ impl<'a, 'e> M<'a, 'e> {
             if let Some(HoleKind::Scalar(ty)) = self.t.holes.get(*h) {
                 if !compat(ty, &ty_of(rt, self.env.vars), self.env.db) {
                     return false;
+                }
+            }
+            if let Some(HoleKind::Obj { ptr: false, .. }) = self.t.holes.get(*h) {
+                // a reference parameter used as the object itself (`*this = other`): bound to
+                // the object's address
+                if matches!(rt, Expr::Load { .. } | Expr::Member { .. } | Expr::Global { .. }) && matches!(strip(&ty_of(rt, self.env.vars)), Type::Named(_)) {
+                    return self.bind_addr(*h, Expr::AddrOf(Box::new(rt.clone())));
                 }
             }
             if matches!(self.t.holes.get(*h), Some(HoleKind::Obj { .. })) {
@@ -349,9 +410,28 @@ impl<'a, 'e> M<'a, 'e> {
                 (Expr::Str { bytes }, Expr::Str { bytes: b2 }) => bytes == b2,
                 (Expr::AddrOf(a), Expr::AddrOf(b)) => self.m(a, b),
                 (Expr::Load { base, offset, ty }, Expr::Load { base: b2, offset: o2, ty: t2 }) | (Expr::Member { base, offset, ty }, Expr::Member { base: b2, offset: o2, ty: t2 }) => {
-                    offset == o2 && compat(ty, t2, self.env.db) && self.m(base, b2)
+                    if !compat(ty, t2, self.env.db) {
+                        return false;
+                    }
+                    let snap = self.b.clone();
+                    if offset == o2 && self.m(base, b2) {
+                        return true;
+                    }
+                    self.b = snap;
+                    // the same address summed differently (`p->a[i]` vs `(q + 0x10000) + i*2 + 0x3f34`)
+                    matches!(p, Expr::Load { .. }) && self.m_linear(base, *offset as i64, b2, *o2 as i64)
                 }
-                (Expr::Index { base, index, .. }, Expr::Index { base: b2, index: i2, .. }) => self.m(base, b2) && self.m(index, i2),
+                (Expr::Index { base, index, ty }, Expr::Index { base: b2, index: i2, ty: t2 }) => {
+                    let snap = self.b.clone();
+                    if self.m(base, b2) && self.m(index, i2) {
+                        return true;
+                    }
+                    self.b = snap;
+                    compat(ty, t2, self.env.db) && self.m_linear(&Expr::AddrOf(Box::new(p.clone())), 0, &Expr::AddrOf(Box::new(t.clone())), 0)
+                }
+                (Expr::Index { ty, .. }, Expr::Load { base: b2, offset: o2, ty: t2 }) if compat(ty, t2, self.env.db) => self.m_linear(&Expr::AddrOf(Box::new(p.clone())), 0, b2, *o2 as i64),
+                // an element access spelled as indexing on one side and as an address sum on the other
+                (Expr::Load { base, offset, ty }, Expr::Index { ty: t2, .. }) if compat(ty, t2, self.env.db) => self.m_linear(base, *offset as i64, &Expr::AddrOf(Box::new(t.clone())), 0),
                 (Expr::Ternary { c, t: a, f, .. }, Expr::Ternary { c: c2, t: a2, f: f2, .. }) => self.m(c, c2) && self.m(a, a2) && self.m(f, f2),
                 (Expr::Call { callee, args, .. }, Expr::Call { callee: c2, args: a2, .. }) => {
                     if args.len() != a2.len() {
@@ -370,11 +450,77 @@ impl<'a, 'e> M<'a, 'e> {
         }
     }
 
+    /// Match two addresses as sums of terms plus a constant: one unbound pointer hole of the
+    /// pattern takes the matching target pointer term plus the constant difference; the other
+    /// terms pair up with equal scales.
+    fn m_linear(&mut self, pb: &Expr, po: i64, tb: &Expr, to: i64) -> bool {
+        let mut pt = vec![];
+        let mut pc = po;
+        if !linear(pb, 1, &mut pt, &mut pc, None, 0) {
+            return false;
+        }
+        let mut tt = vec![];
+        let mut tc = to;
+        if !linear(tb, 1, &mut tt, &mut tc, Some(self.defs()), 0) {
+            return false;
+        }
+        if pt.len() != tt.len() || pt.len() < 2 || pt.len() > 4 {
+            return false;
+        }
+        // the pattern's pointer hole
+        let Some(hi) = pt.iter().position(|(e, s)| *s == 1 && matches!(e, Expr::Var(h) if matches!(self.t.holes.get(*h), Some(HoleKind::Obj { ptr: true, .. })) && self.b[*h].is_none())) else { return false };
+        let Expr::Var(h) = pt[hi].0.clone() else { return false };
+        let HoleKind::Obj { class, .. } = self.t.holes[h].clone() else { return false };
+        let snap = self.b.clone();
+        for ti in 0..tt.len() {
+            if tt[ti].1 != 1 || vclass(&ty_of(res(&tt[ti].0, self.defs()), self.env.vars), self.env.db) != 2 {
+                continue;
+            }
+            self.b = snap.clone();
+            // an object of the hole's class must live there (instantiations differing only in
+            // a size parameter expand alike)
+            let (cb, co) = crate::addr::canon_ptr(&tt[ti].0, self.env);
+            let Some((addr, _)) = crate::addr::object_at(&cb, co + (tc - pc) as i32, &class, self.env) else { continue };
+            if !self.bind_addr(h, addr) {
+                continue;
+            }
+            let rest_p: Vec<&(Expr, i64)> = pt.iter().enumerate().filter(|(k, _)| *k != hi).map(|(_, x)| x).collect();
+            let rest_t: Vec<&(Expr, i64)> = tt.iter().enumerate().filter(|(k, _)| *k != ti).map(|(_, x)| x).collect();
+            if self.pair_terms(&rest_p, &rest_t) {
+                return true;
+            }
+        }
+        self.b = snap;
+        false
+    }
+
+    fn pair_terms(&mut self, p: &[&(Expr, i64)], t: &[&(Expr, i64)]) -> bool {
+        let Some((first, rest)) = p.split_first() else { return t.is_empty() };
+        for k in 0..t.len() {
+            if t[k].1 != first.1 {
+                continue;
+            }
+            let snap = self.b.clone();
+            if self.m(&first.0, &t[k].0) {
+                let others: Vec<&(Expr, i64)> = t.iter().enumerate().filter(|(j, _)| *j != k).map(|(_, x)| *x).collect();
+                if self.pair_terms(rest, &others) {
+                    return true;
+                }
+            }
+            self.b = snap;
+        }
+        false
+    }
+
     /// Turn bindings into call arguments (hole order) and the score of nested explanations.
     /// `depth` bounds nested explanations.
     pub fn finalize(&self, depth: u32) -> Option<(Vec<Expr>, i32)> {
         let mut out = vec![];
         let mut score = 0;
+        // the dead frame stores the expansion leaves must be in the target too
+        if !self.t.dead.is_empty() {
+            score += self.dead_stores_match()? as i32 * 2;
+        }
         for (h, k) in self.t.holes.iter().enumerate() {
             if matches!(k, HoleKind::Local) {
                 continue;
@@ -382,7 +528,11 @@ impl<'a, 'e> M<'a, 'e> {
             let b = self.b[h].as_ref()?;
             match (k, b) {
                 (HoleKind::Scalar(_), Bind::Val(e)) => out.push(e.clone()),
-                (HoleKind::ScalarRef(_), Bind::Val(e)) => out.push(Expr::AddrOf(Box::new(e.clone()))),
+                (HoleKind::ScalarRef(t), Bind::Val(e)) => match literal_value(e, t, self.env.db) {
+                    // a literal the compiler made for a constant argument: the constant
+                    Some(v) => out.push(v),
+                    None => out.push(Expr::AddrOf(Box::new(e.clone()))),
+                },
                 // a null pointer argument (`T(id, nullptr, ...)`), not `this`
                 (HoleKind::Obj { class, ptr: true, .. }, Bind::Val(Expr::Int { value: 0, .. })) if !(h == 0 && matches!(self.t.kind, CallKind::Method)) => {
                     out.push(Expr::Int { value: 0, ty: Type::Ptr(Box::new(Type::Named(class.clone()))) });
@@ -803,7 +953,8 @@ pub fn index(lib: &InlineLib) -> Index {
                 refs.push(i);
             }
             Shape::Scalar(p) => {
-                if t.ops >= 1 && !matches!(p, Expr::Var(_) | Expr::Load { .. } | Expr::Member { .. } | Expr::AddrOf(_) | Expr::Cast { .. }) {
+                // (a plain read only with the dead stores of a by-value class to tell it apart)
+                if (t.ops >= 1 && !matches!(p, Expr::Var(_) | Expr::Load { .. } | Expr::Member { .. } | Expr::AddrOf(_) | Expr::Cast { .. })) || !t.dead.is_empty() {
                     scalars.push(i);
                     if crate::cflow::has_cflow(p) {
                         cflow.push(i);
@@ -818,7 +969,7 @@ pub fn index(lib: &InlineLib) -> Index {
                 groups.push(i);
             }
             Shape::Mutate { comps, .. } => {
-                if !comps.is_empty() && t.ops >= 1 {
+                if !comps.is_empty() && (t.ops >= 1 || !t.dead.is_empty()) {
                     groups.push(i);
                 }
             }
@@ -827,7 +978,7 @@ pub fn index(lib: &InlineLib) -> Index {
     }
     let key = |i: &usize| {
         let t = &lib.templates[*i];
-        (std::cmp::Reverse(t.ops), matches!(t.kind, CallKind::Ctor) as u8, t.holes.len(), !t.name.contains("operator"), *i)
+        (t.guessed, std::cmp::Reverse(t.ops), matches!(t.kind, CallKind::Ctor) as u8, t.holes.len(), !t.name.contains("operator"), *i)
     };
     scalars.sort_by_key(key);
     cflow.sort_by_key(key);
@@ -841,10 +992,56 @@ pub fn index(lib: &InlineLib) -> Index {
 }
 
 pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
+    TARGET_DEAD.with(|d| *d.borrow_mut() = ir.dead_stores.iter().map(|x| (x.size, x.value.clone())).collect());
+    LITERALS.with(|d| *d.borrow_mut() = ir.literal_bytes.iter().cloned().collect());
+    let n = apply_inner(ir, lib, db);
+    TARGET_DEAD.with(|d| d.borrow_mut().clear());
+    LITERALS.with(|d| d.borrow_mut().clear());
+    n
+}
+
+thread_local! {
+    /// Bytes of the function's literal symbols while it is being rewritten.
+    static LITERALS: std::cell::RefCell<HashMap<String, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The value of literal symbol read `e` (`@N`, a splitter-named pool word) as type `t`.
+fn literal_value(e: &Expr, t: &Type, db: &TypeDb) -> Option<Expr> {
+    let sym = match e {
+        Expr::Global { symbol, .. } => symbol,
+        Expr::Load { base, offset: 0, .. } => match &**base {
+            Expr::AddrOf(g) => match &**g {
+                Expr::Global { symbol, .. } => symbol,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let b = LITERALS.with(|l| l.borrow().get(sym).cloned())?;
+    let r = mwdec_lift::types::resolve(Some(db), strip(t)).into_owned();
+    match (strip(&r), b.len()) {
+        (Type::Float { size: 4 }, 4) => Some(Expr::Float { bits: u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64, double: false }),
+        (Type::Float { size: 8 }, 8) => Some(Expr::Float { bits: u64::from_be_bytes(b[..8].try_into().ok()?), double: true }),
+        (Type::Int { size: 4, .. } | Type::Long { .. } | Type::Named(_), 4) => Some(Expr::Int { value: i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64, ty: strip(t).clone() }),
+        _ => None,
+    }
+}
+
+thread_local! {
+    /// The function's dead frame stores (size, value) while it is being rewritten.
+    static TARGET_DEAD: std::cell::RefCell<Vec<(u32, Expr)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     // members' own constructors' stores at the start of a constructor body are implicit
     let (stripped, pending) = if std::env::var("MWDI_NO_CTORS").is_ok() { (0, Default::default()) } else { crate::defctor::strip(ir, db, &lib.default_ctors) };
     let stripped = stripped + crate::defctor::copy_ctor_inits(ir, db, &lib.copy_ctors);
+    // list loops, before folding can merge the walking pointer with its first value
+    let stash = if std::env::var("MWDI_NO_ITERLOOPS").is_err() { crate::iterloops::lists_prefold(ir, db) } else { vec![] };
+    let stripped = stripped + stash.len();
     if lib.templates.is_empty() {
+        crate::iterloops::unstash(ir, stash);
         return stripped + crate::defctor::finish(ir, db, &pending);
     }
     let idx = index(lib);
@@ -882,10 +1079,13 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
             }
         }
     }
+    crate::iterloops::unstash(ir, stash);
     // loops over pointer-iterated containers, as iterator loops
     if std::env::var("MWDI_NO_ITERLOOPS").is_err() {
         total += crate::iterloops::apply(ir, db);
     }
+    // container forwarders and negated predicates (`stmtinl`)
+    total += crate::stmtinl::apply(ir, lib, db);
     // members built explicitly, now that their values are folded calls
     total += crate::defctor::finish(ir, db, &pending);
     if total > 0 {
@@ -896,7 +1096,9 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         crate::post::forward_cond_temps(&mut ir.body, &ir.vars);
         crate::post::return_values(&mut ir.body, &ir.vars);
         crate::post::forward_temps_into_folded(&mut ir.body, &ir.vars);
+        crate::post::fold_flag_chains(&mut ir.body, &ir.vars);
     }
+    crate::stmtinl::finish(ir);
     total
 }
 
@@ -1019,6 +1221,12 @@ fn root_ok(p: &Expr, t: &Expr) -> bool {
 }
 
 fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
+    // an accessor chain folded into one load (`front().get()`: `composed`)
+    if crate::composed::try_split(e, env) {
+        if let Expr::Load { base, .. } = e {
+            return 1 + scalar_expr(base, env, idx);
+        }
+    }
     // a one-member object rebuilt from the member of another one (`TUniqueId(ids[i].value)`,
     // a by-value argument in a register): that object
     if let Expr::Construct { class, args, .. } = &*e {
@@ -1234,4 +1442,75 @@ pub fn dce(body: &mut Vec<Stmt>, vars: &[Var]) {
             break;
         }
     }
+}
+
+/// Decompose an address into scaled terms and a constant (false when it isn't a sum).
+/// Target temps are looked through (`defs`) when their definition is itself a sum.
+fn linear(e: &Expr, scale: i64, terms: &mut Vec<(Expr, i64)>, c: &mut i64, defs: Option<&Defs>, depth: u32) -> bool {
+    if depth > 12 || terms.len() > 6 {
+        return false;
+    }
+    match e {
+        Expr::Int { value, .. } => {
+            *c += value * scale;
+            true
+        }
+        Expr::Binary { op: BinOp::Add, l, r, .. } => linear(l, scale, terms, c, defs, depth + 1) && linear(r, scale, terms, c, defs, depth + 1),
+        Expr::Binary { op: BinOp::Sub, l, r, .. } if matches!(**r, Expr::Int { .. }) => linear(l, scale, terms, c, defs, depth + 1) && linear(r, -scale, terms, c, defs, depth + 1),
+        // constant scaling folds into the term's scale (`i << 1`, `i * 12`)
+        Expr::Binary { op: BinOp::Shl, l, r, .. } if matches!(**r, Expr::Int { value: 0..=8, .. }) => {
+            let Expr::Int { value: k, .. } = **r else { return false };
+            linear(l, scale << k, terms, c, defs, depth + 1)
+        }
+        Expr::Binary { op: BinOp::Mul, l, r, .. } if matches!(**r, Expr::Int { .. }) => {
+            let Expr::Int { value: k, .. } = **r else { return false };
+            linear(l, scale * k, terms, c, defs, depth + 1)
+        }
+        Expr::Cast { ty, e: inner } if matches!(strip(ty), Type::Ptr(_) | Type::Int { size: 4, .. }) => linear(inner, scale, terms, c, defs, depth + 1),
+        Expr::AddrOf(x) => match &**x {
+            Expr::Load { base, offset, .. } => {
+                *c += *offset as i64 * scale;
+                linear(base, scale, terms, c, defs, depth + 1)
+            }
+            Expr::Index { base, index, ty } => {
+                let Some(sz) = mwdec_lift::scalar_size(ty) else { return false };
+                linear(base, scale, terms, c, defs, depth + 1) && linear_index(index, scale * sz as i64, terms, c, depth)
+            }
+            _ => {
+                terms.push((e.clone(), scale));
+                true
+            }
+        },
+        Expr::Var(_) => {
+            if let Some(d) = defs {
+                let r = res(e, d);
+                if r != e && matches!(r, Expr::Binary { op: BinOp::Add | BinOp::Sub, .. } | Expr::Cast { .. }) {
+                    return linear(r, scale, terms, c, defs, depth + 1);
+                }
+            }
+            terms.push((e.clone(), scale));
+            true
+        }
+        _ => {
+            terms.push((e.clone(), scale));
+            true
+        }
+    }
+}
+
+/// An index term: a constant shift or multiplier folds into the scale.
+fn linear_index(e: &Expr, scale: i64, terms: &mut Vec<(Expr, i64)>, c: &mut i64, _depth: u32) -> bool {
+    match e {
+        Expr::Int { value, .. } => *c += value * scale,
+        Expr::Binary { op: BinOp::Shl, l, r, .. } if matches!(**r, Expr::Int { value: 0..=8, .. }) => {
+            let Expr::Int { value: k, .. } = **r else { return false };
+            return linear_index(l, scale << k, terms, c, _depth);
+        }
+        Expr::Binary { op: BinOp::Mul, l, r, .. } if matches!(**r, Expr::Int { .. }) => {
+            let Expr::Int { value: k, .. } = **r else { return false };
+            return linear_index(l, scale * k, terms, c, _depth);
+        }
+        _ => terms.push((e.clone(), scale)),
+    }
+    true
 }

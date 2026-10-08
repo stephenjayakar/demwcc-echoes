@@ -336,11 +336,18 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
             let mut done = false;
             for h in &heads {
                 for (v, cls) in temp_args(h, vars, db) {
+                    let mut built_override: Option<Expr> = None;
                     // the stores right before the call
                     let mut stores: Vec<(usize, i32, u32, Expr)> = vec![];
+                    // members constructed in place by a (non-inline) constructor call
+                    let mut mcalls: Vec<(usize, i32, FuncSig, Vec<Expr>)> = vec![];
                     let mut k = j;
                     while k > 0 {
                         k -= 1;
+                        if let Some((off, cs, cargs)) = member_ctor_call(&b[k], v) {
+                            mcalls.push((k, off, cs, cargs));
+                            continue;
+                        }
                         match &b[k] {
                             Stmt::Assign { dst: Expr::Member { base, offset, ty }, src } if matches!(**base, Expr::Var(x) if x == v) => {
                                 stores.push((k, *offset, scalar_size(ty).unwrap_or(0), src.clone()));
@@ -352,12 +359,20 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
                             _ => break,
                         }
                     }
-                    if stores.is_empty() || total.get(&v).copied().unwrap_or(0) != stores.len() + count_var(std::slice::from_ref(&b[j]), v) || count_var(std::slice::from_ref(&b[j]), v) != 1 {
+                    if (stores.is_empty() && mcalls.is_empty()) || total.get(&v).copied().unwrap_or(0) != stores.len() + mcalls.len() + count_var(std::slice::from_ref(&b[j]), v) || count_var(std::slice::from_ref(&b[j]), v) != 1 {
                         continue;
                     }
+                    if !mcalls.is_empty() {
+                        // only a constructor accounting for the member constructions will do
+                        let flat: Vec<(i32, Expr)> = stores.iter().map(|s| (s.1, s.3.clone())).collect();
+                        let calls: Vec<(i32, FuncSig, Vec<Expr>)> = mcalls.iter().map(|m| (m.1, m.2.clone(), m.3.clone())).collect();
+                        let Some(c) = build_with_member_calls(db, &cls, &flat, &calls) else { continue };
+                        stores.extend(mcalls.iter().map(|m| (m.0, m.1, 0, Expr::Int { value: 0, ty: Type::Void })));
+                        built_override = Some(c);
+                    }
                     let slots = member_slots(db, &cls);
-                    let mut built = None;
-                    for (s, fields) in ctors(db, &cls) {
+                    let mut built = built_override.take();
+                    for (s, fields) in ctors(db, &cls).into_iter().filter(|_| built.is_none()) {
                         if fields.len() != stores.len() {
                             continue;
                         }
@@ -395,7 +410,7 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
                     }
                     // otherwise a constructor setting some members from parameters (nested
                     // objects too); the other stores must be its own constants
-                    if built.is_none() {
+                    if built.is_none() && mcalls.is_empty() {
                         let flat: Vec<(i32, Expr)> = stores.iter().map(|s| (s.1, s.3.clone())).collect();
                         let mut offs: Vec<i32> = flat.iter().map(|s| s.0).collect();
                         offs.sort_unstable();
@@ -448,6 +463,122 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
             j += 1;
         }
     });
+}
+
+/// Does construction `e` run out-of-line code (a member constructed by a call)? See
+/// [`build_with_member_calls`].
+pub fn runs_code(e: &Expr) -> bool {
+    matches!(e, Expr::Construct { ctor: Some(s), .. } if s.is_virtual)
+}
+
+/// `&v.m->M(args)`: a member of stack object `v` at offset `off` constructed in place by a
+/// constructor call (offset, constructor, arguments).
+fn member_ctor_call(s: &Stmt, v: VarId) -> Option<(i32, FuncSig, Vec<Expr>)> {
+    let Stmt::Expr(Expr::Call { callee: Callee::Method { sig: cs, this, .. }, args, .. }) = s else { return None };
+    if !sig::is_ctor(cs) {
+        return None;
+    }
+    let Expr::AddrOf(x) = &**this else { return None };
+    let off = match &**x {
+        Expr::Member { base, offset, .. } if matches!(**base, Expr::Var(w) if w == v) => *offset,
+        _ => return None,
+    };
+    Some((off, cs.clone(), args.clone()))
+}
+
+/// Does literal token text `lit` (`1.f`, `0`, `- 1`) have the value of `e`?
+fn literal_is(lit: &str, e: &Expr) -> bool {
+    let t: String = lit.split_whitespace().collect();
+    let t = t.trim_end_matches(|c| c == 'f' || c == 'F');
+    match e {
+        Expr::Int { value, .. } => t.parse::<i64>().ok() == Some(*value),
+        Expr::Float { bits, double } => t.parse::<f64>().ok().is_some_and(|x| if *double { x.to_bits() == *bits } else { (x as f32).to_bits() as u64 == *bits }),
+        _ => false,
+    }
+}
+
+/// An object of `cls` built by an inline constructor whose initializer list sets scalar members
+/// from parameters or constants and constructs member objects in place from parameters and
+/// constants (`mColor(1.f, 1.f, 1.f, rgba)` seen as `&v.mColor->CColor(1.f, 1.f, 1.f, x)`):
+/// `T(args)`. Every member construction must be accounted for; the other stores must be the
+/// constructor's constants.
+fn build_with_member_calls(db: &TypeDb, cls: &str, stores: &[(i32, Expr)], calls: &[(i32, FuncSig, Vec<Expr>)]) -> Option<Expr> {
+    let c = sig::find_class(db, cls)?;
+    let last = sig::split_scope(cls).1;
+    let key = format!("{}::{}", strip_tmpl(cls), strip_tmpl(last));
+    for d in db.decls.get(&key).map(|v| v.as_slice()).unwrap_or(&[]) {
+        if !d.is_inline_defined || d.params.is_empty() || d.access != mwdec_core::Access::Public || !d.template_params.is_empty() {
+            continue;
+        }
+        let Some(init) = &d.init_list else { continue };
+        if let Some(e) = build_with_ctor_decl(c, &key, cls, d, init, stores, calls) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+fn build_with_ctor_decl(
+    c: &mwdec_core::Class,
+    key: &str,
+    cls: &str,
+    d: &mwdec_core::DeclInfo,
+    init: &str,
+    stores: &[(i32, Expr)],
+    calls: &[(i32, FuncSig, Vec<Expr>)],
+) -> Option<Expr> {
+    let names: Vec<String> = d.params.iter().map(|p| p.name.clone().unwrap_or_default()).collect();
+    let mut args: Vec<Option<Expr>> = vec![None; names.len()];
+    let mut calls_used = 0;
+    let mut stores_used: Vec<i32> = vec![];
+    for part in sig::split_top(init, ',') {
+        let toks: Vec<&str> = part.split_whitespace().collect();
+        if toks.len() < 3 || toks[1] != "(" || toks.last() != Some(&")") {
+            return None;
+        }
+        let f = c.fields.iter().find(|f| f.name == toks[0] && f.bitfield.is_none())?;
+        let off = f.offset as i32;
+        let inner = toks[2..toks.len() - 1].join(" ");
+        if let Some((_, _, cargs)) = calls.iter().find(|(o, _, _)| *o == off) {
+            let parts: Vec<String> = sig::split_top(&inner, ',').into_iter().map(|a| a.trim().to_string()).collect();
+            if parts.len() != cargs.len() {
+                return None;
+            }
+            for (a, ca) in parts.iter().zip(cargs) {
+                if let Some(i) = names.iter().position(|n| n == a) {
+                    args[i] = Some(ca.clone());
+                } else if !literal_is(a, ca) {
+                    return None;
+                }
+            }
+            calls_used += 1;
+        } else if let Some(i) = names.iter().position(|n| *n == inner) {
+            let (_, x) = stores.iter().find(|(o, _)| *o == off)?;
+            args[i] = Some(x.clone());
+            stores_used.push(off);
+        }
+    }
+    if calls_used != calls.len() || args.iter().any(|a| a.is_none()) {
+        return None;
+    }
+    // the remaining stores: constants of the constructor's own
+    if !stores.iter().filter(|(o, _)| !stores_used.contains(o)).all(|(_, x)| matches!(x, Expr::Int { .. } | Expr::Float { .. })) {
+        return None;
+    }
+    let s = FuncSig {
+        qualified_name: key.to_string(),
+        mangled: None,
+        ret: Type::Void,
+        params: d.params.iter().map(|p| Param { name: p.name.clone(), ty: p.ty.clone() }).collect(),
+        this_class: Some(cls.to_string()),
+        is_const: false,
+        is_static: false,
+        // (constructors are never virtual: the flag marks a construction that runs out-of-line
+        // code, a member constructor call, so it is ordered like a call; see `runs_code`)
+        is_virtual: true,
+        variadic: false,
+    };
+    Some(Expr::Construct { class: Type::Named(cls.to_string()), ctor: Some(s), args: args.into_iter().map(|a| a.unwrap()).collect() })
 }
 
 /// A constructed stack object whose address reaches a call argument through the constructor's

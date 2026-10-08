@@ -32,6 +32,10 @@ const ACTIVE: Duration = Duration::from_secs(5);
 const START_AFTER: u32 = 3;
 /// A request waits at most this long for a busy worker holding its context.
 const MAX_WAIT: Duration = Duration::from_secs(20);
+/// Confirmed compile errors before a worker's failures are trusted (`FastPool::trusted_failure`).
+const TRUST_AFTER: usize = 4;
+/// A trusted worker's failures are still re-checked with a normal compile this often.
+const RECHECK_EVERY: usize = 8;
 
 /// What a persistent compiler is started on: compiler + flags + context text + file name.
 pub(crate) struct Spec {
@@ -191,6 +195,10 @@ struct Shared {
 /// The fast path of one driver: worker threads with persistent compilers.
 pub(crate) struct FastPool {
     n: usize,
+    /// Per worker: consecutive failures a normal compile confirmed (a real compile error), and
+    /// failures reported since the last confirmation (see [`FastPool::trusted_failure`]).
+    trust: Vec<AtomicUsize>,
+    unchecked: Vec<AtomicUsize>,
     shared: Arc<Shared>,
     workers: Mutex<Vec<(Sender<Msg>, std::thread::JoinHandle<()>)>>,
     specs: Mutex<HashMap<u64, Arc<Spec>>>,
@@ -202,6 +210,8 @@ impl FastPool {
         let state = State { busy: vec![false; n], held: vec![VecDeque::new(); n], ..Default::default() };
         FastPool {
             n,
+            trust: (0..n).map(|_| AtomicUsize::new(0)).collect(),
+            unchecked: (0..n).map(|_| AtomicUsize::new(0)).collect(),
             shared: Arc::new(Shared { state: Mutex::new(state), cv: Condvar::new(), counters: Counters::default(), pool }),
             workers: Mutex::new(Vec::new()),
             specs: Mutex::new(HashMap::new()),
@@ -367,10 +377,33 @@ impl FastPool {
     /// in a bad state (process state the snapshot does not cover, e.g. after an exception in an
     /// error path). End them; they restart on the next use.
     pub fn poisoned(&self, w: usize) {
+        self.trust[w].store(0, Relaxed);
         self.shared.counters.failed_normal_ok.fetch_add(1, Relaxed);
         self.shared.state.lock().unwrap().held[w].clear();
         self.send(w, Msg::Reset);
     }
+    /// A failure of worker `w` can be reported as a compile error without the normal compile
+    /// that would give its messages: the worker's last [`TRUST_AFTER`] failures were all real
+    /// compile errors (a candidate the normal compiler accepts resets it), and one in
+    /// [`RECHECK_EVERY`] failures is still re-checked. Compile errors are frequent among search
+    /// candidates and each normal compile costs as much as dozens of fast ones.
+    pub fn trusted_failure(&self, w: usize) -> bool {
+        if self.trust[w].load(Relaxed) < TRUST_AFTER {
+            return false;
+        }
+        let n = self.unchecked[w].fetch_add(1, Relaxed) + 1;
+        if n >= RECHECK_EVERY {
+            self.unchecked[w].store(0, Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// A failure of worker `w` that a normal compile confirmed as a compile error.
+    pub fn failure_confirmed(&self, w: usize) {
+        self.trust[w].fetch_add(1, Relaxed);
+    }
+
     pub fn note_confirm(&self, agreed: bool) {
         self.shared.counters.confirms.fetch_add(1, Relaxed);
         if !agreed {

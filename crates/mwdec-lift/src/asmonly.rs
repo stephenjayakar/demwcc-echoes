@@ -8,7 +8,10 @@
 //!   management without an intrinsic (`icbi`, `dcbi`), TLB/segment ops, FPSCR moves outside
 //!   the `__setflm` pair, paired-single arithmetic, and paired or unquantized paired-single
 //!   loads/stores (these compilers have no paired-single intrinsics; they only emit single
-//!   quantized loads/stores for int<->float conversions, and prologue/epilogue saves);
+//!   quantized loads/stores for int<->float conversions, and prologue/epilogue saves), and
+//!   addresses built with `@h`/`@l` (the compiler uses `@ha`), absolute branches, the stack
+//!   pointer written outside the prologue/epilogue, r2/r13 read as values, and a return through LR loaded from a register other
+//!   than r0 (calls through pointers use `mtlr r12; blrl`, returns restore LR from r0);
 //! - a register read before any definition that no calling convention passes in (r0, r11, r12,
 //!   CTR, XER.CA, f0, f9-f13, CR fields other than cr1, which varargs prologues test), or a
 //!   callee-saved register (r14-r31, f14-f31) read or written without the prologue saving it.
@@ -48,6 +51,17 @@ pub fn requires_asm(obj: &ObjectFile, f: &Function) -> Option<String> {
             }
             op => is_paired_single(op),
         };
+        // an address built with `lis @h` + `ori @l`: the compiler always uses `@ha` + `addi`/`@l`
+        let bad = bad || i.reloc.as_ref().is_some_and(|r| r.kind == mwdec_core::RelocKind::Addr16Hi);
+        // absolute branches; the stack pointer written outside the prologue/epilogue; LR loaded
+        // from anything but r0 (the epilogue's restore) for a computed `blr`
+        let bad = bad
+            || (matches!(i.op(), B | Bc) && i.ins.field_aa())
+            || (insn::defs_uses(i).0.contains(&gpr(1)) && !i.is_call() && !i.is_bctrl() && !i.is_blrl())
+            // the small-data base registers read as values (the compiler reaches them only
+            // through `@sda21` relocations)
+            || (i.reloc.is_none() && !i.is_call() && !i.is_bctrl() && !i.is_blrl() && insn::defs_uses(i).1.iter().any(|r| *r == gpr(2) || *r == gpr(13)))
+            || (i.is_blr() && insns[..k].iter().rev().take_while(|p| !p.is_call() && !p.is_blrl() && !p.is_blr()).find(|p| p.op() == Mtspr && p.ins.field_spr() == 8).is_some_and(|p| p.rs() != 0));
         if bad {
             return Some(format!("{} at {:#x}", i.text(), i.off));
         }

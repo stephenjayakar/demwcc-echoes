@@ -195,12 +195,19 @@ if mwdec_lift::variants::alt(mwdec_lift::variants::MY_POINT) { /* alternative */
   only when strictly better, so a variant point can never cost an exact match.
 - Cost: one lift + emit per asked point, one compile per distinct variant; nothing for functions
   whose draft asks no point. `MWDEC_NO_VARIANTS=1` turns variants off (ablations).
-- Points so far: `structcopy.setters` (member stores into a local from one object's members
+- Points so far: `structcopy.words_ll` / `structcopy.words_block` (a run of word copies between
+  two objects becomes 64-bit copies, or one block copy through the helper type
+  `mwdec_words_<N>`), `structcopy.setters` (member stores into a local from one object's members
   become `v = o`), `structcopy.return_whole` (a returned object filled from one object behind
   flag checks and early returns, e.g. an `optional_object` copy, becomes `return x;`),
   `structcopy.no_temp`, `structcopy.no_return` (keep the member-wise forms `structcopy` would
   rewrite). The older fixed alternatives (folded inlines vs plain, raw offsets, `const`
   static-initializer globals, instantiation drafts) are separate candidates of the same choice.
+
+Helper types: a pass may use a type no header declares by naming it through
+`mwdec_lift::helpers` (`helpers::words(n)` = `mwdec_words_<n>`, `struct { int w[n/4]; }`); the
+emitter puts `helpers::definitions(body)` first in the preamble and never synthesizes a stand-in
+for a helper name. Add new helpers there (name prefix + definition).
 
 ### Cheap no-loss check (`eval --drafts-only`, `tools/drafts_diff.py`)
 
@@ -215,6 +222,14 @@ sharded by unit, evaluates only the functions whose hash differs with both binar
 `--new-env K=V` compare one binary with a feature switched off (`MWDEC_NO_VARIANTS=1`,
 `MWDEC_NO_STRUCTCOPY=1`, ...). Changes after drafting (register repair, choice among drafts,
 the search) are not visible in the hash: check those on the set of functions they act on.
+
+Merge gate: `tools/gate.sh <base exe> <new exe> [sample] [out]` runs `drafts_diff.py --shards 2`
+on a fixed train sample (`$MWDEC_WORK_BASE/eval/gate_sample.jsonl`, 1,200 functions built by
+`tools/make_gate_sample.py` from a full train eval and the per-category miss lists: up to 60
+misses per category, compiler-emitted kinds incl. implicit members, one exact ordinary function
+per unit) and prints one line, `GATE PASS|FAIL: <n> of 1200 drafts changed; changed set: base ..
+exact, new .. exact; gained g, lost l (<secs>)`; exit 0 means nothing was lost. About 10-15
+minutes.
 
 ## Caches
 

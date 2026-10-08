@@ -263,6 +263,9 @@ pub fn forward_cond_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
                         Stmt::Return(Some(e)) => e.uses_var(*v),
                         _ => false,
                     };
+                    // (an algorithm's iterator may have been a named local: a variant)
+                    let algorithm = matches!(src, Expr::Call { callee: Callee::Direct { sig, .. }, .. } if sig.qualified_name.starts_with("rstl::") && sig.this_class.is_none());
+                    let ok = ok && !(algorithm && mwdec_lift::variants::alt(mwdec_lift::variants::NAMED_ALGORITHM_RESULT));
                     ok.then(|| (*v, src.clone()))
                 }
                 _ => None,
@@ -417,4 +420,116 @@ pub fn forward_temps_into_folded(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
         }
     });
     n
+}
+
+/// A flag built by nested tests of folded inlines (`v = false; if (a()) { t = x; if (b(t))
+/// v = true; }`) is the `&&` chain of the tests: `v = a() && b(x)`, and a flag read once
+/// right after is replaced by its value (`return !(a() && b(x));`).
+pub fn fold_flag_chains(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    let counts = mentions_body(body);
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let v = match &b[i] {
+                Stmt::Assign { dst: Expr::Var(v), src: Expr::Int { value: 0, .. } } if matches!(vars[*v].kind, VarKind::Local) => *v,
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let Some(chain) = flag_chain(&b[i + 1], v, &counts, vars) else {
+                i += 1;
+                continue;
+            };
+            if !has_folded(&chain) {
+                i += 1;
+                continue;
+            }
+            let mut chain = chain;
+            // pure single-use temps computed right before the flag go into the chain too
+            while i > 0 {
+                let Stmt::Assign { dst: Expr::Var(t), src } = &b[i - 1] else { break };
+                let (t, src) = (*t, src.clone());
+                if !matches!(vars[t].kind, VarKind::Local) || src.has_call() || counts.get(&t) != Some(&2) {
+                    break;
+                }
+                let mut hits = 0;
+                let mut c2 = chain.clone();
+                c2.rewrite(&mut |x| {
+                    if matches!(x, Expr::Var(y) if *y == t) {
+                        *x = src.clone();
+                        hits += 1;
+                    }
+                });
+                if hits != 1 {
+                    break;
+                }
+                chain = c2;
+                b.remove(i - 1);
+                i -= 1;
+            }
+            // the flag read once by the next statement: its value goes there
+            let uses = counts.get(&v).copied().unwrap_or(0);
+            let next_ok = i + 2 < b.len() && uses == 3 && mentions(&b[i + 2], v) == 1 && matches!(&b[i + 2], Stmt::Return(Some(_)) | Stmt::If { .. });
+            if next_ok {
+                let mut s = b[i + 2].clone();
+                let sub = &mut |x: &mut Expr| {
+                    if matches!(x, Expr::Var(y) if *y == v) {
+                        *x = chain.clone();
+                    }
+                };
+                match &mut s {
+                    Stmt::Return(Some(e)) => e.rewrite(sub),
+                    Stmt::If { cond, .. } => cond.rewrite(sub),
+                    _ => {}
+                }
+                b[i + 2] = s;
+                b.drain(i..i + 2);
+            } else {
+                b.splice(i..i + 2, [Stmt::Assign { dst: Expr::Var(v), src: chain }]);
+            }
+            n += 1;
+            i += 1;
+        }
+    });
+    n
+}
+
+fn has_folded(e: &Expr) -> bool {
+    let mut f = false;
+    e.walk(&mut |x| f |= folded_value(x));
+    f
+}
+
+/// `if (c) { pure temps; <inner> }` where the innermost statement is `v = true`: the chain.
+fn flag_chain(s: &Stmt, v: VarId, counts: &HashMap<VarId, usize>, vars: &[Var]) -> Option<Expr> {
+    let Stmt::If { cond, then, els } = s else { return None };
+    if !els.is_empty() || then.is_empty() {
+        return None;
+    }
+    let (last, temps) = then.split_last()?;
+    let mut rest = match last {
+        Stmt::Assign { dst: Expr::Var(x), src: Expr::Int { value: 1, .. } } if *x == v && temps.is_empty() => return Some(cond.clone()),
+        Stmt::If { .. } => flag_chain(last, v, counts, vars)?,
+        _ => return None,
+    };
+    // single-use pure temps computed between the tests move into the later test
+    for t in temps.iter().rev() {
+        let Stmt::Assign { dst: Expr::Var(tv), src } = t else { return None };
+        if !matches!(vars[*tv].kind, VarKind::Local) || src.has_call() || counts.get(tv) != Some(&2) {
+            return None;
+        }
+        let mut hits = 0;
+        rest.rewrite(&mut |x| {
+            if matches!(x, Expr::Var(y) if y == tv) {
+                *x = src.clone();
+                hits += 1;
+            }
+        });
+        if hits != 1 {
+            return None;
+        }
+    }
+    Some(Expr::Binary { op: mwdec_lift::BinOp::LogAnd, l: Box::new(cond.clone()), r: Box::new(rest), ty: Type::Bool })
 }

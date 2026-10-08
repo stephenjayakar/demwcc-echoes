@@ -6,7 +6,7 @@ use crate::ir::*;
 use crate::sig;
 use crate::types;
 use mwdec_core::{Type, TypeDb};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Every statement of a body, nested ones included.
 fn each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
@@ -101,13 +101,34 @@ pub fn standin_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
     }
     let first = body.iter().position(|s| stmt_mentions(s, sret)).unwrap_or(body.len());
     let mut fields: Vec<(i32, Type, Expr)> = vec![];
+    // a single word stored whole (already folded into `return x;`): a one-member object
+    if first == body.len() {
+        if let Some(Stmt::Return(Some(e))) = body.last() {
+            let t = types::ty_of(e, &ir.vars);
+            let t = match strip_cv(&t) {
+                Type::Unknown { size: 4 } => Type::Int { size: 4, signed: true },
+                Type::Int { size: 4, .. } | Type::Float { size: 4 } | Type::Ptr(_) => strip_cv(&t).clone(),
+                _ => return false,
+            };
+            if !stmt_mentions(body.last().unwrap(), sret) && !e.has_call() {
+                let e = e.clone();
+                body.pop();
+                fields.push((0, t, e));
+                let n = body.len();
+                return finish_standin(ir, body, n, fields);
+            }
+        }
+        return false;
+    }
     for s in &body[first..] {
         match s {
             Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if matches!(&**base, Expr::Var(v) if *v == sret) && !src.uses_var(sret) && !src.has_call() => {
                 if fields.iter().any(|f| f.0 == *offset) {
                     return false;
                 }
-                fields.push((*offset, ty.clone(), src.clone()));
+                // (an untyped word store: an `int` member)
+                let ty = if matches!(strip_cv(ty), Type::Unknown { size: 4 }) { Type::Int { size: 4, signed: true } } else { ty.clone() };
+                fields.push((*offset, ty, src.clone()));
             }
             _ => return false,
         }
@@ -124,6 +145,11 @@ pub fn standin_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
         }
         at += sz as i32;
     }
+    finish_standin(ir, body, first, fields)
+}
+
+fn finish_standin(ir: &mut IrFunction, mut body: Vec<Stmt>, first: usize, fields: Vec<(i32, Type, Expr)>) -> bool {
+    let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return false };
     let name = format!("{STANDIN_RET}_{}", ir.symbol.split("__").next().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>());
     let class = Type::Named(name.clone());
     let ctor = mwdec_core::FuncSig {
@@ -195,6 +221,44 @@ fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) {
             });
         }
     }
+    // or the one class of the context whose layout and constructor fit the stores (a variant:
+    // nothing in the code names it)
+    if let (None, Some(db)) = (&cls, db) {
+        let mut stores: Vec<(i32, Expr)> = vec![];
+        let mut widths: Vec<(i32, Option<u32>)> = vec![];
+        each_stmt(&ir.body, &mut |s| {
+            if let Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } = s {
+                if matches!(&**base, Expr::Var(v) if *v == sret) {
+                    stores.push((*offset, src.clone()));
+                    widths.push((*offset, scalar_size(ty)));
+                }
+            }
+        });
+        let vars = ir.vars.clone();
+        if !stores.is_empty() && stores.len() <= 8 {
+            let mut found: Vec<String> = vec![];
+            for (name, c) in &db.classes {
+                if c.is_declaration || name.contains('<') || found.len() > 1 {
+                    continue;
+                }
+                let mut fields = vec![];
+                if !flat_fields(db, name, 0, &mut fields, 0) || fields.len() != stores.len() {
+                    continue;
+                }
+                // each member is one store of its own width and kind
+                let fits = fields.iter().all(|(o, ft)| {
+                    stores.iter().any(|(so, e)| so == o && is_float(&types::ty_of(e, &vars)) == is_float(ft))
+                        && widths.iter().any(|(wo, w)| wo == o && *w == types::size_of(Some(db), ft))
+                });
+                if fits && construct_from_stores(&stores, &Type::Named(name.clone()), Some(db)).is_some() {
+                    found.push(name.clone());
+                }
+            }
+            if found.len() == 1 && crate::variants::alt(crate::variants::SRET_CLASS_BY_LAYOUT) {
+                cls = found.pop();
+            }
+        }
+    }
     if let Some(c) = cls {
         ir.vars[sret].ty = t_ptr(Type::Named(c.clone()));
         ir.sig.ret = Type::Named(c);
@@ -239,8 +303,10 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
     let vars = ir.vars.clone();
     if let Some(db) = db {
         drop_frame_object_dtor_calls(&mut ir.body, &vars, db);
+        // a value kept in a register across the destructor call is returned directly
+        return_kept_values(&mut ir.body, &vars);
     }
-    let kept = forward_stack_objects(&mut ir.body, &vars);
+    let kept = forward_stack_objects(&mut ir.body, &vars, db);
     for &v in &kept {
         // bound to a reference instead: its temporary is created before the objects of the
         // statement that uses it (see `forward_breaks_layout`)
@@ -1492,7 +1558,8 @@ fn dtor_unwrap(ir: &mut IrFunction, this: VarId) {
 
 /// Replace `Var(v)` uses in `e` by `src` where a temporary object is acceptable: by-value use,
 /// member read, receiver of a member call, or argument bound to a reference parameter.
-fn forward_into(e: &mut Expr, v: VarId, src: &Expr, ok: &mut bool) {
+/// (`ref_src`: what a reference argument `&v` becomes, `src` itself or an explicit copy of it)
+fn forward_into(e: &mut Expr, v: VarId, src: &Expr, ref_src: &Expr, ok: &mut bool) {
     let is_v = |x: &Expr| matches!(x, Expr::Var(y) if *y == v);
     match e {
         Expr::Var(_) if is_v(e) => *e = src.clone(),
@@ -1502,49 +1569,49 @@ fn forward_into(e: &mut Expr, v: VarId, src: &Expr, ok: &mut bool) {
             let sig = match callee {
                 Callee::Method { sig, this, .. } => {
                     if matches!(&**this, Expr::AddrOf(i) if is_v(i)) {
-                        **this = Expr::AddrOf(Box::new(src.clone()));
+                        **this = Expr::AddrOf(Box::new(ref_src.clone()));
                     } else {
-                        forward_into(this, v, src, ok);
+                        forward_into(this, v, src, ref_src, ok);
                     }
                     Some(sig.clone())
                 }
                 Callee::Direct { sig, .. } => Some(sig.clone()),
                 Callee::Virtual { this, sig, .. } => {
-                    forward_into(this, v, src, ok);
+                    forward_into(this, v, src, ref_src, ok);
                     sig.clone()
                 }
                 Callee::Indirect(f) => {
-                    forward_into(f, v, src, ok);
+                    forward_into(f, v, src, ref_src, ok);
                     None
                 }
             };
             for (n, a) in args.iter_mut().enumerate() {
                 let is_ref = sig.as_ref().and_then(|s| s.params.get(n)).map_or(false, |p| matches!(strip_cv(&p.ty), Type::Ref(_)));
                 if is_ref && matches!(a, Expr::AddrOf(i) if is_v(i)) {
-                    *a = Expr::AddrOf(Box::new(src.clone()));
+                    *a = Expr::AddrOf(Box::new(ref_src.clone()));
                 } else {
-                    forward_into(a, v, src, ok);
+                    forward_into(a, v, src, ref_src, ok);
                 }
             }
         }
-        Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } => forward_into(base, v, src, ok),
-        Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } | Expr::AddrOf(x) => forward_into(x, v, src, ok),
+        Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } => forward_into(base, v, src, ref_src, ok),
+        Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } | Expr::AddrOf(x) => forward_into(x, v, src, ref_src, ok),
         Expr::Index { base, index, .. } => {
-            forward_into(base, v, src, ok);
-            forward_into(index, v, src, ok);
+            forward_into(base, v, src, ref_src, ok);
+            forward_into(index, v, src, ref_src, ok);
         }
         Expr::Binary { l, r, .. } => {
-            forward_into(l, v, src, ok);
-            forward_into(r, v, src, ok);
+            forward_into(l, v, src, ref_src, ok);
+            forward_into(r, v, src, ref_src, ok);
         }
         Expr::Ternary { c, t, f, .. } => {
-            forward_into(c, v, src, ok);
-            forward_into(t, v, src, ok);
-            forward_into(f, v, src, ok);
+            forward_into(c, v, src, ref_src, ok);
+            forward_into(t, v, src, ref_src, ok);
+            forward_into(f, v, src, ref_src, ok);
         }
         Expr::New { placement, args, .. } => {
             for a in placement.iter_mut().chain(args.iter_mut()) {
-                forward_into(a, v, src, ok);
+                forward_into(a, v, src, ref_src, ok);
             }
         }
         Expr::Construct { args, ctor, .. } => {
@@ -1560,9 +1627,9 @@ fn forward_into(e: &mut Expr, v: VarId, src: &Expr, ok: &mut bool) {
             for (n, a) in args.iter_mut().enumerate() {
                 let is_ref = ctor.as_ref().and_then(|s| s.params.get(n)).map_or(false, |p| matches!(strip_cv(&p.ty), Type::Ref(_)));
                 if is_ref && matches!(a, Expr::AddrOf(i) if is_v(i)) {
-                    *a = Expr::AddrOf(Box::new(src.clone()));
+                    *a = Expr::AddrOf(Box::new(ref_src.clone()));
                 } else {
-                    forward_into(a, v, src, ok);
+                    forward_into(a, v, src, ref_src, ok);
                 }
             }
         }
@@ -1705,7 +1772,7 @@ fn forward_breaks_layout(v: VarId, s: &Stmt, vars: &[Var], folded: &[(Type, i32,
 /// `T v = f(); g(v);` (v a stack object used once) -> `g(f());`: MWCC copies a returned object
 /// into a named local but builds a temporary in place. Returns the call results kept apart
 /// because forwarding them would change the frame layout ([`forward_breaks_layout`]).
-pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) -> Vec<VarId> {
+pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> Vec<VarId> {
     let mut kept: Vec<VarId> = vec![];
     // call results held in a stack object used once: candidates for forwarding
     let mut forwardable: HashSet<VarId> = HashSet::new();
@@ -1836,15 +1903,23 @@ pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var]) -> Vec<VarId> {
                 if mentions(&b[i + 1], v) == 1 && !wider_read(v, &src, &b[i + 1]) && !matches!(b[i + 1], Stmt::If { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } | Stmt::Switch { .. }) {
                     let mut s = b[i + 1].clone();
                     let mut ok = true;
+                    // an object copied into the frame from another object, then passed by
+                    // reference: the copy is the source's (`f(T(x))`), not `f(x)`
+                    let sty = types::ty_of(&src, vars);
+                    let ref_src = if src.is_lvalue() && named(strip_cv(&sty)).is_some() && db.is_some() && types::is_aggregate(db, strip_cv(&sty)) {
+                        Expr::Construct { class: strip_cv(&sty).clone(), ctor: None, args: vec![src.clone()] }
+                    } else {
+                        src.clone()
+                    };
                     match &mut s {
                         Stmt::Assign { dst, src: s2 } => {
                             if matches!(dst, Expr::Var(x) if *x == v) {
                                 ok = false;
                             }
-                            forward_into(dst, v, &src, &mut ok);
-                            forward_into(s2, v, &src, &mut ok);
+                            forward_into(dst, v, &src, &ref_src, &mut ok);
+                            forward_into(s2, v, &src, &ref_src, &mut ok);
                         }
-                        Stmt::Expr(e) | Stmt::Return(Some(e)) => forward_into(e, v, &src, &mut ok),
+                        Stmt::Expr(e) | Stmt::Return(Some(e)) => forward_into(e, v, &src, &ref_src, &mut ok),
                         _ => ok = false,
                     }
                     if ok && mentions(&s, v) == 0 {
@@ -2096,4 +2171,31 @@ pub fn untype_undeclarable(body: &[Stmt], vars: &mut [Var], db: Option<&TypeDb>)
             var.ty = Type::Unknown { size };
         }
     }
+}
+
+/// `t = e; return t;` with `t` used nowhere else -> `return e;` (left behind when the destructor
+/// call that separated them is dropped as implicit).
+fn return_kept_values(body: &mut Vec<Stmt>, vars: &[Var]) {
+    let mut uses: HashMap<VarId, usize> = HashMap::new();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *uses.entry(*v).or_default() += 1;
+        }
+    });
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let hit = match (&b[i], &b[i + 1]) {
+                (Stmt::Assign { dst: Expr::Var(t), .. }, Stmt::Return(Some(Expr::Var(r)))) => t == r && matches!(vars[*t].kind, VarKind::Local) && uses.get(t) == Some(&2),
+                _ => false,
+            };
+            if hit {
+                if let Stmt::Assign { src, .. } = b.remove(i) {
+                    b[i] = Stmt::Return(Some(src));
+                }
+                continue;
+            }
+            i += 1;
+        }
+    });
 }

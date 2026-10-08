@@ -233,7 +233,60 @@ fn collect_defs(b: &[Stmt], is_temp: &[bool], out: &mut HashMap<VarId, Expr>, co
     }
 }
 
+/// Signed remainder by 2^k: `t = (u32)x >> 31; r = rotl((x << (32 - k)) - t, k) + t` is `x % 2^k`.
+fn rem_pow2(e: &Expr, c: &Ctx, vars: &[Var]) -> Option<Expr> {
+    let Expr::Binary { op: BinOp::Add, l, r, .. } = e else { return None };
+    // the sign term: x >> 31 (logical)
+    let sign_of = |t: &Expr| -> Option<Expr> {
+        match c.res(t) {
+            Expr::Binary { op: BinOp::Shr, l: x, r: k, .. } if k.as_int() == Some(31) => Some((**x).clone()),
+            _ => None,
+        }
+    };
+    // rotl(s, k) as `(s << k | s >> (32 - k)) [& 0xffffffff]`
+    let rot = |e: &Expr| -> Option<(Expr, i64)> {
+        let e = match c.res(e) {
+            Expr::Binary { op: BinOp::And, l, r, .. } if r.as_int().map(|m| m as u32) == Some(u32::MAX) => c.res(l),
+            e => e,
+        };
+        let Expr::Binary { op: BinOp::Or, l, r, .. } = e else { return None };
+        let (Expr::Binary { op: BinOp::Shl, l: a, r: k1, .. }, Expr::Binary { op: BinOp::Shr, l: b, r: k2, .. }) = (strip_any(l), strip_any(r)) else { return None };
+        let (k1, k2) = (k1.as_int()?, k2.as_int()?);
+        (k1 + k2 == 32 && same(c, a, b)).then(|| ((**a).clone(), k1))
+    };
+    for (rp, tp) in [(l, r), (r, l)] {
+        let Some(x) = sign_of(tp) else { continue };
+        let Some((s, k)) = rot(rp) else { continue };
+        if !(1..=16).contains(&k) {
+            continue;
+        }
+        let Expr::Binary { op: BinOp::Sub, l: sh, r: t2, .. } = c.res(&s) else { continue };
+        if !same(c, t2, tp) {
+            continue;
+        }
+        let Expr::Binary { op: BinOp::Shl, l: x2, r: k3, .. } = c.res(sh) else { continue };
+        if k3.as_int() != Some(32 - k) || !same(c, x2, &x) {
+            continue;
+        }
+        let _ = vars;
+        return Some(Expr::bin(BinOp::Rem, Expr::cast(t_s32(), x), Expr::int(1i64 << k), t_s32()));
+    }
+    None
+}
+
 pub fn fold(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
+    {
+        let mut defs = HashMap::new();
+        let mut count = HashMap::new();
+        collect_defs(body, is_temp, &mut defs, &mut count);
+        defs.retain(|v, _| count.get(v) == Some(&1));
+        let c = Ctx { defs: &defs };
+        Stmt::rewrite_exprs(body, &mut |e| {
+            if let Some(n) = rem_pow2(e, &c, vars) {
+                *e = n;
+            }
+        });
+    }
     let mut has = false;
     Stmt::walk_exprs(body, &mut |e| {
         if let Expr::Binary { op: BinOp::Mul, ty, .. } = e {

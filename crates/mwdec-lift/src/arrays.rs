@@ -314,6 +314,30 @@ fn try_array(e: &Expr, vars: &[Var], db: Option<&TypeDb>, defs: &HashMap<VarId, 
             return finish(elem, &et, inner, ty, Some(db));
         }
     }
+    // array member with elements smaller than the index scale: `&p->a[i * 2]` (the scale is
+    // a multiple of the element size; the index keeps the factor)
+    if let (Some(db), Some(cls)) = (db, named(&otr)) {
+        for f in [2u32, 4, 8] {
+            if esz % f != 0 || esz / f < 1 {
+                continue;
+            }
+            let e = esz / f;
+            if let Some((a, et, n)) = array_field(db, cls, off, e, 0) {
+                let rel = off - a;
+                let j = (rel as u32 / e) as i64;
+                let inner = rel - (j as i32) * e as i32;
+                let at = Type::Array(Box::new(et.clone()), n);
+                let arr = if ptr {
+                    Expr::Load { base: Box::new(obj), offset: a, ty: at }
+                } else {
+                    Expr::Member { base: Box::new(obj), offset: a, ty: at }
+                };
+                let scaled = Expr::bin(BinOp::Mul, x, Expr::int(f as i64), Type::Int { size: 4, signed: true });
+                let elem = Expr::Index { base: Box::new(arr), index: Box::new(add_index(scaled, j)), ty: et.clone() };
+                return finish(elem, &et, inner, ty, Some(db));
+            }
+        }
+    }
     // an array object itself (global/stack array lvalue)
     if let Type::Array(et, _) = strip_cv(&otr) {
         if !ptr && types::size_of(db, et) == Some(esz) {

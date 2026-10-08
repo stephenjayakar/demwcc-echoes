@@ -13,6 +13,7 @@ mwdec-project.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+flate2 = "1"
 
 [dev-dependencies]
 mwdec-emit.workspace = true

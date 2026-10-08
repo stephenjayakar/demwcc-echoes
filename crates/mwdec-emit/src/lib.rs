@@ -108,6 +108,8 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
         mwdec_lift::idioms::untype_undeclarable(&body, &mut fixed.vars, db);
         let forwarded = mwdec_lift::postinline::forward_inline_args(&mut fixed.body, &fixed.vars);
         let copies = mwdec_lift::structcopy::apply(&mut fixed.body, &fixed.vars, db);
+        let copies = copies + mwdec_lift::postinline::address_temps_first(&mut fixed.body, &fixed.vars);
+        let copies = copies + mwdec_lift::postinline::split_last_field(&mut fixed.body, &fixed.vars);
         if fixed.vars != ir.vars || forwarded > 0 || copies > 0 {
             &fixed
         } else {
@@ -162,7 +164,9 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
     let mut em = new_em();
     em.function();
     em.standin_ret_def();
-    let preamble = em.type_defs.iter().cloned().chain(em.externs.iter().cloned()).chain(em.fn_decls.values().map(|(_, d)| d.clone())).chain(string_pool_decl(ir)).collect::<Vec<_>>().join("
+    // helper types the body uses (mwdec_lift::helpers) come first
+    let helpers = mwdec_lift::helpers::definitions(&em.out);
+    let preamble = helpers.into_iter().chain(em.type_defs.iter().cloned()).chain(em.externs.iter().cloned()).chain(em.fn_decls.values().map(|(_, d)| d.clone())).chain(string_pool_decl(ir)).collect::<Vec<_>>().join("
 ");
     Emitted { preamble: if preamble.is_empty() { preamble } else { preamble + "\n" }, body: em.out }
 }
@@ -772,7 +776,7 @@ impl<'a> Em<'a> {
         for n in &names {
             note(n, &mut chains);
         }
-        let mut wanted: BTreeSet<String> = chains.into_iter().filter(|c| self.unknown_type(db, c)).collect();
+        let mut wanted: BTreeSet<String> = chains.into_iter().filter(|c| self.unknown_type(db, c) && !mwdec_lift::helpers::is_helper(c)).collect();
         for (c, _, _) in &calls {
             if self.unknown_type(db, c) {
                 wanted.insert(c.clone());
@@ -1023,6 +1027,10 @@ impl<'a> Em<'a> {
             body.push(' ');
             body.push_str(d);
             body.push(';');
+        }
+        // a destructor the unit's object defines or calls (`delete` calls it)
+        if !s.methods.iter().any(|(k, _)| k.starts_with('~')) && self.db.is_some_and(|db| db.object_dtors.contains(n) || db.object_dtors.iter().any(|d| strip_unnamed_ns(d) == n)) {
+            let _ = write!(body, " ~{last}();");
         }
         if s.size > 0 && s.base.is_none() {
             let _ = write!(body, " unsigned char __mwdec_data[{}];", s.size);
@@ -1575,6 +1583,13 @@ impl<'a> Em<'a> {
 
     /// Render an assignment destination.
     fn lvalue(&mut self, e: &Expr) -> String {
+        // a store into a member of a const object (a const-reference parameter written by code
+        // the lifter couldn't give a return object): through a cast that drops the const
+        if let Expr::Member { base, offset, ty } = e {
+            if matches!(**base, Expr::Var(_)) && self.const_lvalue(e) && scalar_size(ty).is_some_and(|z| z > 0) {
+                return self.raw_access(base, *offset, ty, false);
+            }
+        }
         self.lvalue_ctx = true;
         let s = self.expr(e, 2);
         self.lvalue_ctx = false;
@@ -1794,6 +1809,57 @@ impl<'a> Em<'a> {
         best.map(|(_, m, t)| (m, t))
     }
 
+    /// `obj.GetX(i)` for `obj.mX[i]` when `mX` is inaccessible here and the class declares an
+    /// inline accessor returning `mX[param]`.
+    fn element_accessor_call(&mut self, base: &Expr, i: &str) -> Option<String> {
+        let db = self.db?;
+        if self.opts.raw_offsets {
+            return None;
+        }
+        let (obj, off, ptr) = match base {
+            Expr::Load { base, offset, ty: Type::Array(..) } => (&**base, *offset, true),
+            Expr::Member { base, offset, ty: Type::Array(..) } => (&**base, *offset, false),
+            _ => return None,
+        };
+        let ot = ty_of(obj, self.vars());
+        let ct = if ptr { pointee(&ot)?.clone() } else { ot };
+        let cls = named(&mwdec_lift::types::resolve(Some(db), strip_cv(&ct)).into_owned())?.to_string();
+        let at = match base {
+            Expr::Load { ty, .. } | Expr::Member { ty, .. } => ty.clone(),
+            _ => return None,
+        };
+        let size = mwdec_lift::types::size_of(Some(db), &at)?;
+        let (path, _) = field_path(db, &cls, off, size)?;
+        let (last, prefix) = path.split_last()?;
+        let PathElem::Field(field, owner) = last else { return None };
+        if self.field_accessible(owner, field) || prefix.iter().any(|p| !matches!(p, PathElem::Field(..))) {
+            return None;
+        }
+        let key = format!("{}::", strip_template_args(owner));
+        let mut found = None;
+        for (qn, ds) in db.decls.range(key.clone()..) {
+            if !qn.starts_with(&key) {
+                break;
+            }
+            let m = &qn[key.len()..];
+            if m.contains("::") || m.starts_with("operator") {
+                continue;
+            }
+            for d in ds {
+                let Some(pn) = d.params.first().and_then(|p| p.name.clone()) else { continue };
+                let want = format!("return {field} [ {pn} ] ;");
+                if d.params.len() == 1 && !d.is_static && d.inline_body.as_deref().map(|b| b.split_whitespace().collect::<Vec<_>>().join(" ")) == Some(want) && matches!(strip_cv(&d.ret), Type::Ref(_)) {
+                    found = Some(m.to_string());
+                }
+            }
+        }
+        let m = found?;
+        let o = self.expr(obj, 15);
+        let pre = self.path_str(prefix, true);
+        let sep = if ptr { "->" } else { "." };
+        Some(if pre.is_empty() { format!("{o}{sep}{m}({i})") } else { format!("{o}{sep}{pre}.{m}({i})") })
+    }
+
     /// A getter for an inaccessible member; for a store through the member (`obj.GetX().y = v`,
     /// `obj.data()[4] = v`) it must return a non-const reference or pointer.
     fn usable_getter(&self, owner: &str, field: &str, read: bool) -> Option<String> {
@@ -1889,9 +1955,14 @@ impl<'a> Em<'a> {
                     (t, _) => type_str(t),
                 })
                 .collect()
-        } else if let Some((tys, _)) = call.filter(|(tys, _)| !c_mode || conf >= 3 || tys.iter().any(is_float)) {
-            // C: unprototyped (K&R) unless float arguments would be promoted to double, or the
-            // address is converted to a prototyped function pointer type (MWCC checks those)
+        } else if let Some((tys, _)) = call.filter(|(tys, _)| {
+            let r = |t: &Type| mwdec_lift::types::resolve(Some(db), t).into_owned();
+            // (narrow integer arguments the call passes unextended: a prototype keeps them so)
+            !c_mode || conf >= 3 || tys.iter().any(|t| is_float(&r(t))) || tys.iter().any(|t| matches!(strip_cv(&r(t)), Type::Int { size: 1 | 2, .. } | Type::Bool | Type::Char))
+        }) {
+            // C: unprototyped (K&R) unless float arguments would be promoted to double, narrow
+            // integers extended, or the address is converted to a prototyped function pointer
+            // type (MWCC checks those)
             tys.iter().map(type_str).collect()
         } else {
             vec![]
@@ -2030,6 +2101,8 @@ impl<'a> Em<'a> {
                 }
                 // a word-sized access that is the whole member object (`damage.GetWeaponMode()`)
                 Expr::Load { .. } | Expr::Member { .. } if matches!(froms, Type::Unknown { .. }) && self.typed_member(e, inner).is_some() => self.typed_member(e, inner).unwrap(),
+                // a constant bound to a const reference (the compiler materialises it)
+                Expr::Int { .. } | Expr::Float { .. } if matches!(**inner, Type::Const(_)) => self.expr(e, 0),
                 _ if matches!(froms, Type::Int { .. } | Type::Unknown { .. }) => format!("*({}){}", ptr_to(inner), self.expr(e, 14)),
                 _ => self.expr(e, 0),
             };
@@ -2798,11 +2871,21 @@ impl<'a> Em<'a> {
         if !self.opts.raw_offsets {
             if let Some(db) = self.db {
                 let br = mwdec_lift::types::resolve(Some(db), &bt).into_owned();
+                // a member of a reference member: of the referenced object
+                let br = match strip_cv(&br) {
+                    Type::Ref(inner) => mwdec_lift::types::resolve(Some(db), inner).into_owned(),
+                    _ => br,
+                };
                 if let Some(cls) = named(&br) {
                     let want = scalar_size(ty).unwrap_or(0);
                     if let Some((path, ft)) = field_path(db, cls, off, if matches!(ty, Type::Unknown { size: 0 }) { 0 } else { want }) {
                         if access_ok(self.db, &ft, ty) {
+                            // (a reference member as the object, not the pointer it's stored as)
+                            if matches!(strip_cv(&bt), Type::Ref(_)) {
+                                self.lvalue_ctx = true;
+                            }
                             let b = self.expr(base, 15);
+                            self.lvalue_ctx = false;
                             if !self.reachable(&path, read) {
                                 return self.raw_access(base, off, ty, false);
                             }
@@ -3140,7 +3223,13 @@ impl<'a> Em<'a> {
                         }
                     }
                 }
-                return format!("{}.", self.expr(inner, 15));
+                // (a reference member is the object itself here, not the pointer it's stored as)
+                if matches!(ty_of(inner, self.vars()), Type::Ref(_)) {
+                    self.lvalue_ctx = true;
+                }
+                let s = self.expr(inner, 15);
+                self.lvalue_ctx = false;
+                return format!("{s}.");
             }
         }
         let t = ty_of(this_e, self.vars());
@@ -3427,7 +3516,8 @@ impl<'a> Em<'a> {
 
     fn args(&mut self, args: &[Expr], sig: Option<&mwdec_core::FuncSig>) -> String {
         let mut v = vec![];
-        for (i, a) in args.iter().enumerate() {
+        let keep = sig.map_or(args.len(), |s| self.args_without_defaults(args, s));
+        for (i, a) in args.iter().enumerate().take(keep) {
             // unknown parameter types (undeclared functions, declared from these arguments): as is
             let pt = sig.and_then(|s| s.params.get(i)).map(|p| p.ty.clone()).filter(|t| !matches!(t, Type::Unknown { .. }));
             // an argument already of the parameter's integer type spelled through a typedef (`s8`
@@ -3444,6 +3534,87 @@ impl<'a> Em<'a> {
             v.push(s);
         }
         v.join(", ")
+    }
+
+    /// How many leading arguments to pass: trailing arguments equal to the declaration's
+    /// default arguments are left out, as long as the shorter call still means the same
+    /// overload (draft variant [`mwdec_lift::variants::EXPLICIT_DEFAULT_ARGS`] keeps them).
+    fn args_without_defaults(&self, args: &[Expr], sig: &mwdec_core::FuncSig) -> usize {
+        let Some(db) = self.db else { return args.len() };
+        let key = strip_template_args(&sig.qualified_name);
+        let Some(decls) = db.decls.get(&key) else { return args.len() };
+        let Some(d) = decls.iter().find(|d| d.params.len() == args.len() && d.defaults.len() == args.len() && !d.variadic) else { return args.len() };
+        let mut keep = args.len();
+        while keep > 0 && d.defaults[keep - 1].as_deref().is_some_and(|def| self.default_matches(def, &args[keep - 1])) {
+            keep -= 1;
+        }
+        // a constructor keeps one argument: `T x();` would declare a function
+        if sig::is_ctor(sig) {
+            keep = keep.max(1);
+        }
+        if keep == args.len() {
+            return keep;
+        }
+        // another overload callable with `keep` arguments would change the call's meaning
+        let min_arity = |x: &mwdec_core::DeclInfo| x.params.len() - x.defaults.iter().rev().take_while(|d| d.is_some()).count();
+        if decls.iter().any(|x| !std::ptr::eq(x, d) && (x.variadic || (min_arity(x) <= keep && keep <= x.params.len()))) {
+            return args.len();
+        }
+        if mwdec_lift::variants::alt(mwdec_lift::variants::EXPLICIT_DEFAULT_ARGS) {
+            return args.len();
+        }
+        keep
+    }
+
+    /// Is argument `a` the default argument spelled `def` (space-joined tokens)?
+    fn default_matches(&self, def: &str, a: &Expr) -> bool {
+        let mut a = a;
+        while let Expr::Cast { e, .. } = a {
+            a = e;
+        }
+        let d: String = def.split_whitespace().collect();
+        let int = |s: &str| -> Option<i64> {
+            let (neg, s) = match s.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, s),
+            };
+            let s = s.trim_end_matches(|c| c == 'u' || c == 'U' || c == 'l' || c == 'L');
+            let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) { i64::from_str_radix(h, 16).ok()? } else { s.parse::<i64>().ok()? };
+            Some(if neg { -v } else { v })
+        };
+        match d.as_str() {
+            "true" => return a.as_int() == Some(1),
+            "false" | "nullptr" | "NULL" => return a.as_int() == Some(0),
+            _ => {}
+        }
+        if let Some(v) = int(&d) {
+            return a.as_int() == Some(v);
+        }
+        if let Expr::Float { bits, double } = a {
+            let s = d.trim_end_matches(|c| c == 'f' || c == 'F');
+            if let Ok(x) = s.parse::<f64>() {
+                return if *double { *bits == x.to_bits() } else { *bits == (x as f32).to_bits() as u64 };
+            }
+            return false;
+        }
+        if !d.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') || d.starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
+        let last = d.rsplit("::").next().unwrap_or(&d);
+        // an enumerator
+        if let Some(v) = a.as_int() {
+            let db = match self.db {
+                Some(db) => db,
+                None => return false,
+            };
+            let mut vals = db.enums.values().flat_map(|e| e.values.iter()).filter(|(n, _)| n == last || n.rsplit("::").next() == Some(last));
+            return vals.next().is_some_and(|(_, x)| *x == v);
+        }
+        // a global object or constant
+        match a {
+            Expr::Global { symbol, .. } => symbol_name(symbol).rsplit("::").next() == Some(last),
+            _ => false,
+        }
     }
 
     fn expr_inner(&mut self, e: &Expr) -> String {
@@ -3516,6 +3687,11 @@ impl<'a> Em<'a> {
                 let lv = std::mem::replace(&mut self.lvalue_ctx, false);
                 let i = self.expr(index, 0);
                 self.lvalue_ctx = lv;
+                // an element of an inaccessible member array read through the class's element
+                // accessor (`T& GetX(int i) { return mX[i]; }`)
+                if let Some(s) = self.element_accessor_call(base, &i) {
+                    return s;
+                }
                 // an indexable class object (its operator[])
                 if named(&bt).is_some() {
                     let b = self.expr(base, 15);
@@ -3711,6 +3887,27 @@ impl<'a> Em<'a> {
         }
     }
 
+    /// The virtual function at `vtable_offset` of the static type of `this` (a pointer to a class
+    /// whose vtable the TypeDb knows, with the vtable pointer at `vptr_offset`).
+    fn slot_of_object(&self, this: &Expr, vtable_offset: u32, vptr_offset: u32) -> Option<mwdec_core::FuncSig> {
+        let db = self.db?;
+        // (the declared type of a member read: the IR may type a raw read as an integer)
+        let declared = self.decl_type_rw(this, true);
+        let t = if pointee(&declared).is_some() { declared } else { ty_of(this, self.vars()) };
+        let p = pointee(&t)?;
+        let r = mwdec_lift::types::resolve(Some(db), strip_cv(p)).into_owned();
+        let cls = named(&r)?;
+        let c = sig::find_class(db, cls)?;
+        if c.vptr_offset != Some(vptr_offset) {
+            return None;
+        }
+        let v = c.vtable.iter().find(|v| v.vtable_offset == vtable_offset && v.this_adjust == 0)?;
+        if v.sig.qualified_name.is_empty() {
+            return None;
+        }
+        Some(v.sig.clone())
+    }
+
     /// The signature of the only constructor of `cls` the headers declare with `n` parameters.
     fn only_ctor(&self, cls: &str, n: usize) -> Option<mwdec_core::FuncSig> {
         let db = self.db?;
@@ -3790,7 +3987,21 @@ impl<'a> Em<'a> {
                     }
                 }
                 let name = if symbol.starts_with("__") && sig::demangle(symbol).is_none() { symbol.clone() } else { strip_unnamed_ns(&s.qualified_name) };
-                let arg_tys: Vec<Type> = args.iter().map(|a| value_type(&ty_of(a, self.vars()))).collect();
+                // (an argument explicitly narrowed from a value of that same narrow type: the
+                // extension is the conversion to a wider parameter)
+                let arg_tys: Vec<Type> = args
+                    .iter()
+                    .map(|a| {
+                        if let Expr::Cast { ty, e } = a {
+                            let r = |t: &Type| mwdec_lift::types::resolve(self.db, t).into_owned();
+                            let (ct, et) = (r(ty), r(&ty_of(e, self.vars())));
+                            if matches!(strip_cv(&ct), Type::Int { size: 1 | 2, .. }) && strip_cv(&ct) == strip_cv(&et) {
+                                return Type::Int { size: 4, signed: false };
+                            }
+                        }
+                        value_type(&ty_of(a, self.vars()))
+                    })
+                    .collect();
                 self.declare_function(symbol, Some(s), Some((&arg_tys, ret)), 2);
                 let self_decl = sig::demangle(symbol).is_none() && self.fn_decls.contains_key(symbol);
                 let a = if self_decl { args.iter().map(|x| self.expr(x, 0)).collect::<Vec<_>>().join(", ") } else { self.args(args, Some(s)) };
@@ -3845,6 +4056,10 @@ impl<'a> Em<'a> {
                         let r = self.args(args, Some(s));
                         return format!("({l})[{r}]");
                     }
+                    // `it->m`: the iterator itself before `->`
+                    if args.is_empty() && op == "->" {
+                        return self.object_lvalue_c(this, cls.as_deref(), s.is_const);
+                    }
                     if args.is_empty() && matches!(op, "-" | "!" | "~") {
                         let l = self.object_lvalue_c(this, cls.as_deref(), s.is_const);
                         return format!("{op}({l})");
@@ -3884,6 +4099,20 @@ impl<'a> Em<'a> {
                     let n = if s.variadic { args.len() } else { args.len().min(s.params.len()) };
                     let a = self.args(&args[..n], Some(s));
                     return format!("{pre}{}({a})", self.method_name(s));
+                }
+                // the object's type known only now (e.g. a folded header inline returns it): its
+                // class's vtable names the slot
+                if let Some(vs) = self.slot_of_object(this, *vtable_offset, *vptr_offset) {
+                    if !self.method_name(&vs).is_empty() && (vs.variadic || vs.params.len() <= args.len()) {
+                        let pre = self.object_prefix(this, vs.this_class.as_deref());
+                        let n = if vs.variadic { args.len() } else { vs.params.len() };
+                        let a = self.args(&args[..n], Some(&vs));
+                        // (the IR has the returned reference as the address it is)
+                        if matches!(strip_cv(&vs.ret), Type::Ref(_)) {
+                            return format!("&{pre}{}({a})", self.method_name(&vs));
+                        }
+                        return format!("{pre}{}({a})", self.method_name(&vs));
+                    }
                 }
                 // method unknown: a stand-in polymorphic class whose slot N has this call's
                 // signature, so MWCC emits the real virtual-call sequence (vptr into r12)
@@ -4092,6 +4321,10 @@ fn type_chains(s: &str) -> Vec<String> {
                     continue;
                 }
                 break;
+            }
+            // a member of a template instance (`A<T>::node`) is no free-standing name
+            if st >= 2 && &s[st - 2..st] == "::" {
+                continue;
             }
             // a function name's own last component (`Ns::Func(`) isn't a type
             if b.get(i) != Some(&b'(') {

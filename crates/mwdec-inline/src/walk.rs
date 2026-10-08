@@ -107,7 +107,20 @@ pub fn walk(b: &mut Vec<Stmt>, reach: &mut Defs, cx: &Ctx) -> usize {
     let mut i = 0;
     while i < b.len() {
         {
-            let defs = merged(cx.global, reach);
+            // a loop's condition also runs after its body: values the body reassigns are unknown
+            let mut in_loop = vec![];
+            match &b[i] {
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => assigned_deep(body, &mut in_loop),
+                Stmt::For { init, step, body, .. } => {
+                    assigned_deep(init, &mut in_loop);
+                    assigned_deep(step, &mut in_loop);
+                    assigned_deep(body, &mut in_loop);
+                }
+                _ => {}
+            }
+            let mut here = reach.clone();
+            kill(&mut here, &in_loop);
+            let defs = merged(cx.global, &here);
             let env = Env { db: cx.db, vars: cx.vars, defs: &defs, lib: cx.lib, objects: &cx.idx.objects };
             if crate::util::prof::time(3, || crate::stmts::try_stmts_at(b, i, cx.whole, &env, cx.idx)) {
                 n += 1;

@@ -418,7 +418,140 @@ pub fn insert_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Ve
         hoist_inserted_words(body, vars, is_temp);
         join_chains(body, is_temp);
         split_field_values(body);
+        setups_before_stores(body);
+        shared_word_starts(body);
     }
+}
+
+/// See [`crate::variants::SDK_WORD_SHARED_INLINE`]: a single-assignment pure value whose every use
+/// is in the start of a register word (`r = f(t)` followed by inserts into r), used twice or more.
+fn shared_word_starts(body: &mut Vec<Stmt>) {
+    let mut defs: HashMap<VarId, (usize, Expr)> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for st in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), src } = st {
+                let e = defs.entry(*v).or_insert((0, src.clone()));
+                e.0 += 1;
+            }
+        }
+    });
+    let pure_val = |e: &Expr| {
+        let mut ok = true;
+        e.walk(&mut |x| ok &= matches!(x, Expr::Var(_) | Expr::Int { .. } | Expr::Binary { .. } | Expr::Cast { .. } | Expr::Unary { .. }));
+        ok
+    };
+    // uses: (in word starts, elsewhere)
+    let mut uses: HashMap<VarId, (usize, usize)> = HashMap::new();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for (i, st) in b.iter().enumerate() {
+            let start = matches!(st, Stmt::Assign { dst: Expr::Var(r), src } if !is_rlwimi(src)
+                && matches!(b.get(i + 1), Some(Stmt::Assign { dst: Expr::Var(r2), src: s2 }) if r2 == r && is_rlwimi(s2)));
+            let mut count = |e: &Expr, word: bool| {
+                e.walk(&mut |x| {
+                    if let Expr::Var(v) = x {
+                        let u = uses.entry(*v).or_default();
+                        if word { u.0 += 1 } else { u.1 += 1 }
+                    }
+                })
+            };
+            match st {
+                Stmt::Assign { dst: Expr::Var(_), src } => count(src, start),
+                Stmt::Assign { dst, src } => {
+                    count(dst, false);
+                    count(src, false)
+                }
+                Stmt::Expr(e) | Stmt::Return(Some(e)) => count(e, false),
+                Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } | Stmt::For { cond, .. } => count(cond, false),
+                Stmt::Switch { e, .. } => count(e, false),
+                _ => {}
+            }
+        }
+    });
+    let cand: HashMap<VarId, Expr> = defs
+        .into_iter()
+        .filter(|(v, (n, src))| *n == 1 && pure_val(src) && !src.uses_var(*v) && uses.get(v).is_some_and(|(w, o)| *w >= 2 && *o == 0))
+        .map(|(v, (_, src))| (v, src))
+        .collect();
+    if cand.is_empty() || !crate::variants::alt(crate::variants::SDK_WORD_SHARED_INLINE) {
+        return;
+    }
+    Stmt::for_each_block_mut(body, &mut |b| b.retain(|st| !matches!(st, Stmt::Assign { dst: Expr::Var(v), .. } if cand.contains_key(v))));
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if let Expr::Var(v) = e {
+            if let Some(d) = cand.get(v) {
+                *e = d.clone();
+            }
+        }
+    });
+}
+
+/// Register words are computed before they are written out: a pure setup run (`r = x;
+/// r = __rlwimi(r, ..); ..`, no memory reads) moves up past the stores just before it (the
+/// FIFO writes of the previous word) when they don't involve it.
+fn setups_before_stores(body: &mut Vec<Stmt>) {
+    fn pure(e: &Expr) -> bool {
+        let mut m = true;
+        e.walk(&mut |x| {
+            if matches!(x, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. } | Expr::BitField { .. } | Expr::New { .. } | Expr::IncDec { .. }) || (matches!(x, Expr::Call { .. }) && !x.is_pure_call()) {
+                m = false;
+            }
+        });
+        m
+    }
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            // a run: r = pure; r = __rlwimi(r, pure..) ..
+            let Stmt::Assign { dst: Expr::Var(r), src } = &b[i] else {
+                i += 1;
+                continue;
+            };
+            let r = *r;
+            if is_rlwimi(src) || !pure(src) || src.uses_var(r) {
+                i += 1;
+                continue;
+            }
+            let mut end = i + 1;
+            while let Some(Stmt::Assign { dst: Expr::Var(r2), src }) = b.get(end) {
+                if *r2 != r || !is_rlwimi(src) || !pure(src) || !matches!(chain_base(src), Expr::Var(x) if *x == r) {
+                    break;
+                }
+                end += 1;
+            }
+            if end - i < 2 {
+                i += 1;
+                continue;
+            }
+            // operands of the run
+            let mut ops: Vec<VarId> = vec![];
+            for st in &b[i..end] {
+                if let Stmt::Assign { src, .. } = st {
+                    src.walk(&mut |x| {
+                        if let Expr::Var(v) = x {
+                            ops.push(*v);
+                        }
+                    });
+                }
+            }
+            let mut at = i;
+            while at > 0 {
+                match &b[at - 1] {
+                    Stmt::Assign { dst, src } if !matches!(dst, Expr::Var(_)) && !dst.uses_var(r) && !src.uses_var(r) && !src.has_call() && !dst.has_call() => at -= 1,
+                    _ => break,
+                }
+            }
+            // (nothing the run reads may be assigned in between: only stores were passed)
+            let _ = &ops;
+            if at < i {
+                let run: Vec<Stmt> = b.drain(i..end).collect();
+                let n = run.len();
+                b.splice(at..at, run);
+                i = at + n;
+            } else {
+                i = end;
+            }
+        }
+    });
 }
 
 /// One variable whose different bits are inserted into several fields is split into its bit
@@ -426,12 +559,21 @@ pub fn insert_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Ve
 /// (`SET_REG_FIELD(reg, 1, 18, op & 1); SET_REG_FIELD(reg, 2, 20, (op >> 1) & 3);`): the masks
 /// leave the instructions alone but not the register allocation.
 fn split_field_values(body: &mut Vec<Stmt>) {
+    fn var_of(e: &Expr) -> Option<VarId> {
+        match e {
+            Expr::Var(v) => Some(*v),
+            Expr::Cast { e, ty } if matches!(strip_cv(ty), Type::Int { size: 4, .. }) => var_of(e),
+            _ => None,
+        }
+    }
+    // source bit of the field's lowest bit (the value's bits rotate left by `sh` into place)
+    let low = |sh: i64, me: i64| ((31 - me) - sh).rem_euclid(32);
     let mut count: HashMap<VarId, Vec<(i64, i64, i64)>> = HashMap::new();
     Stmt::walk_exprs(body, &mut |e| {
         if let Expr::Call { args, .. } = e {
             if is_rlwimi(e) {
-                if let (Expr::Var(v), Some(sh), Some(mb), Some(me)) = (&args[1], args[2].as_int(), args[3].as_int(), args[4].as_int()) {
-                    let f = count.entry(*v).or_default();
+                if let (Some(v), Some(sh), Some(mb), Some(me)) = (var_of(&args[1]), args[2].as_int(), args[3].as_int(), args[4].as_int()) {
+                    let f = count.entry(v).or_default();
                     if !f.contains(&(sh, mb, me)) {
                         f.push((sh, mb, me));
                     }
@@ -441,7 +583,7 @@ fn split_field_values(body: &mut Vec<Stmt>) {
     });
     // pieces: different bits of the value (the same bits at different places are alternatives)
     count.retain(|_, f| {
-        let mut lows: Vec<i64> = f.iter().map(|(sh, _, me)| (31 - me) - sh).collect();
+        let mut lows: Vec<i64> = f.iter().map(|(sh, _, me)| low(*sh, *me)).collect();
         lows.sort();
         lows.dedup();
         lows.len() >= 2
@@ -454,22 +596,28 @@ fn split_field_values(body: &mut Vec<Stmt>) {
             return;
         }
         let Expr::Call { args, .. } = e else { return };
-        let (Expr::Var(v), Some(sh), Some(mb), Some(me)) = (&args[1], args[2].as_int(), args[3].as_int(), args[4].as_int()) else { return };
-        if !count.contains_key(v) || !(0..=31).contains(&mb) || !(mb..=31).contains(&me) {
+        let (Some(v), Some(sh), Some(mb), Some(me)) = (var_of(&args[1]), args[2].as_int(), args[3].as_int(), args[4].as_int()) else { return };
+        if !count.contains_key(&v) || !(0..=31).contains(&mb) || !(mb..=31).contains(&me) {
             return;
         }
         let fs = 31 - me;
         let width = me - mb + 1;
-        let d = fs - sh;
-        if !(0..32).contains(&d) || width >= 32 {
+        let d = low(sh, me);
+        if width >= 32 || d + width > 32 {
             return;
         }
-        let ty = Type::Int { size: 4, signed: true };
+        // (the value's own signedness: a logical shift of an unsigned word)
+        let unsigned = matches!(&args[1], Expr::Cast { ty, .. } if matches!(strip_cv(ty), Type::Int { signed: false, .. }));
+        let ty = Type::Int { size: 4, signed: !unsigned };
         let mut x = args[1].clone();
         if d > 0 {
             x = Expr::bin(BinOp::Shr, x, Expr::int(d), ty.clone());
         }
-        args[1] = Expr::bin(BinOp::And, x, Expr::int((1i64 << width) - 1), ty);
+        // (a shift that leaves only the field's bits needs no mask)
+        if d + width < 32 {
+            x = Expr::bin(BinOp::And, x, Expr::int((1i64 << width) - 1), ty);
+        }
+        args[1] = x;
         args[2] = Expr::int(fs);
     });
 }

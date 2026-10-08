@@ -570,12 +570,21 @@ impl Mwcc {
                         let ms = t.elapsed().as_secs_f64() * 1000.0;
                         return Ok(Compiled { obj, obj_path: PathBuf::new(), messages: String::new(), ms, cache_hit: false, fast: true });
                     }
-                    fast::Outcome::Failed(w) => fast_failed = Some((fp, w)),
+                    fast::Outcome::Failed(w) => {
+                        if fp.trusted_failure(w) {
+                            // a compile error without its messages (not cached: unconfirmed)
+                            return Err(MwccError::Compile { status: Some(1), messages: "compile failed (persistent compiler; messages not collected)".into() });
+                        }
+                        fast_failed = Some((fp, w))
+                    }
                     fast::Outcome::NotReady => {}
                 }
             }
         }
         let res = self.compile_in_slow(ctx, code, key);
+        if let (Some((fp, w)), Err(MwccError::Compile { .. })) = (&fast_failed, &res) {
+            fp.failure_confirmed(*w);
+        }
         if let (Some((fp, w)), Ok(_)) = (&fast_failed, &res) {
             fp.poisoned(*w);
             if std::env::var_os("MWDEC_MWCC_LOG").is_some() {
@@ -627,7 +636,7 @@ impl Mwcc {
         res
     }
 
-    /// Turn on the fast path for candidate compiles: up to `workers` (at most 4) persistent
+    /// Turn on the fast path for candidate compiles: up to `workers` (at most [`MAX_FAST_WORKERS`]) persistent
     /// compiler threads (module `fast`), started on first use. GC/2.7 only; contexts compiled
     /// with line information (`-sym`, `-g`) always compile normally. `MWDEC_PERSIST=0` in the
     /// environment keeps it off. Returns whether it is on.
@@ -637,7 +646,7 @@ impl Mwcc {
         }
         let mut f = self.fast.write().unwrap();
         if f.is_none() {
-            *f = Some(Arc::new(fast::FastPool::new(workers.clamp(1, 4), self.pool.clone())));
+            *f = Some(Arc::new(fast::FastPool::new(workers.clamp(1, MAX_FAST_WORKERS), self.pool.clone())));
         }
         true
     }
@@ -748,6 +757,16 @@ impl Mwcc {
         }
         Some(p)
     }
+}
+
+/// Most persistent-compiler workers of one driver (each holds up to two context snapshots of a
+/// few MB plus an idle compiler process).
+pub const MAX_FAST_WORKERS: usize = 6;
+
+/// Fast-path workers for search drivers: `MWDEC_FAST_WORKERS` (1..=MAX_FAST_WORKERS), else
+/// `default`.
+pub fn fast_workers_from_env(default: usize) -> usize {
+    std::env::var("MWDEC_FAST_WORKERS").ok().and_then(|v| v.trim().parse().ok()).map_or(default, |n: usize| n.clamp(1, MAX_FAST_WORKERS))
 }
 
 /// Attempts of a compile whose compiler could not open one of our work files.

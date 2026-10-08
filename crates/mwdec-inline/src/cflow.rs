@@ -281,6 +281,21 @@ fn has_if(b: &[Stmt]) -> bool {
     b.iter().any(|s| matches!(s, Stmt::If { .. }))
 }
 
+/// `x != 0` operands of `&&`/`||` as plain truth tests `x`.
+fn truth_operands(e: &mut Expr) {
+    if let Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, l, r, .. } = e {
+        for x in [l, r] {
+            truth_operands(x);
+            if let Expr::Binary { op: BinOp::Ne, l: a, r: z, .. } = &**x {
+                if matches!(**z, Expr::Int { value: 0, .. }) && !matches!(**a, Expr::Cast { .. }) {
+                    let a = (**a).clone();
+                    **x = a;
+                }
+            }
+        }
+    }
+}
+
 /// Fold if-regions that compute one value into a call of a control-flow inline.
 pub fn rewrite_regions(b: &mut Vec<Stmt>, whole: &[Stmt], env: &MEnv, idx: &Index) -> usize {
     let mut n = 0;
@@ -302,7 +317,9 @@ pub fn try_region_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &MEnv, id
     let jmax = (i + 6).min(b.len());
     for j in (i + 1..=jmax).rev() {
         let w = &b[i..j];
-        if !has_if(w) {
+        // a value-context `&&`/`||` chain the lifter already materialised (`v = a && (b || c)`)
+        let chain = j == i + 1 && matches!(&w[0], Stmt::Assign { dst: Expr::Var(_), src: Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, .. } });
+        if !has_if(w) && !chain {
             continue;
         }
         // values computed inside the window must be single-use and call-free (else folding
@@ -329,7 +346,17 @@ pub fn try_region_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &MEnv, id
             continue;
         }
         let mut fenv = Env::new();
-        let Ok(r) = fold_list(w, &mut fenv, true) else { continue };
+        let r = if chain {
+            let Stmt::Assign { dst: Expr::Var(v), src } = &w[0] else { continue };
+            // operands tested for truth as the condition form spells them (`p` for `p != 0`)
+            let mut src = src.clone();
+            truth_operands(&mut src);
+            fenv.insert(*v, src);
+            None
+        } else {
+            let Ok(r) = fold_list(w, &mut fenv, true) else { continue };
+            r
+        };
         let mut cands: Vec<(Option<VarId>, Expr)> = vec![];
         match r {
             Some(v) => {
@@ -395,4 +422,30 @@ pub fn try_region_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &MEnv, id
         }
     }
     false
+}
+
+/// Truth tests in one spelling: `x != 0` -> `x`, `x == 0` -> `!x` (through integer casts of
+/// the tested value), `!!x` -> `x`, inside `&&` / `||` / `!`.
+pub fn truth_canon(e: &mut Expr) {
+    fn bare(x: &Expr) -> Expr {
+        match x {
+            Expr::Cast { ty, e } if matches!(crate::util::strip(ty), Type::Int { .. } | Type::Bool) && !matches!(**e, Expr::Binary { .. }) => (**e).clone(),
+            x => x.clone(),
+        }
+    }
+    match e {
+        Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, l, r, .. } => {
+            truth_canon(l);
+            truth_canon(r);
+        }
+        Expr::Binary { op: BinOp::Ne, l, r, .. } if matches!(**r, Expr::Int { value: 0, .. }) => *e = bare(l),
+        Expr::Binary { op: BinOp::Eq, l, r, .. } if matches!(**r, Expr::Int { value: 0, .. }) => *e = Expr::Unary { op: UnOp::Not, e: Box::new(bare(l)), ty: Type::Bool },
+        Expr::Unary { op: UnOp::Not, e: inner, .. } => {
+            truth_canon(inner);
+            if let Expr::Unary { op: UnOp::Not, e: x, .. } = &**inner {
+                *e = (**x).clone();
+            }
+        }
+        _ => {}
+    }
 }

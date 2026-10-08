@@ -149,3 +149,83 @@ pub fn forward_inline_args(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
     });
     n
 }
+
+/// Variant point [`crate::variants::ORDER_ADDRESS_FIRST`]: the first `v = X; t = &obj...;` pair of
+/// adjacent independent temp assignments (no calls or stores, `t` a pointer, `v` not) swapped.
+pub fn address_temps_first(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    fn pure(e: &Expr) -> bool {
+        !e.has_call()
+    }
+    let mut at = None;
+    let mut seen = false;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        if seen {
+            return;
+        }
+        for k in 0..b.len().saturating_sub(1) {
+            let (Stmt::Assign { dst: Expr::Var(v), src: x }, Stmt::Assign { dst: Expr::Var(t), src: y }) = (&b[k], &b[k + 1]) else { continue };
+            if v == t || !is_ptr(&vars[*t].ty) || is_ptr(&vars[*v].ty) || !pure(x) || !pure(y) {
+                continue;
+            }
+            if !matches!(vars[*v].kind, VarKind::Local) || !matches!(vars[*t].kind, VarKind::Local) {
+                continue;
+            }
+            if y.uses_var(*v) || x.uses_var(*t) || !matches!(y, Expr::AddrOf(_)) {
+                continue;
+            }
+            seen = true;
+            if crate::variants::alt(crate::variants::ORDER_ADDRESS_FIRST) {
+                at = Some(k);
+                b.swap(k, k + 1);
+            }
+            return;
+        }
+    });
+    at.map_or(0, |_| 1)
+}
+
+/// Variant point [`crate::variants::ORDER_SPLIT_LAST_FIELD`]: the first `v = a | b | c | (x..);`
+/// (at least four or-ed field inserts into a local) becomes `v = a | b | c; v = v | (x..);`.
+pub fn split_last_field(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    fn field(e: &Expr) -> bool {
+        matches!(e, Expr::Binary { op: BinOp::Shl | BinOp::And, .. })
+    }
+    fn ors(e: &Expr) -> usize {
+        match e {
+            Expr::Binary { op: BinOp::Or, l, r, .. } => ors(l) + ors(r),
+            _ => 1,
+        }
+    }
+    let mut done = false;
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        if done {
+            return;
+        }
+        for k in 0..b.len() {
+            let Stmt::Assign { dst: Expr::Var(v), src: Expr::Binary { op: BinOp::Or, l, r, ty } } = &b[k] else { continue };
+            if !matches!(vars[*v].kind, VarKind::Local) || ors(l) < 3 || !field(r) || l.uses_var(*v) || r.uses_var(*v) {
+                continue;
+            }
+            done = true;
+            if crate::variants::alt(crate::variants::ORDER_SPLIT_LAST_FIELD) {
+                let (v, l, mut r, ty) = (*v, (**l).clone(), (**r).clone(), ty.clone());
+                // the field masked before it is shifted (`(x & m) << s`, as an `|=` statement is written)
+                if let Expr::Binary { op: BinOp::And, l: sx, r: mm, ty: aty } = &r {
+                    if let (Expr::Binary { op: BinOp::Shl, l: x, r: sh, .. }, Some(m)) = (&**sx, mm.as_int()) {
+                        if let Some(k) = sh.as_int().filter(|k| (1..32).contains(k)) {
+                            if m & ((1 << k) - 1) == 0 {
+                                r = Expr::bin(BinOp::Shl, Expr::bin(BinOp::And, (**x).clone(), Expr::uint(m >> k), aty.clone()), Expr::int(k), aty.clone());
+                            }
+                        }
+                    }
+                }
+                b[k] = Stmt::Assign { dst: Expr::Var(v), src: l };
+                b.insert(k + 1, Stmt::Assign { dst: Expr::Var(v), src: Expr::bin(BinOp::Or, Expr::Var(v), r, ty) });
+                n = 1;
+            }
+            return;
+        }
+    });
+    n
+}

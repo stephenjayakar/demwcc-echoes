@@ -112,6 +112,22 @@ fn simp(e: &mut Expr, vars: &[Var]) {
         *e = n;
         return;
     }
+    // (x + a) + b  /  (x + a) - b  ->  x + (a + b) / x + (a - b) (an address split into
+    // `addis` / `addi` halves, so the array and member recovery sees one offset)
+    if let Expr::Binary { op: op @ (BinOp::Add | BinOp::Sub), l, r, ty } = e {
+        if let (Expr::Binary { op: BinOp::Add, l: x, r: a, .. }, Some(b)) = (&**l, r.as_int()) {
+            if let Some(a) = a.as_int() {
+                if !is_ptr(&ty_of(x, vars)) && matches!(strip_cv(ty), Type::Int { size: 4, .. }) {
+                    let c = if *op == BinOp::Add { a + b } else { a - b };
+                    if (-0x8000_0000..=0xffff_ffff).contains(&c) {
+                        let cty = ty.clone();
+                        *e = Expr::Binary { op: BinOp::Add, l: x.clone(), r: Box::new(Expr::int(c)), ty: cty };
+                        return;
+                    }
+                }
+            }
+        }
+    }
     // (x & a) & b  ->  x & (a & b)
     if let Expr::Binary { op: BinOp::And, l, r, ty } = e {
         if let (Expr::Binary { op: BinOp::And, l: x, r: a, .. }, Some(b)) = (&**l, r.as_int()) {
@@ -217,6 +233,14 @@ fn simp(e: &mut Expr, vars: &[Var]) {
                     if let Expr::Binary { op: BinOp::Sub, l: x, r: y, .. } = uncast(&args[0]) {
                         if y.as_int().is_none() {
                             *e = Expr::cmp(BinOp::Eq, (**y).clone(), (**x).clone());
+                            return;
+                        }
+                    }
+                    // `a == K` is `addi -K ; cntlzw ; srwi 5`
+                    if let Expr::Binary { op: op @ (BinOp::Add | BinOp::Sub), l: x, r: k, .. } = uncast(&args[0]) {
+                        if let Some(k) = k.as_int().filter(|k| *k != 0 && (-0x8000..=0x8000).contains(k)) {
+                            let k = if *op == BinOp::Add { -k } else { k };
+                            *e = Expr::cmp(BinOp::Eq, (**x).clone(), Expr::int(k));
                             return;
                         }
                     }
@@ -1042,13 +1066,49 @@ pub fn fold_virtual_delete_checks(body: &mut Vec<Stmt>) {
             if !crate::sig::is_dtor(sg) || args.len() != 1 || args[0].as_int() != Some(1) {
                 continue;
             }
-            let tests_this = match uncast(cond) {
+            let tests = |c: &Expr| match uncast(c) {
                 Expr::Binary { op: BinOp::Ne, l, r, .. } => uncast(l) == uncast(this) && r.as_int() == Some(0),
                 c => c == uncast(this),
             };
-            if tests_this {
+            if tests(cond) {
                 let call = (*call).clone();
                 *s = Stmt::Expr(call);
+            } else if let Expr::Binary { op: BinOp::LogAnd, l, r, .. } = uncast(cond) {
+                // `if (x && p) delete p;`: the last test is the delete-expression's own
+                if tests(r) {
+                    let l = (**l).clone();
+                    *cond = l;
+                }
+            }
+        }
+    });
+}
+
+/// `if (p && p) delete p;` -> `if (p) delete p;`: a virtual delete already folded to
+/// `__delete(p)` brings its own test, so two tests are the explicit one and the delete's (runs
+/// after `localtypes::fold_delete_checks`, which drops a lone test before a delete).
+pub fn fold_double_delete_checks(body: &mut Vec<Stmt>) {
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            let Stmt::If { cond, then, els } = s else { continue };
+            if !els.is_empty() || then.len() != 1 {
+                continue;
+            }
+            let Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }) = &then[0] else { continue };
+            if symbol != "__delete" || args.len() != 1 {
+                continue;
+            }
+            let p = uncast(&args[0]).clone();
+            let tests_p = |c: &Expr| match uncast(c) {
+                Expr::Binary { op: BinOp::Ne, l, r, .. } => *uncast(l) == p && r.as_int() == Some(0),
+                c => *c == p,
+            };
+            let new = match uncast(cond) {
+                Expr::Binary { op: BinOp::LogAnd, l, r, .. } if tests_p(l) && tests_p(r) => Some((**l).clone()),
+                _ => None,
+            };
+            if let Some(n) = new {
+                *cond = n;
             }
         }
     });

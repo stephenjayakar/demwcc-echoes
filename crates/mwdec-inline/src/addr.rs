@@ -79,7 +79,11 @@ pub fn access(e: &Expr, env: &Env) -> Option<(Expr, i32)> {
 /// The class the pointer `p` points at (or the object `X` of `&X`).
 pub fn outer_class(p: &Expr, env: &Env) -> Option<String> {
     match p {
-        Expr::AddrOf(x) => class_name(&ty_of(x, env.vars), env.db),
+        // (the address of a reference member is the referenced object's)
+        Expr::AddrOf(x) => match ty_of(x, env.vars) {
+            Type::Ref(inner) => class_name(&inner, env.db),
+            t => class_name(&t, env.db),
+        },
         _ => {
             let t = ty_of(p, env.vars);
             class_name(mwdec_lift::pointee(&t)?, env.db)

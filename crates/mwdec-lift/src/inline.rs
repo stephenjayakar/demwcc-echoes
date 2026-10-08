@@ -255,7 +255,8 @@ fn conflicts(fx_e: &Effects, s: &Stmt, is_temp: &[bool], vars: &[Var]) -> bool {
 fn sibling_calls(e: &Expr, t: VarId) -> usize {
     let mut n = 0;
     e.walk(&mut |x| {
-        if let Expr::Call { .. } = x {
+        // (a construction running a member's out-of-line constructor counts as a call)
+        if matches!(x, Expr::Call { .. }) || crate::construct::runs_code(x) {
             if !x.uses_var(t) && !x.is_pure_call() {
                 n += 1;
             }

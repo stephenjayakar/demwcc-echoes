@@ -51,6 +51,12 @@ pub struct Template {
     /// Operator/call nodes in the pattern (specificity).
     pub ops: usize,
     pub ret_ref: bool,
+    /// Dead frame stores the expansion leaves (size, stored value over the holes): the copy
+    /// of a by-value class parameter or return value. A match needs equal ones in the target.
+    pub dead: Vec<(u32, Expr)>,
+    /// From a function template instantiated with a guessed scalar type: a declared function
+    /// with the same expansion is preferred.
+    pub guessed: bool,
 }
 
 pub fn hole_kind(t: &Type, db: &TypeDb) -> HoleKind {
@@ -62,7 +68,8 @@ pub fn hole_kind(t: &Type, db: &TypeDb) -> HoleKind {
             if let Some(c) = class_name(inner, db) {
                 return HoleKind::Obj { class: c, ptr: is_ptr, temp_ok: !is_ptr && is_const };
             }
-            if !is_ptr && mwdec_lift::scalar_size(strip(inner)).is_some() && !matches!(strip(inner), Type::Unknown { .. }) {
+            let scalar = mwdec_lift::scalar_size(strip(inner)).is_some() || mwdec_lift::types::is_enum(Some(db), strip(inner));
+            if !is_ptr && scalar && !matches!(strip(inner), Type::Unknown { .. }) {
                 return HoleKind::ScalarRef((**inner).clone());
             }
             HoleKind::Scalar(t.clone())
@@ -121,6 +128,13 @@ fn subst(e: &mut Expr, defs: &HashMap<VarId, Expr>) {
 }
 
 /// Rename probe parameters to hole indices; None if other variables remain.
+/// The probe's dead frame stores over its parameters' holes (None when a value isn't
+/// expressible in them).
+pub fn dead_patterns(ir: &IrFunction) -> Option<Vec<(u32, Expr)>> {
+    let map: HashMap<VarId, usize> = ir.params.iter().enumerate().map(|(i, v)| (*v, i)).collect();
+    ir.dead_stores.iter().map(|d| Some((d.size, to_holes(&d.value, &map)?))).collect()
+}
+
 fn to_holes(e: &Expr, map: &HashMap<VarId, usize>) -> Option<Expr> {
     let mut ok = true;
     let mut e = e.clone();
@@ -334,7 +348,7 @@ fn from_probe_expr(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, 
         Shape::Object { comps, .. } | Shape::Mutate { comps, .. } => comps.iter().map(|c| count_ops(&c.pat)).sum(),
         Shape::Stmts { .. } => 0,
     };
-    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape, ops, ret_ref: p.ret_ref })
+    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape, ops, ret_ref: p.ret_ref, dead: vec![], guessed: p.fn_template })
 }
 
 /// A probe whose body has control flow: fold it into one value expression (ternaries).
@@ -357,5 +371,5 @@ fn from_cflow_probe(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template,
         }
     }
     let ops = count_ops(&e);
-    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape: Shape::Scalar(e), ops, ret_ref: p.ret_ref })
+    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape: Shape::Scalar(e), ops, ret_ref: p.ret_ref, dead: vec![], guessed: p.fn_template })
 }

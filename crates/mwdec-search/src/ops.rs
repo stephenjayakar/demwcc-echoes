@@ -138,6 +138,11 @@ pub const OPS: &[OpDef] = &[
     OpDef { name: "ret_var", cat: Cat::Control, weight: 2.0, aff: L | C, f: crate::near::op_ret_var },
     OpDef { name: "delete_stmt", cat: Cat::Expr, weight: 1.0, aff: C, f: crate::near::op_delete_stmt },
     OpDef { name: "retype_all", cat: Cat::Types, weight: 3.0, aff: R | C, f: op_retype_all },
+    OpDef { name: "return_implicit", cat: Cat::Expr, weight: 2.5, aff: S | M_ | C, f: crate::near::op_return_implicit },
+    OpDef { name: "const_call", cat: Cat::Types, weight: 1.5, aff: C, f: crate::near::op_const_call },
+    OpDef { name: "shift_form", cat: Cat::Expr, weight: 2.0, aff: C | S, f: op_shift_form },
+    OpDef { name: "cmp_select", cat: Cat::Expr, weight: 2.0, aff: C | L, f: crate::near::op_cmp_select },
+    OpDef { name: "flag_and", cat: Cat::Control, weight: 2.5, aff: L | C, f: crate::near::op_flag_and },
     OpDef { name: "ctor_copy", cat: Cat::Expr, weight: 4.0, aff: S | R | C, f: crate::near::op_ctor_copy },
     // Verified no codegen effect: near-zero weight (cleanup / stepping stones only).
     OpDef { name: "unwrap_block", cat: Cat::Order, weight: 0.46, aff: 0, f: op_unwrap_block },
@@ -1351,22 +1356,131 @@ fn op_retype_all(m: &mut M) -> Option<Vec<Edit>> {
     Some(decls.iter().filter(|(_, t)| t == from).map(|(n, _)| Edit::replace(c, *n, to)).collect())
 }
 
+/// Concrete types for a `__typeof__(e)` temporary (the width the source gave it decides masks,
+/// sign extension and compares: `uchar flags = a | b << 1;`).
+const TYPEOF_ALTS: &[&str] = &["int", "unsigned int", "unsigned char", "unsigned short", "short", "char", "bool"];
+
 fn op_local_type(m: &mut M) -> Option<Vec<Edit>> {
     let c = m.cst;
     let mut cands = Vec::new();
     for d in m.of_kind(&["declaration"]) {
+        // `__typeof__(e) t = e;` (made by extract/cse) -> an integer type
+        let txt = c.text(d).trim_start();
+        if txt.starts_with("__typeof__") {
+            if let Some(close) = matching_paren(txt, txt.find('(').unwrap_or(0)) {
+                let start = c.nodes[d].start + (c.text(d).len() - txt.len());
+                for a in TYPEOF_ALTS {
+                    cands.push((Edit { start, end: start + close + 1, text: a.to_string() }, ()));
+                }
+            }
+            continue;
+        }
         let Some(t) = c.child(d, "type") else { continue };
         if let Some((_, alts)) = TYPE_ALTS.iter().find(|(k, _)| *k == c.text(t)) {
             let names = names_declared(c, d);
             for a in alts.iter() {
                 if names.iter().all(|n| literals_fit(c, m.info, n, a)) {
-                    cands.push((t, *a));
+                    cands.push((Edit::replace(c, t, *a), ()));
                 }
             }
         }
     }
-    let (t, a) = m.pick(&cands)?;
-    Some(vec![Edit::replace(c, t, a)])
+    let (e, _) = m.pick_one(&cands)?;
+    Some(vec![e])
+}
+
+/// Index of the `)` matching the `(` at `open` in `s`.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, ch) in s.char_indices().skip_while(|(i, _)| *i < open) {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Shift / mask / multiply forms of one value (the compiler selects `rlwinm` forms from the
+/// expression shape): `x * 2^k` <-> `x << k`, `(x << k) & M` <-> `(x & (M >> k)) << k`,
+/// `(x >> k) & M` <-> `(x & (M << k)) >> k`.
+fn op_shift_form(m: &mut M) -> Option<Vec<Edit>> {
+    let c = m.cst;
+    let lit = |n: usize| literal_value(c, n);
+    let hex = |v: i64| if v >= 10 { format!("0x{v:x}") } else { v.to_string() };
+    let mut cands: Vec<(usize, String)> = Vec::new();
+    for n in m.nodes.clone() {
+        if c.kind(n) != "binary_expression" {
+            continue;
+        }
+        let (Some(l), Some(r)) = (c.child(n, "left"), c.child(n, "right")) else { continue };
+        match c.op(n) {
+            Some("*") => {
+                for (x, k) in [(l, r), (r, l)] {
+                    if let Some(v) = lit(k).filter(|v| *v > 1 && (*v as u64).is_power_of_two()) {
+                        cands.push((n, format!("({} << {})", ptext(c, x), v.trailing_zeros())));
+                    }
+                }
+            }
+            Some("<<") => {
+                if let Some(k) = lit(r).filter(|k| (1..31).contains(k)) {
+                    cands.push((n, format!("({} * {})", ptext(c, l), hex(1 << k))));
+                }
+            }
+            Some("&") => {
+                for (x, mk) in [(l, r), (r, l)] {
+                    let Some(mask) = lit(mk).filter(|v| *v > 0) else { continue };
+                    let inner = strip_parens_node(c, x);
+                    if c.kind(inner) != "binary_expression" {
+                        continue;
+                    }
+                    let (Some(il), Some(ir)) = (c.child(inner, "left"), c.child(inner, "right")) else { continue };
+                    let Some(k) = lit(ir).filter(|k| (1..31).contains(k)) else { continue };
+                    match c.op(inner) {
+                        Some("<<") if mask & ((1 << k) - 1) == 0 => cands.push((n, format!("(({} & {}) << {k})", ptext(c, il), hex(mask >> k)))),
+                        Some(">>") => cands.push((n, format!("(({} & {}) >> {k})", ptext(c, il), hex(mask << k)))),
+                        _ => {}
+                    }
+                }
+                // (x & M) << k is handled from the shift side below
+            }
+            _ => {}
+        }
+        // (x & M) << k -> (x << k) & (M << k);  (x & M) >> k -> (x >> k) & (M >> k)
+        if let (Some(op @ ("<<" | ">>")), Some(k)) = (c.op(n), lit(r).filter(|k| (1..31).contains(k))) {
+            let inner = strip_parens_node(c, l);
+            if c.kind(inner) == "binary_expression" && c.op(inner) == Some("&") {
+                if let (Some(il), Some(ir)) = (c.child(inner, "left"), c.child(inner, "right")) {
+                    for (x, mk) in [(il, ir), (ir, il)] {
+                        if let Some(mask) = lit(mk).filter(|v| *v > 0) {
+                            let m2 = if op == "<<" { mask << k } else { mask >> k };
+                            if m2 > 0 {
+                                cands.push((n, format!("(({} {op} {k}) & {})", ptext(c, x), hex(m2))));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (n, t) = m.pick_one(&cands)?;
+    Some(vec![Edit::replace(c, n, t)])
+}
+
+fn strip_parens_node(c: &Cst, mut n: usize) -> usize {
+    while c.kind(n) == "parenthesized_expression" {
+        match c.named(n).first() {
+            Some(&x) => n = x,
+            None => break,
+        }
+    }
+    n
 }
 
 fn op_const_local(m: &mut M) -> Option<Vec<Edit>> {

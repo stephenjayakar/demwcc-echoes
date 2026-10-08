@@ -107,7 +107,7 @@ impl HeaderIndex {
     }
 
     /// Best header for a type name: the one named after it, else the shortest path.
-    fn header_for(&self, name: &str) -> Option<&String> {
+    pub fn header_for(&self, name: &str) -> Option<&String> {
         let v = self.defs.get(name)?;
         v.iter()
             .find(|h| Path::new(h).file_stem().and_then(|s| s.to_str()) == Some(name))
@@ -149,7 +149,7 @@ fn idents(s: &str) -> Vec<&str> {
 }
 
 /// Type names referenced by a symbol name (mangled C++ names only).
-fn type_names_of(sym: &str, out: &mut BTreeSet<String>) {
+pub fn type_names_of(sym: &str, out: &mut BTreeSet<String>) {
     let s = mwdec_lift::sig::strip_dtk_suffix(sym);
     let Some(d) = mwdec_lift::sig::demangle(s) else { return };
     for t in idents(&d) {

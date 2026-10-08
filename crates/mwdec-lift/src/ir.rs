@@ -293,6 +293,9 @@ pub struct IrFunction {
     /// The target's string pool from its start up to the last string this function uses, when
     /// that string isn't at offset 0 (earlier functions of the unit put strings before it).
     pub string_pool: Vec<Vec<u8>>,
+    /// Bytes of the compiler / splitter literals (`@N`, `lbl_` words) the function references:
+    /// the values behind constants passed to `const T&` parameters.
+    pub literal_bytes: Vec<(String, Vec<u8>)>,
     /// Frame stores nothing reads, dropped from `body` (see [`DeadStackStore`]).
     pub dead_stores: Vec<DeadStackStore>,
 }

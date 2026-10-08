@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when the TypeDb produced for the same inputs changes (invalidates caches).
-const CACHE_VERSION: &str = "mwdec-ctx-22b-bool-static-members";
+const CACHE_VERSION: &str = "mwdec-ctx-24-decl-order-default-args";
 
 /// Parse the DWARF of an already-compiled MWCC object into a TypeDb (no header scan).
 pub fn typedb_from_object_bytes(elf: &[u8]) -> Result<TypeDb> {

@@ -29,16 +29,72 @@ pub const STRUCTCOPY_NO_TEMP: &str = "structcopy.no_temp";
 /// Keep a returned object built in the struct-return storage (no `return x;` / `return T(..);`).
 pub const STRUCTCOPY_NO_RETURN: &str = "structcopy.no_return";
 
+/// Pass trailing arguments equal to the declaration's default arguments explicitly (by default
+/// they are omitted: MWCC reuses one temporary for an omitted by-value class default across
+/// calls, but makes a fresh one for each explicit argument).
+pub const EXPLICIT_DEFAULT_ARGS: &str = "emit.explicit_default_args";
 /// A returned object filled from one object (through flag checks and early returns, as an
 /// `optional_object` copy does) becomes `return x;`.
 pub const STRUCTCOPY_RETURN_WHOLE: &str = "structcopy.return_whole";
+/// Values read from memory once and kept in a local read again at every use (MWCC CSEs the reads).
+/// (named to sort after the other points: the driver tries the first `MAX_VARIANT_POINTS` asked)
+pub const REREAD_TEMPS: &str = "temps.reread";
+
+/// A value computed once and used to start several register words (`t = id << 1; ra = (t +
+/// 224) << 24; bg = (t + 225) << 24;`) is written out at each start, as the SDK does
+/// (`(0xE0 + id * 2) << 24`); the compiler's CSE then decides the registers.
+pub const SDK_WORD_SHARED_INLINE: &str = "sdk.word_shared_inline";
+
+/// An address temp computed right after an independent value temp moves before it (the source
+/// took the object's address first: `T& s = a[i]; u32 f = ...;`).
+pub const ORDER_ADDRESS_FIRST: &str = "order.address_first";
+
+/// A guessed struct return whose class nothing names takes the only class of the context whose
+/// layout and constructor fit the stores into it (`return T(args);`).
+pub const SRET_CLASS_BY_LAYOUT: &str = "sret.class_by_layout";
+
+/// A run of word copies (`*(int*)(d + 4k) = *(int*)(s + 4k)`) becomes 64-bit copies, one per pair.
+pub const STRUCTCOPY_WORDS_LL: &str = "structcopy.words_ll";
+/// A run of word copies becomes one block copy through a helper struct (`mwdec_lift::helpers`).
+pub const STRUCTCOPY_WORDS_BLOCK: &str = "structcopy.words_block";
+
+/// A packed word built from field inserts `v = a | b | c | d;` gets its last field in a statement
+/// of its own (`v = a | b | c; v |= d;`: the compiler copies the partial word before the insert).
+pub const ORDER_SPLIT_LAST_FIELD: &str = "order.split_last_field";
+
+/// GC/1.2.5n: draft locals in volatile registers holding a global read are folded into their
+/// single use when the target's frame shows no scalar-local slots (`mwdec_lift::sdkframe`).
+pub const SDK_FOLD_SLOT_LOCALS: &str = "sdk.fold_slot_locals";
+
+/// A scaled array index (`a[x * 2]`) comes from a named local assigned right before its
+/// statement (`int index = x * 2;`), which fixes when the compiler computes it.
+pub const INDEX_NAMED_SCALED: &str = "index.named_scaled";
+
+/// A free algorithm's result (`it = rstl::find(...)`) used once by the next condition stays a named
+/// local instead of being written into the condition.
+pub const NAMED_ALGORITHM_RESULT: &str = "inline.named_algorithm_result";
+
+/// Successive webs of one callee-saved register (`temp_r31`, `temp_r31_2`) are one variable.
+pub const MERGE_REGISTER_WEBS: &str = "regs.merge_webs";
 
 /// Registered decision points: (name, what the alternative does).
 pub const POINTS: &[(&str, &str)] = &[
+    (EXPLICIT_DEFAULT_ARGS, "trailing arguments equal to their declared defaults are passed explicitly"),
     (STRUCTCOPY_SETTERS, "a run of member setters from one object's getters becomes a whole-object copy"),
     (STRUCTCOPY_NO_TEMP, "a temporary built from every member of one object stays a construction"),
     (STRUCTCOPY_NO_RETURN, "a returned object stays built in the struct-return storage"),
+    (REREAD_TEMPS, "single-assignment locals of pure memory reads are re-read where they are used"),
+    (STRUCTCOPY_WORDS_LL, "a run of word copies between two objects becomes 64-bit copies (one per word pair)"),
+    (STRUCTCOPY_WORDS_BLOCK, "a run of word copies between two objects becomes one block copy (helper struct)"),
     (STRUCTCOPY_RETURN_WHOLE, "a returned object filled from one object behind flag checks becomes `return x;`"),
+    (SDK_WORD_SHARED_INLINE, "a value shared by several register-word starts is written out at each start"),
+    (SDK_FOLD_SLOT_LOCALS, "volatile-register locals holding a global read fold into their use (no frame slots)"),
+    (INDEX_NAMED_SCALED, "a scaled array index comes from a named local assigned before its statement"),
+    (MERGE_REGISTER_WEBS, "successive webs of one callee-saved register are one variable"),
+    (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
+    (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),
+    (ORDER_SPLIT_LAST_FIELD, "a packed word built from field inserts gets its last field in a statement of its own"),
+    (SRET_CLASS_BY_LAYOUT, "an unnamed struct return takes the one context class whose layout and constructor fit its stores"),
 ];
 
 #[derive(Default)]

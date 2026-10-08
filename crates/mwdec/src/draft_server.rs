@@ -73,9 +73,17 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_e
     if kind.is_none() && mwdec_emit::instantiate::is_template_instance(&f.name) {
         r.alts = instantiation_drafts(ui, f);
     }
+    let _ = mwdec_inline::stmtinl::take_forwarded();
     match draft_with(ui, f, include_implicit) {
         Ok(s) => {
             r.status = "ok".into();
+            // a container statement inline on a member container: also through a local
+            if mwdec_inline::stmtinl::take_forwarded() > 0 {
+                mwdec_inline::stmtinl::set_container_locals(true);
+                let v = draft_with(ui, f, include_implicit).ok().filter(|v| *v != s);
+                mwdec_inline::stmtinl::set_container_locals(false);
+                r.alts.extend(v);
+            }
             if ui.inlines.enabled {
                 r.plain = draft_variant(ui, f, false, true).ok().filter(|p| *p != s);
             }

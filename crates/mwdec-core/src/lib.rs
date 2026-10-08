@@ -329,6 +329,14 @@ pub struct DeclInfo {
     /// `:` (`value ( - 1 )`); None when the definition has none.
     #[serde(default)]
     pub init_list: Option<String>,
+    /// Position of the declaration in the scanned headers (declaration order: virtual
+    /// functions get vtable slots in this order).
+    #[serde(default)]
+    pub order: u32,
+    /// Default argument of each parameter as written, space-joined tokens (`kInvalidUniqueId`,
+    /// `- 1`); None for parameters without one. Empty when no parameter has a default.
+    #[serde(default)]
+    pub defaults: Vec<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -365,6 +373,10 @@ pub struct TypeDb {
     /// CodeWarrior extension DWARF doesn't describe): name -> address.
     #[serde(default)]
     pub abs_addrs: BTreeMap<String, u32>,
+    /// Classes whose destructor the unit's target object defines or calls (qualified names):
+    /// a stand-in for a class the context lacks declares it, so `delete` calls it.
+    #[serde(default)]
+    pub object_dtors: std::collections::BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------- match results

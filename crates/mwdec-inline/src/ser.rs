@@ -191,6 +191,10 @@ pub struct STemplate {
     shape: SShape,
     ops: usize,
     ret_ref: bool,
+    #[serde(default)]
+    dead: Vec<(u32, SExpr)>,
+    #[serde(default)]
+    guessed: bool,
 }
 
 /// A cache entry: the template, or why the probe gives none.
@@ -229,6 +233,8 @@ pub fn encode(t: &Template) -> Option<Entry> {
         },
         ops: t.ops,
         ret_ref: t.ret_ref,
+        dead: t.dead.iter().map(|(n, e)| (*n, se(e))).collect(),
+        guessed: t.guessed,
     }))
 }
 
@@ -265,6 +271,8 @@ pub fn decode(e: &Entry) -> Result<Template, String> {
         },
         ops: t.ops,
         ret_ref: t.ret_ref,
+        dead: t.dead.iter().map(|(n, e)| (*n, de(e))).collect(),
+        guessed: t.guessed,
     })
 }
 
@@ -313,6 +321,175 @@ impl Cache {
             // write-then-rename so concurrent readers never see a partial file
             let tmp = p.with_extension(format!("tmp{}", std::process::id()));
             if std::fs::write(&tmp, s).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
+    }
+}
+
+/// Disk cache of compiled probe functions (a probe's text + compiler + flags decide its code,
+/// whatever the lifter): templates are re-lifted from these after a lifter change without
+/// compiling again. Each entry is a minimal object: the probe function (named `__P...`) and
+/// the data it references.
+pub struct ObjCache {
+    dir: std::path::PathBuf,
+    salt: String,
+}
+
+impl ObjCache {
+    pub fn new(dir: std::path::PathBuf, salt: String) -> ObjCache {
+        let _ = std::fs::create_dir_all(&dir);
+        ObjCache { dir, salt }
+    }
+
+    fn path(&self, probe_text: &str) -> std::path::PathBuf {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in self.salt.bytes().chain([0u8]).chain(probe_text.bytes()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        self.dir.join(format!("{:02x}", h & 0xff)).join(format!("{h:016x}.json"))
+    }
+
+    /// `Some(None)`: compiled, but the probe function wasn't in the object.
+    pub fn get(&self, probe_text: &str) -> Option<Option<mwdec_core::ObjectFile>> {
+        let s = std::fs::read_to_string(self.path(probe_text)).ok()?;
+        let (text, o): (String, Option<mwdec_core::ObjectFile>) = serde_json::from_str(&s).ok()?;
+        (text == probe_text).then_some(o)
+    }
+
+    pub fn put(&self, probe_text: &str, o: &Option<mwdec_core::ObjectFile>) {
+        let p = self.path(probe_text);
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        if let Ok(s) = serde_json::to_string(&(probe_text, o)) {
+            let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, s).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
+    }
+}
+
+/// The minimal object of one function of `obj`: the function renamed `prefix` -> `__P`, the
+/// data symbols its relocations reach (two levels) laid out in fresh sections.
+pub fn minimal_object(obj: &mwdec_core::ObjectFile, f: &mwdec_core::Function, prefix: &str) -> mwdec_core::ObjectFile {
+    use mwdec_core::{DataSymbol, ObjectFile, Section, SymbolDef};
+    let mut want: Vec<String> = f.relocs.iter().map(|r| r.target.clone()).collect();
+    let mut k = 0;
+    while k < want.len() && k < 256 {
+        if let Some(d) = obj.data.get(&want[k]) {
+            for r in &d.relocs {
+                if !want.contains(&r.target) {
+                    want.push(r.target.clone());
+                }
+            }
+        }
+        k += 1;
+    }
+    let rename = |n: &str| if let Some(rest) = n.strip_prefix(prefix) { format!("__P{rest}") } else { n.to_string() };
+    let mut out = ObjectFile { path: obj.path.clone(), ..Default::default() };
+    let mut func = f.clone();
+    func.name = rename(&f.name);
+    func.address = 0;
+    for r in func.relocs.iter_mut() {
+        r.target = rename(&r.target);
+    }
+    let mut sections: Vec<Section> = vec![Section { name: ".text".into(), size: f.code.len() as u32, bytes: f.code.clone(), executable: true, relocs: vec![] }];
+    out.symbols.push(SymbolDef { name: func.name.clone(), section: ".text".into(), address: 0, size: f.code.len() as u32, binding: f.binding, is_func: true });
+    for n in &want {
+        let Some(d) = obj.data.get(n) else { continue };
+        // the bytes as the section has them (a string pool reaches past its symbol's size)
+        let (sec_bytes, base) = match mwdec_obj::symbol_location(obj, n) {
+            Some((s, a)) => (s.bytes.clone(), a as usize),
+            None => (d.bytes.clone(), 0),
+        };
+        let size = d.size.max(d.bytes.len() as u32) as usize;
+        let mut end = (base + size).min(sec_bytes.len());
+        // through the end of the last string that starts inside the symbol
+        while end < sec_bytes.len() && end > base && sec_bytes[end - 1] != 0 && d.section != ".bss" && d.section != ".sbss" {
+            end += 1;
+        }
+        let bytes: Vec<u8> = if base <= end && end <= sec_bytes.len() { sec_bytes[base..end].to_vec() } else { d.bytes.clone() };
+        let si = match sections.iter().position(|s| s.name == d.section) {
+            Some(i) => i,
+            None => {
+                sections.push(Section { name: d.section.clone(), size: 0, bytes: vec![], executable: false, relocs: vec![] });
+                sections.len() - 1
+            }
+        };
+        let sec = &mut sections[si];
+        while sec.bytes.len() % 8 != 0 {
+            sec.bytes.push(0);
+        }
+        let addr = sec.bytes.len() as u32;
+        sec.bytes.extend_from_slice(&bytes);
+        sec.size = sec.bytes.len() as u32;
+        let mut nd = DataSymbol { address: addr, ..d.clone() };
+        for r in nd.relocs.iter_mut() {
+            r.target = rename(&r.target);
+        }
+        out.symbols.push(SymbolDef { name: n.clone(), section: d.section.clone(), address: addr, size: d.size, binding: d.binding, is_func: false });
+        out.data.insert(n.clone(), nd);
+    }
+    out.all_symbols = std::iter::once(func.name.clone()).chain(want.iter().map(|n| rename(n))).collect();
+    out.functions.push(func);
+    out.sections = sections;
+    out
+}
+
+/// Disk cache of whole template libraries (one file per set of probes: units with the same
+/// context share it), for one lifter: reading one file instead of one per probe.
+pub struct PackCache {
+    dir: std::path::PathBuf,
+    salt: String,
+}
+
+impl PackCache {
+    pub fn new(dir: std::path::PathBuf, salt: String) -> PackCache {
+        PackCache { dir, salt }
+    }
+
+    fn path(&self, keys: &[String]) -> std::path::PathBuf {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in self.salt.bytes().chain([0u8]).chain(keys.iter().flat_map(|k| k.bytes().chain([0u8]))) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        self.dir.join(format!("{h:016x}.json.gz"))
+    }
+
+    /// The outcome of every probe (by key; a key without an entry didn't compile).
+    pub fn get(&self, keys: &[String]) -> Option<std::collections::HashMap<String, Result<Template, String>>> {
+        let f = std::fs::File::open(self.path(keys)).ok()?;
+        let (stored, entries): (Vec<String>, Vec<(String, Entry)>) = serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f))).ok()?;
+        if stored != keys {
+            return None;
+        }
+        Some(entries.iter().map(|(k, e)| (k.clone(), decode(e))).collect())
+    }
+
+    pub fn put(&self, keys: &[String], outcomes: &[(String, Result<Template, String>)]) {
+        let entries: Vec<(String, Entry)> = outcomes
+            .iter()
+            .filter_map(|(k, r)| {
+                let e = match r {
+                    Ok(t) => encode(t)?,
+                    Err(w) => Entry::Rejected(w.clone()),
+                };
+                Some((k.clone(), e))
+            })
+            .collect();
+        let p = self.path(keys);
+        let _ = std::fs::create_dir_all(&self.dir);
+        if let Ok(s) = serde_json::to_vec(&(keys, entries)) {
+            use std::io::Write;
+            let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            if z.write_all(&s).is_err() {
+                return;
+            }
+            let Ok(bytes) = z.finish() else { return };
+            let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, bytes).is_ok() {
                 let _ = std::fs::rename(&tmp, &p);
             }
         }

@@ -27,6 +27,8 @@ pub struct Structurer<'a> {
     insns: &'a [Insn],
     /// Variables the structurer introduced (numbered after `vars`).
     pub extra_vars: Vec<Var>,
+    /// The last `case_tree` was confirmed against MWCC's tree builder.
+    tree_confirmed: std::cell::Cell<bool>,
 }
 
 enum TreeCheck {
@@ -63,6 +65,7 @@ impl<'a> Structurer<'a> {
             ret_void,
             insns: &[],
             extra_vars: vec![],
+            tree_confirmed: std::cell::Cell::new(false),
         }
     }
 
@@ -266,6 +269,10 @@ impl<'a> Structurer<'a> {
                     }
                 }
                 Term::CondReturn { fall } => {
+                    if let Some(next) = self.leaf_or_return(cur, out) {
+                        cur = next;
+                        continue;
+                    }
                     if let Some(next) = self.one_case_switch(cur, out) {
                         match next {
                             Some(j) => {
@@ -298,6 +305,25 @@ impl<'a> Structurer<'a> {
                         cur = fall;
                         continue;
                     }
+                    // the same with a value in place (`bgtlr` returning the selector's source):
+                    // `switch (x) { case ...: return ...; } return v;`
+                    let value_guard = !self.ret_void
+                        && fall < self.cfg.blocks.len()
+                        && matches!(self.cfg.blocks[fall].term, Term::Switch { .. })
+                        && !self.has_stmts(fall)
+                        && self.cfg.blocks[fall].preds.len() == 1
+                        && self.join_of(fall).is_none()
+                        && matches!(&c, Expr::Binary { op: BinOp::Gt, .. })
+                        && matches!(r, Some(Expr::Var(_)));
+                    if value_guard {
+                        if let Term::Switch { targets, .. } = self.cfg.blocks[fall].term.clone() {
+                            self.emitted[fall] = true;
+                            let stmt = self.build_switch(fall, &targets, None);
+                            out.push(stmt);
+                            out.push(Stmt::Return(r));
+                            return;
+                        }
+                    }
                     // `li r3,A ; b<c>lr ; li r3,B ; blr` is MWCC's select layout for `return !c ?
                     // B : A` (the else value is loaded first); `if (c) return A; return B;`
                     // would load B first
@@ -325,12 +351,19 @@ impl<'a> Structurer<'a> {
                         // K`): the source assigned a variable (`v = a; if (!c) v = b; return v;`)
                         let branchless = match (a.as_int(), b.as_int()) {
                             (Some(x), Some(y)) => x == 0 || y == 0 || (x - y).abs() == 1,
+                            // `c ? v : 0` is a mask too (`and`/`andc`) for integers (not for pointers)
+                            (Some(0), None) => matches!(&b, Expr::Var(x) if matches!(strip_cv(&self.vars[*x].ty), mwdec_core::Type::Int { .. })),
+                            (None, Some(0)) => matches!(&a, Expr::Var(x) if matches!(strip_cv(&self.vars[*x].ty), mwdec_core::Type::Int { .. })),
                             _ => false,
                         };
                         if branchless {
                             self.emitted[fall] = true;
                             let v = self.vars.len() + self.extra_vars.len();
-                            self.extra_vars.push(Var { name: "var_r3".into(), ty: t_s32(), kind: VarKind::Local });
+                            let ty = match (&a, &b) {
+                                (Expr::Var(x), _) | (_, Expr::Var(x)) => self.vars[*x].ty.clone(),
+                                _ => t_s32(),
+                            };
+                            self.extra_vars.push(Var { name: "var_r3".into(), ty, kind: VarKind::Local });
                             out.push(Stmt::Assign { dst: Expr::Var(v), src: a });
                             out.push(Stmt::If { cond: nc, then: vec![Stmt::Assign { dst: Expr::Var(v), src: b }], els: vec![] });
                             out.push(Stmt::Return(Some(Expr::Var(v))));
@@ -664,6 +697,49 @@ impl<'a> Structurer<'a> {
         Some(cont)
     }
 
+    /// The leaf form of `or_return_chain`: `b<c>lr` for the first terms, the last one branching
+    /// over a lone `blr` (`bne L; blr; L:`): `if (a || !b) return;`.
+    fn leaf_or_return(&mut self, s: usize, out: &mut Vec<Stmt>) -> Option<usize> {
+        if !self.ret_void || self.insns.is_empty() || self.blocks[s].ret.is_some() {
+            return None;
+        }
+        let lone_blr = |me: &Self, b: usize| {
+            b < me.cfg.blocks.len()
+                && matches!(me.cfg.blocks[b].term, Term::Return)
+                && me.cfg.blocks[b].end == me.cfg.blocks[b].start + 1
+                && me.insns[me.cfg.blocks[b].start].is_blr()
+                && me.cfg.blocks[b].preds.len() == 1
+        };
+        let mut conds = vec![self.cond_of(s)];
+        let mut chain = vec![s];
+        let Term::CondReturn { fall } = self.cfg.blocks[s].term else { return None };
+        let mut cur = fall;
+        loop {
+            if cur >= self.cfg.blocks.len() || self.has_stmts(cur) || self.emitted[cur] || self.cfg.blocks[cur].preds.len() != 1 || self.loops.contains_key(&cur) {
+                return None;
+            }
+            match self.cfg.blocks[cur].term {
+                Term::CondReturn { fall } if self.blocks[cur].ret.is_none() => {
+                    conds.push(self.cond_of(cur));
+                    chain.push(cur);
+                    cur = fall;
+                }
+                Term::Cond { taken, fall } if taken != fall && lone_blr(self, fall) => {
+                    conds.push(self.cond_of(cur).negate(self.vars));
+                    chain.push(cur);
+                    chain.push(fall);
+                    for &n in &chain {
+                        self.emitted[n] = true;
+                    }
+                    let cond = conds.into_iter().reduce(|a, b| Expr::cmp(BinOp::LogOr, a, b))?;
+                    out.push(Stmt::If { cond, then: vec![Stmt::Return(None)], els: vec![] });
+                    return Some(taken);
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// `lis rT, hi; addi rT, rT, lo; cmpw x, rT; bne end`: an equality test against a constant
     /// beyond 16 bits built in a register is MWCC's single-label switch (an `if` compares such a
     /// constant with `subis; cmplwi`).
@@ -727,6 +803,13 @@ impl<'a> Structurer<'a> {
             work.extend(self.cfg.blocks[x].succs.iter().copied());
         }
         false
+    }
+
+    /// Is `n` the root of a compare tree MWCC's tree builder reproduces (not merely a run of
+    /// tests on one value)?
+    fn confirmed_tree(&self, n: usize) -> bool {
+        self.tree_confirmed.set(false);
+        self.case_tree(n).is_some() && self.tree_confirmed.get()
     }
 
     /// The function's last block when it is a return shared by several paths.
@@ -813,7 +896,7 @@ impl<'a> Structurer<'a> {
                 && join.map_or(true, |j| self.cfg.postdominates(j, n))
                 && self.stack.last().map_or(true, |c| n != c.header && Some(n) != c.exit);
             // the root of one of MWCC's compare trees starts a switch, not another `&&` term
-            if !ok || self.case_tree(n).is_some() {
+            if !ok || self.confirmed_tree(n) {
                 break;
             }
             chain.push(n);
@@ -964,6 +1047,30 @@ impl<'a> Structurer<'a> {
 
     fn build_loop(&mut self, h: usize) -> (Stmt, Option<usize>) {
         let l = self.loops[&h].clone();
+        // a header that only steps the counter it tests (`subic. r7, r7, 1; bge`): `--n >= 0`
+        if let ([Stmt::Assign { dst: Expr::Var(v), src: Expr::Binary { op, l: x, r: k, .. } }], Some(c)) = (self.blocks[h].stmts.as_slice(), self.blocks[h].cond.clone()) {
+            let delta = match (op, k.as_int()) {
+                (BinOp::Add, Some(1)) | (BinOp::Sub, Some(-1)) => Some(1),
+                (BinOp::Sub, Some(1)) | (BinOp::Add, Some(-1)) => Some(-1),
+                _ => None,
+            };
+            let v = *v;
+            let mut uses = 0;
+            c.walk(&mut |e| uses += matches!(e, Expr::Var(y) if *y == v) as usize);
+            if let (Some(delta), true, 1) = (delta, matches!(**x, Expr::Var(y) if y == v), uses) {
+                // (not the CTR counter: the CTR loop recovery reads its decrement)
+                if matches!(strip_cv(&self.vars[v].ty), mwdec_core::Type::Int { .. }) && !self.vars[v].name.starts_with("var_ctr") {
+                    let mut c2 = c;
+                    c2.rewrite(&mut |e| {
+                        if matches!(e, Expr::Var(y) if *y == v) {
+                            *e = Expr::IncDec { e: Box::new(Expr::Var(v)), delta, post: false };
+                        }
+                    });
+                    self.blocks[h].stmts.clear();
+                    self.blocks[h].cond = Some(c2);
+                }
+            }
+        }
         // exit: first node outside the loop on the ipdom chain from h
         let mut x = h;
         let mut guard = 0;
@@ -1377,7 +1484,10 @@ impl<'a> Structurer<'a> {
         cases.sort_by_key(|c| c.0[0]);
         if !self.insns.is_empty() {
             match self.check_tree(root, &cases, default, &nodes) {
-                TreeCheck::Match(extra) => cases.extend(extra),
+                TreeCheck::Match(extra) => {
+                    self.tree_confirmed.set(true);
+                    cases.extend(extra)
+                }
                 // not MWCC's tree for any case set tried: an if/else-if chain on one value
                 TreeCheck::NoMatch => return None,
                 // a one-node "tree" must be MWCC's single-case switch (`beq case; b end`)

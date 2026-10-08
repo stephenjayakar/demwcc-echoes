@@ -441,7 +441,7 @@ pub fn apply_decls(db: &mut TypeDb, sr: &ScanResult) {
                 ttds.push((qual(scope, name), t));
             }
         }
-        for d in decls {
+        for (order, d) in decls.iter().enumerate() {
             r.tparams = d.template_params.clone();
             // out-of-line definitions `A::B::f` inside scope S: class scope = S::A::B
             let parts = split_scope(&d.name);
@@ -494,6 +494,8 @@ pub fn apply_decls(db: &mut TypeDb, sr: &ScanResult) {
                 template_params: d.template_params.clone(),
                 access: d.access,
                 init_list: d.init_list.clone(),
+                order: order as u32,
+                defaults: d.defaults.clone(),
             };
             let list = out.entry(qualified).or_default();
             // merge an out-of-line definition into the matching in-class declaration
@@ -501,6 +503,9 @@ pub fn apply_decls(db: &mut TypeDb, sr: &ScanResult) {
             if let Some(ex) = list.iter_mut().find(|e| {
                 e.is_const == info.is_const && e.params.iter().map(|p| param_key(db, &p.ty)).collect::<Vec<_>>() == key
             }) {
+                if ex.defaults.is_empty() && !info.defaults.is_empty() {
+                    ex.defaults = info.defaults.clone();
+                }
                 if ex.inline_body.is_none() && info.inline_body.is_some() {
                     ex.inline_body = info.inline_body.clone();
                     ex.init_list = info.init_list.clone();

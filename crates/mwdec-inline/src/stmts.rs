@@ -77,7 +77,9 @@ pub fn from_probe(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, S
     if body.is_empty() || !has_effect(&body) {
         return Err("no statements".into());
     }
-    if p.fn_template {
+    // (a member function template instantiated with a guessed scalar: the call deduces its
+    // type from the argument, so only a method's is safe to name)
+    if p.fn_template && !matches!(p.kind, crate::probe::CallKind::Method) {
         return Err("statement template of a guessed instantiation".into());
     }
     // a plain forwarder (`void f() { g(); }`) is too ambiguous to recognise
@@ -105,7 +107,15 @@ pub fn from_probe(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, S
         locals.push(RESULT_VAR);
     }
     for v in &locals {
-        if *v != RESULT_VAR && !matches!(ir.vars[*v].kind, VarKind::Local) {
+        // a constructor's object (the probe's return slot): the destination hole
+        if *v != RESULT_VAR && ir.vars[*v].kind == VarKind::StructRet && matches!(p.kind, crate::probe::CallKind::Ctor) {
+            let Some(c) = p.class.clone() else { return Err("constructor without class".into()) };
+            map.insert(*v, holes.len());
+            holes.push(HoleKind::Obj { class: c, ptr: true, temp_ok: false });
+            continue;
+        }
+        // (a stack object of the inline: `const float value = t; Put(&value, 4)`)
+        if *v != RESULT_VAR && !matches!(ir.vars[*v].kind, VarKind::Local | VarKind::Stack { .. }) {
             return Err("non-local var".into());
         }
         map.insert(*v, holes.len());
@@ -134,6 +144,8 @@ pub fn from_probe(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, S
         shape: Shape::Stmts { stmts, result },
         ops,
         ret_ref: p.ret_ref,
+        dead: vec![],
+        guessed: p.fn_template,
     })
 }
 
@@ -256,7 +268,7 @@ fn is_local_hole(t: &Template, h: usize) -> bool {
 fn match_stmt(m: &mut M, p: &Stmt, t: &Stmt) -> bool {
     match (p, t) {
         (Stmt::Assign { dst: Expr::Var(l), src }, Stmt::Assign { dst: Expr::Var(tv), src: src2 }) if is_local_hole(m.t, *l) => {
-            if !matches!(m.env.vars[*tv].kind, VarKind::Local) {
+            if !matches!(m.env.vars[*tv].kind, VarKind::Local | VarKind::Stack { .. }) {
                 return false;
             }
             match &m.b[*l] {
@@ -276,6 +288,26 @@ fn match_stmt(m: &mut M, p: &Stmt, t: &Stmt) -> bool {
             let snap = m.b.clone();
             if m.m(cond, c2) && match_seq(m, then, t2, 0) == Some(t2.len()) && match_seq(m, els, e2, 0) == Some(e2.len()) {
                 return true;
+            }
+            // truth tests spelled differently (`!p` / `(unsigned int)p == 0`)
+            m.b = snap.clone();
+            let (mut pc, mut tc) = (cond.clone(), c2.clone());
+            crate::cflow::truth_canon(&mut pc);
+            crate::cflow::truth_canon(&mut tc);
+            if (pc != *cond || tc != *c2) && m.m(&pc, &tc) && match_seq(m, then, t2, 0) == Some(t2.len()) && match_seq(m, els, e2, 0) == Some(e2.len()) {
+                return true;
+            }
+            static TR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            if let Some(f) = TR.get_or_init(|| std::env::var("MWDI_TRACE_IF").ok()) {
+                if m.t.name.contains(f.as_str()) {
+                    m.b = snap.clone();
+                    let cm = m.m(&pc, &tc);
+                    eprintln!("IF {}: cond {cm}
+  {pc:?}
+  {tc:?}
+  then {then:?}
+  vs {t2:?}", m.t.name);
+                }
             }
             // other polarity
             m.b = snap;
@@ -378,12 +410,53 @@ fn replace_result(e: &mut Expr, r: &Expr, m: &mut M, call: &dyn Fn(&M) -> Option
 }
 
 /// Try statement templates at `b[i]`. True if rewritten.
+/// Destination hole of a constructor statement template (the object it builds), if any.
+pub fn ctor_dest(t: &Template) -> Option<usize> {
+    if !matches!(t.kind, crate::probe::CallKind::Ctor) {
+        return None;
+    }
+    t.holes.iter().enumerate().skip(t.sig.params.len()).find(|(_, h)| matches!(h, HoleKind::Obj { .. })).map(|(k, _)| k)
+}
+
+/// A whole-object copy of a small class as member-wise copies (how a constructor's probe
+/// stores it), or None.
+fn split_copy(s: &Stmt, env: &Env) -> Option<Vec<Stmt>> {
+    let Stmt::Assign { dst, src } = s else { return None };
+    let ty = mwdec_lift::types::ty_of(dst, env.vars);
+    let cls = crate::util::class_name(&ty, env.db)?;
+    let fields = crate::template::flat_fields(env.db, &cls)?;
+    if fields.len() < 2 || fields.len() > 4 {
+        return None;
+    }
+    let at = |e: &Expr, o: i32, t: &mwdec_core::Type| -> Option<Expr> {
+        Some(match e {
+            Expr::Load { base, offset, .. } => Expr::Load { base: base.clone(), offset: offset + o, ty: t.clone() },
+            Expr::Member { base, offset, .. } => Expr::Member { base: base.clone(), offset: offset + o, ty: t.clone() },
+            Expr::Var(_) | Expr::Global { .. } => Expr::Member { base: Box::new(e.clone()), offset: o, ty: t.clone() },
+            _ => return None,
+        })
+    };
+    fields.iter().map(|(o, t)| Some(Stmt::Assign { dst: at(dst, *o, t)?, src: at(src, *o, t)? })).collect()
+}
+
 pub fn try_stmts_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, idx: &Index) -> bool {
     for &ti in &idx.stmts {
         let t = &env.lib.templates[ti];
         let Shape::Stmts { stmts, result } = &t.shape else { continue };
+        if let Some(dh) = ctor_dest(t) {
+            if try_ctor_at(b, i, whole, env, t, stmts, dh) {
+                return true;
+            }
+            continue;
+        }
         let mut m = M::new(env, t);
-        let Some(end) = match_seq(&mut m, stmts, b, i) else { continue };
+        let Some(end) = match_seq(&mut m, stmts, b, i) else {
+            // independent statements the compiler scheduled between the inline's own
+            if try_interleaved_at(b, i, whole, env, t, stmts, result) {
+                return true;
+            }
+            continue;
+        };
         if end == i {
             continue;
         }
@@ -487,6 +560,11 @@ pub fn try_stmts_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, idx:
                 if result.is_some() && stmts.len() < 2 {
                     continue;
                 }
+                // ... nor when a pattern local was computed in place: the target read the value
+                // itself (`p = in.ptr; in.ptr = p + 1; ... *p`), the inline didn't return it
+                if result.is_some() && !m.folded.is_empty() {
+                    continue;
+                }
                 let Some(call) = mk(&m) else { continue };
                 b.splice(i..end, [Stmt::Expr(call)]);
             }
@@ -494,4 +572,185 @@ pub fn try_stmts_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, idx:
         return true;
     }
     false
+}
+
+/// A pattern statement copying a whole object hole (`*dest = other`) as member-wise copies.
+fn split_copy_pattern(s: &Stmt, t: &Template, env: &Env) -> Option<Vec<Stmt>> {
+    let Stmt::Assign { dst: Expr::Load { base, offset, ty }, src: Expr::Var(h) } = s else { return None };
+    let Some(HoleKind::Obj { class, ptr: false, .. }) = t.holes.get(*h) else { return None };
+    let fields = crate::template::flat_fields(env.db, class)?;
+    if crate::util::class_name(ty, env.db).as_deref() != Some(class.as_str()) || fields.len() < 2 {
+        return None;
+    }
+    Some(
+        fields
+            .iter()
+            .map(|(o, ft)| Stmt::Assign {
+                dst: Expr::Load { base: base.clone(), offset: offset + o, ty: ft.clone() },
+                src: Expr::Member { base: Box::new(Expr::Var(*h)), offset: *o, ty: ft.clone() },
+            })
+            .collect(),
+    )
+}
+
+/// A constructor statement template at `b[i]`: its statements build the object at the
+/// destination hole (a whole-object copy in the target counts as the member-wise copies the
+/// probe made); the window becomes `*dest = T(args);`.
+fn try_ctor_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, t: &Template, stmts: &[Stmt], dh: usize) -> bool {
+    // the target with a leading whole-object copy split (index map back to `b`)
+    let mut exp: Vec<Stmt> = b[..i].to_vec();
+    let mut back: Vec<usize> = (0..i).collect();
+    for (k, s) in b.iter().enumerate().skip(i) {
+        match (k == i).then(|| split_copy(s, env)).flatten() {
+            Some(parts) => {
+                for p in parts {
+                    exp.push(p);
+                    back.push(k);
+                }
+            }
+            None => {
+                exp.push(s.clone());
+                back.push(k);
+            }
+        }
+    }
+    let mut m = M::new(env, t);
+    // as is first, then with the copy split
+    let (exp, back, end) = match match_seq(&mut m, stmts, b, i) {
+        Some(e) => (b.clone(), (0..b.len()).collect::<Vec<_>>(), e),
+        None => {
+            m = M::new(env, t);
+            match match_seq(&mut m, stmts, &exp, i) {
+                Some(e) => (exp, back, e),
+                None => {
+                    // the probe's whole-object copy against member-wise stores in the target
+                    let split: Vec<Stmt> = stmts.iter().flat_map(|s| split_copy_pattern(s, t, env).unwrap_or_else(|| vec![s.clone()])).collect();
+                    if split.len() == stmts.len() {
+                        return false;
+                    }
+                    m = M::new(env, t);
+                    if std::env::var("MWDI_TRACE_CTOR").is_ok_and(|f| t.name.contains(f.as_str())) {
+                        eprintln!("CTOR {} split {:?}
+  vs {:?}", t.name, split, &b[i..(i + split.len()).min(b.len())]);
+                    }
+                    match match_seq(&mut m, &split, b, i) {
+                        Some(e) => (b.clone(), (0..b.len()).collect::<Vec<_>>(), e),
+                        None => return false,
+                    }
+                }
+            }
+        }
+    };
+    if end == i {
+        return false;
+    }
+    // the window must cover whole original statements
+    let oend = if end < exp.len() { back[end] } else { b.len() };
+    if end < exp.len() && back[end - 1] == back[end] {
+        return false;
+    }
+    // pattern locals used nowhere else
+    let window = &b[i..oend];
+    for (h, k) in t.holes.iter().enumerate() {
+        if let (HoleKind::Local, Some(Bind::Val(Expr::Var(v)))) = (k, &m.b[h]) {
+            if uses_in(whole, *v) != uses_in(window, *v) {
+                return false;
+            }
+        }
+    }
+    let Some((mut args, _)) = m.finalize(0) else {
+        if std::env::var("MWDI_TRACE_CTOR").is_ok_and(|f| t.name.contains(f.as_str())) {
+            eprintln!("CTOR {} finalize failed {:?}", t.name, m.b);
+        }
+        return false;
+    };
+    // the destination is the last non-local hole
+    let nonlocal_before = t.holes[..dh].iter().filter(|h| !matches!(h, HoleKind::Local)).count();
+    if nonlocal_before >= args.len() {
+        return false;
+    }
+    let dest = args.remove(nonlocal_before);
+    let lv = match dest {
+        Expr::AddrOf(x) => *x,
+        p => Expr::Load { base: Box::new(p), offset: 0, ty: mwdec_core::Type::Named(t.class.clone().unwrap_or_default()) },
+    };
+    let call = make_call(t, args);
+    b.splice(i..oend, [Stmt::Assign { dst: lv, src: call }]);
+    true
+}
+
+/// A pure definition of a single-assignment local (`t = p->x + 1`): may be moved before the
+/// statements of an inline expansion it was scheduled into.
+fn movable_def(s: &Stmt, whole: &[Stmt], env: &Env) -> Option<VarId> {
+    let Stmt::Assign { dst: Expr::Var(v), src } = s else { return None };
+    if !matches!(env.vars[*v].kind, VarKind::Local) || src.has_call() || src.uses_var(*v) {
+        return None;
+    }
+    fn defs_of(b: &[Stmt], v: VarId) -> usize {
+        b.iter()
+            .map(|s| match s {
+                Stmt::Assign { dst: Expr::Var(w), .. } => (*w == v) as usize,
+                Stmt::If { then, els, .. } => defs_of(then, v) + defs_of(els, v),
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => defs_of(body, v),
+                Stmt::For { init, step, body, .. } => defs_of(init, v) + defs_of(step, v) + defs_of(body, v),
+                Stmt::Switch { cases, .. } => cases.iter().map(|c| defs_of(&c.body, v)).sum(),
+                _ => 0,
+            })
+            .sum()
+    }
+    (defs_of(whole, *v) == 1).then_some(*v)
+}
+
+/// Statement template `t` at `b[i]` with independent definitions interleaved: the expansion's
+/// statements are matched with those set aside, which then go before the folded call.
+fn try_interleaved_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, t: &Template, stmts: &[Stmt], result: &Option<Expr>) -> bool {
+    if result.is_some() || stmts.len() < 2 || i >= b.len() || movable_def(&b[i], whole, env).is_some() {
+        return false;
+    }
+    // the window: the pattern's length plus up to 3 set-aside statements
+    let mut kept: Vec<usize> = vec![];
+    let mut aside: Vec<usize> = vec![];
+    let mut k = i;
+    while k < b.len() && kept.len() < stmts.len() && aside.len() <= 3 {
+        match movable_def(&b[k], whole, env) {
+            Some(_) if !kept.is_empty() => aside.push(k),
+            _ => kept.push(k),
+        }
+        k += 1;
+    }
+    if aside.is_empty() || kept.len() != stmts.len() || aside.len() > 3 {
+        return false;
+    }
+    // a set-aside statement moves before the expansion's earlier statements: it must not read
+    // what they write, and they must not use what it defines
+    for &a in &aside {
+        let Stmt::Assign { dst: Expr::Var(v), src } = &b[a] else { return false };
+        let mut rd = vec![];
+        crate::safety::reads(&crate::matcher::expand(src, env.defs), env, &mut rd);
+        for &w in kept.iter().filter(|&&w| w < a) {
+            if crate::safety::clobbers(&b[w], &rd, env) || uses_in(std::slice::from_ref(&b[w]), *v) > 0 {
+                return false;
+            }
+        }
+    }
+    let view: Vec<Stmt> = kept.iter().map(|&w| b[w].clone()).collect();
+    let mut m = M::new(env, t);
+    if match_seq(&mut m, stmts, &view, 0) != Some(view.len()) {
+        return false;
+    }
+    // locals bound by the pattern: used nowhere else
+    for (h, kd) in t.holes.iter().enumerate() {
+        if let (HoleKind::Local, Some(Bind::Val(Expr::Var(v)))) = (kd, &m.b[h]) {
+            if uses_in(whole, *v) != uses_in(&view, *v) {
+                return false;
+            }
+        }
+    }
+    let Some((args, _)) = m.finalize(0) else { return false };
+    let call = make_call(t, args);
+    let end = *kept.last().unwrap() + 1;
+    let mut repl: Vec<Stmt> = aside.iter().map(|&a| b[a].clone()).collect();
+    repl.push(Stmt::Expr(call));
+    b.splice(i..end, repl);
+    true
 }

@@ -134,6 +134,34 @@ fn split_lvalue(e: &Expr) -> Option<(&Expr, i32, bool, &Type)> {
     }
 }
 
+thread_local! {
+    /// Pairs (lower, upper) of word-sized data labels the splitter cut out of one 8-byte object
+    /// (adjacent in one section of the target object), for the 64-bit merges.
+    static ADJACENT: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(vec![]);
+}
+
+/// Set the adjacent word-label pairs of the current object (see [`merge_or_assigns`]).
+pub fn set_adjacent_labels(obj: &mwdec_core::ObjectFile) {
+    let mut v = vec![];
+    for (n, d) in &obj.data {
+        if d.size != 4 || !n.starts_with("lbl_") {
+            continue;
+        }
+        if let Some((m, _)) = obj.data.iter().find(|(m, e)| m.starts_with("lbl_") && e.section == d.section && e.size == 4 && e.address == d.address + 4) {
+            v.push((n.clone(), m.clone()));
+        }
+    }
+    ADJACENT.with(|a| *a.borrow_mut() = v);
+}
+
+/// `lo`/`hi` are the upper/lower word labels of one object: the lower label's name.
+fn adjacent_globals(hi: &Expr, lo: &Expr) -> Option<String> {
+    match (hi, lo) {
+        (Expr::Global { symbol: a, .. }, Expr::Global { symbol: b, .. }) => ADJACENT.with(|v| v.borrow().iter().any(|(x, y)| x == a && y == b)).then(|| a.clone()),
+        _ => None,
+    }
+}
+
 fn same_base(a: &Expr, b: &Expr) -> bool {
     match (a, b) {
         (Expr::Global { symbol: x, .. }, Expr::Global { symbol: y, .. }) => x == y,
@@ -282,14 +310,16 @@ pub fn merge_or_assigns(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
                     };
                     let (x, hi) = or_half(src, dst, vars)?;
                     if hi {
-                        x_hi = Some((x, o));
+                        x_hi = Some((x, o, *dst));
                     } else {
-                        x_lo = Some((x, o));
+                        x_lo = Some((x, o, *dst));
                     }
                     lv.push((dst, o));
                 }
-                let ((xh, oh), (xl, ol)) = (x_hi?, x_lo?);
-                if xh != xl || ol != oh + 4 || !same_base(split_lvalue(lv[0].0)?.0, split_lvalue(lv[1].0)?.0) {
+                let ((xh, oh, hdst), (xl, ol, ldst)) = (x_hi?, x_lo?);
+                // two word labels of one 8-byte object
+                let adj = adjacent_globals(hdst, ldst);
+                if xh != xl || (adj.is_none() && (ol != oh + 4 || !same_base(split_lvalue(lv[0].0)?.0, split_lvalue(lv[1].0)?.0))) {
                     return None;
                 }
                 // a temp must be the one consumed by the stores
@@ -300,7 +330,10 @@ pub fn merge_or_assigns(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
                     }
                 }
                 let signed = matches!(strip_cv(&ty_of(&xh, vars)), Type::Int { signed: true, .. });
-                let w = wide_at(lv[0].0, lv[0].1, lv[1].0, lv[1].1, signed);
+                let w = match adj {
+                    Some(sym) => Expr::Global { symbol: sym, ty: Type::Int { size: 8, signed: false } },
+                    None => wide_at(lv[0].0, lv[0].1, lv[1].0, lv[1].1, signed),
+                };
                 Some((start + 2, w.clone(), Expr::bin(BinOp::Or, w, xh, Type::Int { size: 8, signed })))
             })();
             if let Some((end, w, v)) = found {
@@ -324,6 +357,8 @@ pub fn merge_or_assigns(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
                             break;
                         }
                     }
+                    // (the upper word label of the object)
+                    Stmt::Assign { dst, src } if src.as_int() == Some(0) && adjacent_globals(&w, dst).is_some() => zeros.push(k),
                     Stmt::Assign { dst, src } if src.as_int() == Some(0) => match split_lvalue(dst) {
                         Some((bb, o, _, t)) if same_base(bb, &wb) && (scalar_size(t) == Some(4) || matches!(dst, Expr::Global { .. })) && (o == wo || o == wo + 4) => zeros.push(k),
                         _ => break,
@@ -332,7 +367,7 @@ pub fn merge_or_assigns(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
                 }
             }
             if zeros.len() == 2 {
-                let offs: Vec<i32> = zeros.iter().map(|&z| if let Stmt::Assign { dst, .. } = &b[z] { split_lvalue(dst).unwrap().1 } else { 0 }).collect();
+                let offs: Vec<i32> = zeros.iter().map(|&z| if let Stmt::Assign { dst, .. } = &b[z] { if adjacent_globals(&w, dst).is_some() { wo + 4 } else { split_lvalue(dst).unwrap().1 } } else { 0 }).collect();
                 if offs[0] != offs[1] {
                     let (z0, z1) = (zeros[0].max(zeros[1]), zeros[0].min(zeros[1]));
                     b.remove(z0);

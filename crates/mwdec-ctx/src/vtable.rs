@@ -169,3 +169,214 @@ pub fn apply_vtables(db: &mut TypeDb, vts: &BTreeMap<String, Vec<VirtualMethod>>
     }
     crate::resolve::fill_methods(db);
 }
+
+/// Vtables of polymorphic classes no object of the module has a vtable for (abstract
+/// interfaces, classes whose vtable lives in another module): the slots follow the header's
+/// declaration order, after the primary base's slots, an override taking its base slot (MWCC GC
+/// layout: 8 bytes of header, then one word per virtual function, one for the destructor).
+/// Returns the number of classes given a vtable.
+pub fn declared_vtables(db: &mut TypeDb) -> usize {
+    let names: Vec<String> = db.classes.iter().filter(|(n, c)| c.vptr_offset == Some(0) && c.vtable.is_empty() && !c.is_declaration && !n.contains('<')).map(|(n, _)| n.clone()).collect();
+    let mut memo: BTreeMap<String, Option<Vec<VirtualMethod>>> = BTreeMap::new();
+    if std::env::var_os("MWDEC_VT_VALIDATE").is_some() {
+        // agreement of the declaration-order layout with the vtables the objects have
+        let have: Vec<String> = db.classes.iter().filter(|(n, c)| c.vptr_offset == Some(0) && !c.vtable.is_empty() && !n.contains('<')).map(|(n, _)| n.clone()).collect();
+        let (mut ok, mut bad) = (0, 0);
+        for c in have {
+            let mut copy = db.clone();
+            copy.classes.get_mut(&c).unwrap().vtable.clear();
+            let mut m = BTreeMap::new();
+            let Some(slots) = declared_slots(&copy, &c, &mut m, 0) else { continue };
+            let real = &db.classes[&c].vtable;
+            let same = slots.len() == real.len() && slots.iter().zip(real).all(|(a, b)| b.sig.qualified_name.is_empty() || simple_name(&a.sig.qualified_name) == simple_name(&b.sig.qualified_name));
+            if same {
+                ok += 1;
+            } else {
+                bad += 1;
+                eprintln!("vtable mismatch {c}: declared {:?} vs object {:?}", slots.iter().map(|s| simple_name(&s.sig.qualified_name).to_string()).collect::<Vec<_>>(), real.iter().map(|s| simple_name(&s.sig.qualified_name).to_string()).collect::<Vec<_>>());
+            }
+        }
+        eprintln!("declared vtables: {ok} agree, {bad} differ");
+    }
+    let mut n = 0;
+    // objects' vtables of abstract classes lack the names of pure slots and stop at the last
+    // non-pure one: completed from the declarations where those agree
+    let have: Vec<String> = db.classes.iter().filter(|(n, c)| c.vptr_offset == Some(0) && !c.vtable.is_empty() && !n.contains('<')).map(|(n, _)| n.clone()).collect();
+    for c in have {
+        let real = db.classes[&c].vtable.clone();
+        let v = completed(db, &c, &real, &mut memo, 0);
+        if v.len() != real.len() || v.iter().zip(&real).any(|(a, b)| a.sig.qualified_name != b.sig.qualified_name) {
+            db.classes.get_mut(&c).unwrap().vtable = v;
+            n += 1;
+        }
+    }
+    for c in names {
+        if let Some(slots) = declared_slots(db, &c, &mut memo, 0) {
+            if !slots.is_empty() {
+                db.classes.get_mut(&c).unwrap().vtable = slots;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// A type spelling for comparing parameter lists (typedefs resolved, no spaces).
+fn norm_ty(db: &TypeDb, t: &Type) -> String {
+    fn res<'a>(db: &'a TypeDb, t: &'a Type, d: u32) -> std::borrow::Cow<'a, Type> {
+        match t {
+            Type::Named(n) if d < 8 => match db.typedefs.get(n) {
+                Some(u) => std::borrow::Cow::Owned(res(db, u, d + 1).into_owned()),
+                None => std::borrow::Cow::Borrowed(t),
+            },
+            Type::Ptr(x) => std::borrow::Cow::Owned(Type::Ptr(Box::new(res(db, x, d + 1).into_owned()))),
+            Type::Ref(x) => std::borrow::Cow::Owned(Type::Ref(Box::new(res(db, x, d + 1).into_owned()))),
+            Type::Const(x) => std::borrow::Cow::Owned(Type::Const(Box::new(res(db, x, d + 1).into_owned()))),
+            _ => std::borrow::Cow::Borrowed(t),
+        }
+    }
+    // (top-level const of a by-value parameter is not part of the signature)
+    let t = match t {
+        Type::Const(x) => &**x,
+        t => t,
+    };
+    let r = res(db, t, 0);
+    let s: String = format!("{:?}", r).chars().filter(|c| !c.is_whitespace()).collect();
+    // (a class spelled relative to its scope in one place and qualified in the other)
+    s.split("Named(\"").map(|p| match p.find('"') {
+        Some(e) => format!("{}{}", simple_name(&p[..e]), &p[e..]),
+        None => p.to_string(),
+    }).collect::<Vec<_>>().join("Named(\"")
+}
+
+/// An object's vtable with the names of its unnamed (pure) slots and its trailing slots taken
+/// from the declaration-order layout, where the two agree on every named slot.
+fn completed(db: &TypeDb, cls: &str, real: &[VirtualMethod], memo: &mut BTreeMap<String, Option<Vec<VirtualMethod>>>, depth: u32) -> Vec<VirtualMethod> {
+    let mut copy_db = None;
+    let decl = {
+        let key = format!("#decl#{cls}");
+        if let Some(v) = memo.get(&key) {
+            v.clone()
+        } else {
+            let d = copy_db.get_or_insert_with(|| {
+                let mut c = db.clone();
+                if let Some(k) = c.classes.get_mut(cls) {
+                    k.vtable.clear();
+                }
+                c
+            });
+            let mut m = BTreeMap::new();
+            let v = declared_slots(d, cls, &mut m, depth + 1);
+            memo.insert(key, v.clone());
+            v
+        }
+    };
+    let Some(decl) = decl else { return real.to_vec() };
+    if real.iter().any(|r| r.this_adjust != 0) {
+        return real.to_vec();
+    }
+    if decl.len() < real.len() {
+        return real.to_vec();
+    }
+    let agree = real.iter().zip(&decl).all(|(r, d)| r.sig.qualified_name.is_empty() || simple_name(&r.sig.qualified_name) == simple_name(&d.sig.qualified_name));
+    if !agree {
+        return real.to_vec();
+    }
+    let mut out = real.to_vec();
+    for (o, d) in out.iter_mut().zip(&decl) {
+        if o.sig.qualified_name.is_empty() {
+            o.sig = d.sig.clone();
+        }
+    }
+    out.extend(decl[real.len()..].iter().cloned());
+    out
+}
+
+fn simple_name(q: &str) -> &str {
+    q.rsplit("::").next().unwrap_or(q)
+}
+
+fn declared_slots(db: &TypeDb, cls: &str, memo: &mut BTreeMap<String, Option<Vec<VirtualMethod>>>, depth: u32) -> Option<Vec<VirtualMethod>> {
+    if let Some(v) = memo.get(cls) {
+        return v.clone();
+    }
+    if depth > 12 {
+        return None;
+    }
+    let c = db.classes.get(cls)?;
+    let r = (|| {
+        // the primary base (at offset 0, polymorphic): its slots first
+        let mut slots: Vec<VirtualMethod> = match c.bases.iter().find(|b| b.offset == 0 && !b.is_virtual && db.classes.get(&b.name).is_some_and(|bc| bc.vptr_offset.is_some())) {
+            Some(b) => {
+                let bc = db.classes.get(&b.name)?;
+                if bc.vtable.is_empty() {
+                    declared_slots(db, &b.name, memo, depth + 1)?
+                } else {
+                    completed(db, &b.name, &bc.vtable, memo, depth)
+                }
+            }
+            None => vec![],
+        };
+        // a secondary base's slots can't be laid out from declarations
+        if c.bases.iter().any(|b| b.offset != 0 && db.classes.get(&b.name).is_some_and(|bc| bc.vptr_offset.is_some())) {
+            return None;
+        }
+        let prefix = format!("{cls}::");
+        let mut own: Vec<&DeclInfo> = db
+            .decls
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .filter(|(k, _)| !k[prefix.len()..].contains("::"))
+            .flat_map(|(_, ds)| ds.iter())
+            .filter(|d| !d.is_static && d.template_params.is_empty())
+            .collect();
+        own.sort_by_key(|d| d.order);
+        for d in own {
+            let name = simple_name(&d.qualified_name);
+            let is_dtor = name.starts_with('~');
+            let pkey = |ps: &[Param]| ps.iter().map(|p| norm_ty(db, &p.ty)).collect::<Vec<_>>();
+            let overrides = slots.iter().position(|s| {
+                let sn = simple_name(&s.sig.qualified_name);
+                if is_dtor {
+                    sn.starts_with('~')
+                } else {
+                    sn == name && s.sig.params.len() == d.params.len() && s.sig.is_const == d.is_const && pkey(&s.sig.params) == pkey(&d.params)
+                }
+            });
+            let sig = FuncSig {
+                qualified_name: d.qualified_name.clone(),
+                mangled: None,
+                ret: d.ret.clone(),
+                params: d.params.clone(),
+                this_class: Some(cls.to_string()),
+                is_const: d.is_const,
+                is_static: false,
+                is_virtual: true,
+                variadic: d.variadic,
+            };
+            match overrides {
+                Some(i) => {
+                    slots[i].sig = sig;
+                    slots[i].symbol.clear();
+                }
+                None if d.is_virtual => {
+                    let off = 8 + 4 * slots.len() as u32;
+                    slots.push(VirtualMethod { vtable_offset: off, sig, symbol: String::new(), this_adjust: 0 });
+                }
+                None => {}
+            }
+        }
+        // a derived class without a declared destructor has its implicit one in the slot
+        if let Some(s) = slots.iter_mut().find(|s| simple_name(&s.sig.qualified_name).starts_with('~')) {
+            if s.sig.this_class.as_deref() != Some(cls) {
+                let last = simple_name(cls).to_string();
+                s.sig.qualified_name = format!("{cls}::~{last}");
+                s.sig.this_class = Some(cls.to_string());
+                s.symbol.clear();
+            }
+        }
+        Some(slots)
+    })();
+    memo.insert(cls.to_string(), r.clone());
+    r
+}

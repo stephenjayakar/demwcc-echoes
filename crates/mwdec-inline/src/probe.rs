@@ -35,6 +35,9 @@ pub struct Probe {
     pub line: usize,
     /// Instantiated from a function template with a guessed scalar type.
     pub fn_template: bool,
+    /// A trivial accessor (`m = x;`) probed only for the dead stores of its by-value class
+    /// parameter or return: its template needs them.
+    pub needs_dead: bool,
 }
 
 /// C++ spelling of a type, or None when the probe can't name it.
@@ -249,7 +252,11 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             if !d.is_inline_defined || d.variadic || d.is_virtual {
                 continue;
             }
-            if d.inline_body.as_deref().map_or(false, crate::relevance::trivial_body) {
+            // trivial accessors only with a by-value class parameter or return (their copy
+            // leaves a dead frame store that tells the call apart from a plain member access)
+            let by_value_class = |t: &Type| !matches!(strip_cv(t), Type::Ptr(_) | Type::Ref(_)) && is_class_type(t, db);
+            let needs_dead = d.inline_body.as_deref().map_or(false, crate::relevance::trivial_body);
+            if needs_dead && !(d.params.iter().any(|p| by_value_class(&p.ty)) || by_value_class(&d.ret)) {
                 continue;
             }
             // loops never fold into one value, and their instantiations are the ones that fail
@@ -299,6 +306,9 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             let mut ret_ref = false;
             let ret: Type;
             let body: String;
+            // a non-const method's value can be discarded: its expansion without the result
+            // (the compiler drops the result's computation) is probed too
+            let mut discard: Option<String> = None;
             if is_ctor {
                 let c = class.clone().unwrap();
                 // default constructors only for class template instances (`optional_object<T>()`:
@@ -334,6 +344,9 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                     _ => {
                         ret = d.ret.clone();
                         body = format!("return {call};");
+                        if matches!(kind, CallKind::Method) && !d.is_const {
+                            discard = Some(call.clone());
+                        }
                     }
                 }
             }
@@ -360,9 +373,17 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             }
             let sig = sig_of_decl(d, class.as_deref(), &qname);
             let _ = is_class_type;
-            out.push(Probe { name, decl: d.clone(), class: class.clone(), kind, params, ret, ret_ref, sig, line: 0, fn_template });
+            out.push(Probe { name, decl: d.clone(), class: class.clone(), kind: kind.clone(), params: params.clone(), ret, ret_ref, sig: sig.clone(), line: 0, fn_template, needs_dead });
             // stash the text in the decl body slot for rendering
             out.last_mut().unwrap().decl.inline_body = Some(text);
+            if let Some(call) = discard {
+                let name = format!("__mwdi_p{}", out.len());
+                let text = format!("void {name}({}) {{ {call}; }}", all_params.join(", "));
+                if seen.insert(text.replace(&name, "")) {
+                    out.push(Probe { name, decl: d.clone(), class: class.clone(), kind, params, ret: Type::Void, ret_ref: false, sig, line: 0, fn_template, needs_dead: false });
+                    out.last_mut().unwrap().decl.inline_body = Some(text);
+                }
+            }
         }
     }
     out
@@ -596,6 +617,8 @@ pub fn inject_decls(db: &mut TypeDb, probes: &[Probe]) {
                 template_params: vec![],
                 access: mwdec_core::Access::Public,
                 init_list: None,
+                order: 0,
+                defaults: vec![],
             }],
         );
     }

@@ -365,6 +365,9 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
                 continue;
             };
             let score = crate::matcher::use_score(t, extra, false, &args);
+            if tr {
+                eprintln!("G {}: match {:?} from {:?}", t.name, args, pick.iter().map(|s| (s.off, &s.src)).collect::<Vec<_>>());
+            }
             // intervening statements must not touch the destination
             let lo = *stmts.first().unwrap();
             let hi = *stmts.last().unwrap();
