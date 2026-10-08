@@ -229,3 +229,69 @@ pub fn split_last_field(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
     });
     n
 }
+
+/// Variant point [`crate::variants::BOOL_CONST_LOCAL`]: bool locals defined once (where they are
+/// declared) become `const bool`, and a returned `&&`/`||` chain is returned through one
+/// (`const bool r = a || b; return r;`). The compiler re-extends a const bool at each use.
+pub fn const_bool_locals(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, ret_bool: bool) -> usize {
+    let defs = count_defs(body);
+    let decl_here = crate::idioms::decl_at_first_def_scalars(body, vars);
+    let locals: Vec<VarId> = (0..vars.len())
+        .filter(|&v| {
+            matches!(vars[v].kind, VarKind::Local) && matches!(vars[v].ty, mwdec_core::Type::Bool) && defs.get(&v) == Some(&1) && decl_here.contains(&v)
+        })
+        .collect();
+    let mut chains = 0;
+    if ret_bool {
+        Stmt::for_each_block_mut(body, &mut |b| {
+            chains += b.iter().filter(|s| matches!(s, Stmt::Return(Some(Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, .. })))).count();
+        });
+    }
+    if (locals.is_empty() && chains == 0) || !crate::variants::alt(crate::variants::BOOL_CONST_LOCAL) {
+        return 0;
+    }
+    let cb = mwdec_core::Type::Const(Box::new(mwdec_core::Type::Bool));
+    for &v in &locals {
+        vars[v].ty = cb.clone();
+    }
+    let mut n = locals.len();
+    if chains > 0 {
+        let mut fresh = vec![];
+        Stmt::for_each_block_mut(body, &mut |b| {
+            let mut k = 0;
+            while k < b.len() {
+                if let Stmt::Return(Some(e @ Expr::Binary { op: BinOp::LogAnd | BinOp::LogOr, .. })) = &b[k] {
+                    let e = e.clone();
+                    let v = vars.len() + fresh.len();
+                    fresh.push(v);
+                    b[k] = Stmt::Assign { dst: Expr::Var(v), src: e };
+                    b.insert(k + 1, Stmt::Return(Some(Expr::Var(v))));
+                    k += 1;
+                }
+                k += 1;
+            }
+        });
+        for (i, _) in fresh.iter().enumerate() {
+            let name = if i == 0 { "result".to_string() } else { format!("result{i}") };
+            vars.push(Var { name, ty: cb.clone(), kind: VarKind::Local });
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `Member { base: r }` with `r` a reference (a folded inline's object reached through a reference
+/// member or local, `mPlayer.GetTranslation()`) is the access through it: `Load { base: r }`, which
+/// renders through the referent's members and accessors like any pointer access.
+pub fn reference_members(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    let mut n = 0;
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if let Expr::Member { base, offset, ty } = &*e {
+            if matches!(crate::types::ty_of(base, vars), mwdec_core::Type::Ref(_)) {
+                *e = Expr::Load { base: base.clone(), offset: *offset, ty: ty.clone() };
+                n += 1;
+            }
+        }
+    });
+    n
+}

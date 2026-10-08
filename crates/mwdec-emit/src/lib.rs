@@ -107,9 +107,11 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
         let body = fixed.body.clone();
         mwdec_lift::idioms::untype_undeclarable(&body, &mut fixed.vars, db);
         let forwarded = mwdec_lift::postinline::forward_inline_args(&mut fixed.body, &fixed.vars);
+        let forwarded = forwarded + mwdec_lift::postinline::reference_members(&mut fixed.body, &fixed.vars);
         let copies = mwdec_lift::structcopy::apply(&mut fixed.body, &fixed.vars, db);
         let copies = copies + mwdec_lift::postinline::address_temps_first(&mut fixed.body, &fixed.vars);
         let copies = copies + mwdec_lift::postinline::split_last_field(&mut fixed.body, &fixed.vars);
+        let copies = copies + mwdec_lift::postinline::const_bool_locals(&mut fixed.body, &mut fixed.vars, matches!(fixed.sig.ret, Type::Bool));
         if fixed.vars != ir.vars || forwarded > 0 || copies > 0 {
             &fixed
         } else {
@@ -343,7 +345,11 @@ impl<'a> Em<'a> {
         let mut ps = vec![];
         for (i, &v) in ir.params.iter().enumerate() {
             let name = &ir.vars[v].name;
-            let spelled = ir.decl_params.get(i).cloned().unwrap_or_default();
+            let mut spelled = ir.decl_params.get(i).cloned().unwrap_or_default();
+            // (a header's top-level `const` goes when the body writes the parameter)
+            if spelled.starts_with("const ") && !spelled.contains('*') && !spelled.contains('&') && param_written(&ir.body, v) {
+                spelled = spelled["const ".len()..].to_string();
+            }
             // no mangled spelling (C functions): the header declaration's parameter type
             let declared = ir.sig.params.get(i).map(|p| &p.ty).filter(|t| !matches!(t, Type::Unknown { .. }));
             let p = if !spelled.is_empty() {
@@ -888,6 +894,8 @@ impl<'a> Em<'a> {
             Type::Unknown { size: 8 } if matches!(var.kind, VarKind::Stack { offset, .. } if offset % 8 != 0) => {
                 format!("unsigned char {}[8]", var.name)
             }
+            // a const scalar (declared at its definition)
+            Type::Const(t) if matches!(**t, Type::Bool) && matches!(var.kind, VarKind::Local) => format!("const {}", decl(t, &var.name)),
             t => decl(&local_type(t), &var.name),
         };
         if self.memory_scalar(v) {
@@ -1078,7 +1086,8 @@ impl<'a> Em<'a> {
     /// Globals the context lacks that are only read and written as scalar members (not just the
     /// one at offset 0; never by address): a stand-in struct with one member per offset.
     fn collect_global_structs(&mut self) {
-        let mut fields: std::collections::HashMap<String, std::collections::BTreeMap<i32, Vec<Type>>> = Default::default();
+        // (ordered: the stand-ins are emitted in this order, and drafts must be deterministic)
+        let mut fields: std::collections::BTreeMap<String, std::collections::BTreeMap<i32, Vec<Type>>> = Default::default();
         let mut total: std::collections::HashMap<String, usize> = Default::default();
         let mut covered: std::collections::HashMap<String, usize> = Default::default();
         Stmt::walk_exprs(&self.ir.body, &mut |e| match e {
@@ -1501,7 +1510,21 @@ impl<'a> Em<'a> {
                 let _ = writeln!(self.out, "{ind}}} while ({c});");
             }
             Stmt::For { init, cond, step, body } => {
-                let i = init.iter().map(|s| self.inline_stmt(s)).collect::<Vec<_>>().join(", ");
+                let mut parts = vec![];
+                for s in init {
+                    match s {
+                        // declared by the init (`for (T it = c.begin(); ...)`)
+                        Stmt::Assign { dst: Expr::Var(v), src } if self.constructed.contains(v) && !self.declared.contains(v) && init.len() == 1 => {
+                            self.declared.insert(*v);
+                            let t = self.ir.vars[*v].ty.clone();
+                            let d = self.local_decl(*v);
+                            let val = self.coerce(src, &local_type(&t));
+                            parts.push(format!("{d} = {val}"));
+                        }
+                        s => parts.push(self.inline_stmt(s)),
+                    }
+                }
+                let i = parts.join(", ");
                 let c = self.cond(cond);
                 let st = step.iter().map(|s| self.inline_stmt(s)).collect::<Vec<_>>().join(", ");
                 let _ = writeln!(self.out, "{ind}for ({i}; {c}; {st}) {{");
@@ -1903,6 +1926,20 @@ impl<'a> Em<'a> {
     }
 
     fn cond(&mut self, e: &Expr) -> String {
+        // a bool member tested against zero through its widened byte: the bool itself
+        // (`x.valid()`, not `(unsigned int)x.valid() != 0`)
+        if let Expr::Binary { op: op @ (BinOp::Ne | BinOp::Eq), l, r, .. } = e {
+            if r.as_int() == Some(0) {
+                let mut inner = &**l;
+                while let Expr::Cast { e: x, .. } = inner {
+                    inner = x;
+                }
+                if !std::ptr::eq(inner, &**l) && matches!(inner, Expr::Member { .. } | Expr::Load { .. }) && matches!(strip_cv(&self.decl_type_rw(inner, true)), Type::Bool) {
+                    let x = self.expr(inner, 15);
+                    return if *op == BinOp::Ne { x } else { format!("!{x}") };
+                }
+            }
+        }
         self.expr(e, 0)
     }
 
@@ -2101,8 +2138,12 @@ impl<'a> Em<'a> {
                 }
                 // a word-sized access that is the whole member object (`damage.GetWeaponMode()`)
                 Expr::Load { .. } | Expr::Member { .. } if matches!(froms, Type::Unknown { .. }) && self.typed_member(e, inner).is_some() => self.typed_member(e, inner).unwrap(),
-                // a constant bound to a const reference (the compiler materialises it)
-                Expr::Int { .. } | Expr::Float { .. } if matches!(**inner, Type::Const(_)) => self.expr(e, 0),
+                // a constant bound to a const reference (the compiler materialises it): the value
+                // for a scalar, a class constructed from it by a one-scalar constructor
+                Expr::Int { .. } | Expr::Float { .. } if matches!(**inner, Type::Const(_)) && self.scalar_target(inner) => self.expr(e, 0),
+                Expr::Int { .. } if matches!(**inner, Type::Const(_)) && self.scalar_ctor_class(inner).is_some() => {
+                    format!("{}({})", self.scalar_ctor_class(inner).unwrap(), self.expr(e, 0))
+                }
                 _ if matches!(froms, Type::Int { .. } | Type::Unknown { .. }) => format!("*({}){}", ptr_to(inner), self.expr(e, 14)),
                 _ => self.expr(e, 0),
             };
@@ -2876,6 +2917,14 @@ impl<'a> Em<'a> {
                     Type::Ref(inner) => mwdec_lift::types::resolve(Some(db), inner).into_owned(),
                     _ => br,
                 };
+                // the object a class template keeps in raw storage (`optional_object<T>`'s bytes):
+                // through its accessor (`opt.data()`)
+                if let (Some(cls), Some(tc)) = (named(&br), named(strip_cv(ty))) {
+                    if let Some(acc) = storage_accessor(db, cls, off, tc) {
+                        let b = self.expr(base, 15);
+                        return format!("{b}.{acc}()");
+                    }
+                }
                 if let Some(cls) = named(&br) {
                     let want = scalar_size(ty).unwrap_or(0);
                     if let Some((path, ft)) = field_path(db, cls, off, if matches!(ty, Type::Unknown { size: 0 }) { 0 } else { want }) {
@@ -2973,6 +3022,26 @@ impl<'a> Em<'a> {
             }
         }
         true
+    }
+
+    /// A scalar (or enum) type, through cv and typedefs.
+    fn scalar_target(&self, t: &Type) -> bool {
+        let r = mwdec_lift::types::resolve(self.db, strip_cv(t)).into_owned();
+        mwdec_lift::types::is_enum(self.db, &r) || (scalar_size(&r).is_some() && named(&r).is_none())
+    }
+
+    /// The class `t` names when it has a constructor taking one scalar by value
+    /// (`explicit CMaterialList(u64 value)`).
+    fn scalar_ctor_class(&self, t: &Type) -> Option<String> {
+        let db = self.db?;
+        let c = strip_cv(t);
+        let n = named(c)?;
+        let base = strip_template_args(n);
+        let key = format!("{base}::{}", sig::split_scope(&base).1);
+        let ok = db.decls.get(&key)?.iter().any(|d| {
+            d.params.len() == 1 && !matches!(strip_cv(&d.params[0].ty), Type::Ref(_) | Type::Ptr(_)) && self.scalar_target(&d.params[0].ty) && !mwdec_lift::types::is_enum(Some(db), strip_cv(&d.params[0].ty))
+        });
+        ok.then(|| type_str(c))
     }
 
     /// `*(T*)((char*)p + off)` (pointer base) / `*(T*)((char*)&obj + off)` (aggregate lvalue).
@@ -3925,6 +3994,7 @@ impl<'a> Em<'a> {
             is_static: false,
             is_virtual: false,
             variadic: false,
+            runs_code: false,
         })
     }
 
@@ -4618,6 +4688,26 @@ fn value_type(t: &Type) -> Type {
     }
 }
 
+/// Does the body assign (or take the address of) variable `v`?
+fn param_written(body: &[Stmt], v: VarId) -> bool {
+    fn assigns(b: &[Stmt], v: VarId) -> bool {
+        b.iter().any(|s| match s {
+            Stmt::Assign { dst: Expr::Var(x), .. } => *x == v,
+            Stmt::If { then, els, .. } => assigns(then, v) || assigns(els, v),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => assigns(body, v),
+            Stmt::For { init, step, body, .. } => assigns(init, v) || assigns(step, v) || assigns(body, v),
+            Stmt::Switch { cases, .. } => cases.iter().any(|c| assigns(&c.body, v)),
+            _ => false,
+        })
+    }
+    let mut hit = assigns(body, v);
+    Stmt::walk_exprs(body, &mut |e| match e {
+        Expr::IncDec { e, .. } | Expr::AddrOf(e) if matches!(&**e, Expr::Var(x) if *x == v) => hit = true,
+        _ => {}
+    });
+    hit
+}
+
 /// Insert a parameter name into a type spelling (`void (*)(int)` -> `void (*name)(int)`).
 fn spell_param(spelled: &str, name: &str) -> String {
     // abstract declarator `(*)`, `(**)`, `(&)`, `(* const)`: the name goes before its `)`
@@ -4657,4 +4747,36 @@ fn stack_var_of(e: &Expr, ir: &IrFunction) -> Option<VarId> {
         Expr::Var(v) if matches!(ir.vars[*v].kind, VarKind::Stack { .. }) => Some(*v),
         _ => None,
     }
+}
+
+/// The accessor (`data`) of class template instance `cls` returning the `T&` it keeps in raw
+/// byte storage at `off`, when `T` is `obj`.
+fn storage_accessor(db: &TypeDb, cls: &str, off: i32, obj: &str) -> Option<String> {
+    let lt = cls.find('<')?;
+    let base = &cls[..lt];
+    let tps = db.templates.get(base)?;
+    let args = sig::split_top(&cls[lt + 1..cls.len().checked_sub(1)?], ',');
+    let k = args.iter().position(|a| sig::norm_name(a.trim()) == sig::norm_name(obj))?;
+    let tp = tps.get(k)?;
+    let c = sig::find_class(db, cls)?;
+    let f = c.fields.iter().find(|f| f.offset as i32 == off)?;
+    if !matches!(strip_cv(&f.ty), Type::Array(e, _) if scalar_size(strip_cv(e)) == Some(1)) {
+        return None;
+    }
+    let prefix = format!("{base}::");
+    let mut found: Option<String> = None;
+    for (key, ds) in db.decls.range(prefix.clone()..) {
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let name = &key[prefix.len()..];
+        if name.contains("::") || name.starts_with("operator") {
+            continue;
+        }
+        if ds.iter().any(|d| d.params.is_empty() && !d.is_const && d.is_inline_defined && matches!(strip_cv(&d.ret), Type::Ref(t) if matches!(strip_cv(t), Type::Named(n) if n == tp))) {
+            found = Some(name.to_string());
+            break;
+        }
+    }
+    found
 }

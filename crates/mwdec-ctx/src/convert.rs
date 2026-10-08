@@ -282,6 +282,7 @@ impl<'a> Converter<'a> {
             is_static: false,
             is_virtual: d.has(at::VIRTUAL),
             variadic,
+            runs_code: false,
         }
     }
 

@@ -24,6 +24,7 @@ pub mod post;
 pub mod probe;
 pub mod relevance;
 pub mod safety;
+pub mod scalarinl;
 pub mod ser;
 pub mod session;
 pub mod stmtinl;
@@ -114,7 +115,12 @@ pub fn build_library_for(db: &TypeDb, target: Option<&ObjectFile>, cache: Option
     let rel = target.map(|o| relevance::relevant_classes(o, db));
     let mut lib = build_library_rel(db, rel.as_ref(), cache, compile);
     if let Some(o) = target {
-        let classes = defctor::wanted(o.functions.iter().map(|f| f.name.as_str()), db);
+        let mut classes = defctor::wanted(o.functions.iter().map(|f| f.name.as_str()), db);
+        for c in defctor::wanted_arg_classes(o, db) {
+            if !classes.contains(&c) {
+                classes.push(c);
+            }
+        }
         lib.default_ctors = defctor::build(db, &classes, cache.map(|c| &c.defctors), compile);
         let pairs = defctor::wanted_pairs(o.functions.iter().map(|f| f.name.as_str()), db);
         lib.copy_ctors = defctor::build_copies(db, &pairs, cache.map(|c| &c.defctors), compile);

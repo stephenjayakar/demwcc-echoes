@@ -160,6 +160,7 @@ impl<'a> P<'a> {
                     is_static: false,
                     is_virtual: false,
                     variadic,
+                    runs_code: false,
                 };
                 // A function type only appears under a pointer: P F... -> FuncPtr
                 if quals.last() == Some(&b'P') {

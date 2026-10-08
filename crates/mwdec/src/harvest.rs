@@ -235,6 +235,12 @@ struct Row {
     flags: Vec<String>,
     compiler: String,
     context: String,
+    /// Data the exact candidate defines that the target unit lacks (`Scorer::extra_data`):
+    /// integration must strip it or skip the candidate.
+    extra_data: Vec<String>,
+    /// Diff profiles of the first draft and of the best candidate (what differs from the target).
+    first_profile: Option<mwdec_search::score::DiffProfile>,
+    best_profile: Option<mwdec_search::score::DiffProfile>,
 }
 
 /// Per-unit state: inputs (context, PCH, TypeDb, drivers) built once and shared by the unit's
@@ -342,11 +348,43 @@ pub fn cmd_harvest(root: &Path, work: &Path, a: HarvestArgs) -> Result<()> {
     let units: Mutex<Vec<(String, Arc<Mutex<Option<Arc<UnitSlot>>>>)>> = Mutex::new(Vec::new());
     let next = std::sync::atomic::AtomicUsize::new(0);
     let n_exact = std::sync::atomic::AtomicUsize::new(0);
+    // Watchdog: a candidate that runs far past its budget (a draft that never ends, a compiler
+    // that hangs) is recorded as a timeout and the process ends; the supervisor restarts it and
+    // the resume logic skips the candidate.
+    let running: Mutex<Vec<Option<(usize, Instant)>>> = Mutex::new(vec![None; jobs]);
+    let grace = std::env::var("MWDEC_HARVEST_GRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(CANDIDATE_GRACE_SECS);
+    let limit = Duration::from_secs(a.budget_secs * 3 + grace);
+    let job_ids = std::sync::atomic::AtomicUsize::new(0);
+    // job threads that ran out of candidates
+    let finished = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
+        s.spawn(|| {
+            while finished.load(std::sync::atomic::Ordering::Relaxed) < jobs {
+                std::thread::sleep(Duration::from_secs(2));
+                let stuck = running.lock().unwrap().iter().flatten().find(|(_, t)| t.elapsed() > limit).copied();
+                if let Some((i, t)) = stuck {
+                    let c = &cands[i];
+                    let row = Row { unit: c.unit.clone(), symbol: c.symbol.clone(), size: c.size, fuzzy: c.fuzzy, sourced: c.sourced, status: "timeout".into(), seconds: t.elapsed().as_secs_f64(), ..Default::default() };
+                    if let Ok(mut f) = attempts_file.lock() {
+                        let _ = f.write_all(format!("{}\n", row_json(&row, &a.tag)).as_bytes());
+                        let _ = f.flush();
+                    }
+                    eprintln!("harvest: {} {} still running after {:.0}s: recorded as a timeout, restarting", c.unit, c.symbol, t.elapsed().as_secs_f64());
+                    end_process(3);
+                }
+            }
+        });
         for _ in 0..jobs {
-            let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, || loop {
+            let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, || {
+              let job = job_ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(c) = cands.get(i) else { break };
+                let Some(c) = cands.get(i) else {
+                    running.lock().unwrap()[job] = None;
+                    finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                };
+                running.lock().unwrap()[job] = Some((i, Instant::now()));
                 {
                     let mut f = started_file.lock().unwrap();
                     let _ = f.write_all(format!("{}\t{}\t{}\n", a.tag, c.unit, c.symbol).as_bytes());
@@ -435,6 +473,7 @@ pub fn cmd_harvest(root: &Path, work: &Path, a: HarvestArgs) -> Result<()> {
                     n_exact.load(std::sync::atomic::Ordering::Relaxed),
                     t0.elapsed().as_secs_f64()
                 );
+              }
             });
         }
     });
@@ -448,7 +487,29 @@ pub fn cmd_harvest(root: &Path, work: &Path, a: HarvestArgs) -> Result<()> {
     }
     let _ = std::io::stderr().flush();
     let _ = std::io::stdout().flush();
-    std::process::exit(0)
+    end_process(0)
+}
+
+/// Seconds a candidate may run beyond three times its search budget before the watchdog ends
+/// the harvest child (drafting, probes and confirmations included; `MWDEC_HARVEST_GRACE`).
+const CANDIDATE_GRACE_SECS: u64 = 300;
+
+/// End this process now, without running library teardown: `ExitProcess` terminates the other
+/// threads (fast-path workers, debugger loops of persistent compilers) wherever they are and then
+/// runs DLL detach code, which can wait forever on a lock one of them held. Results are flushed
+/// by the caller; debugged compilers end with their debugger.
+fn end_process(code: i32) -> ! {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn TerminateProcess(h: isize, code: u32) -> i32;
+        }
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), code as u32);
+        }
+    }
+    std::process::exit(code)
 }
 
 fn row_json(r: &Row, tag: &str) -> serde_json::Value {
@@ -456,7 +517,7 @@ fn row_json(r: &Row, tag: &str) -> serde_json::Value {
         "unit": r.unit, "symbol": r.symbol, "size": r.size, "fuzzy_before": r.fuzzy, "sourced": r.sourced,
         "status": r.status, "error": r.error.as_ref().map(|e| e.chars().take(400).collect::<String>()),
         "first_exact": r.first_exact, "best_score": r.best_score, "compiles": r.compiles,
-        "seconds": r.seconds, "tag": tag,
+        "seconds": r.seconds, "tag": tag, "extra_data": r.extra_data, "first_profile": r.first_profile, "best_profile": r.best_profile,
     })
 }
 
@@ -471,7 +532,7 @@ fn write_exact(a: &HarvestArgs, r: &Row, file: &Mutex<std::fs::File>) -> Result<
         "unit": r.unit, "symbol": r.symbol, "size": r.size, "fuzzy_before": r.fuzzy, "sourced": r.sourced,
         "status": r.status, "verdict": "EXACT", "first_exact": r.first_exact, "compiles": r.compiles,
         "seconds": r.seconds, "tag": a.tag, "source": src, "preamble": preamble, "definition": def,
-        "flags": r.flags, "compiler": r.compiler, "context": r.context, "file": path.to_string_lossy(),
+        "flags": r.flags, "compiler": r.compiler, "context": r.context, "file": path.to_string_lossy(), "extra_data": r.extra_data,
     });
     let mut f = file.lock().unwrap();
     f.write_all(format!("{v}\n").as_bytes())?;
@@ -548,6 +609,8 @@ fn run_one(us: &UnitSlot, ext: &(ExternIndex, ExternIndex), c: &Cand, a: &Harves
         }
     }
     row.first_exact = r.initial.as_ref().is_some_and(|f| f.exact);
+    row.first_profile = r.initial.as_ref().map(|f| f.profile);
+    row.best_profile = r.best.as_ref().map(|f| f.profile);
     row.best_score = r.best.as_ref().map(|f| f.score);
     row.compiles = r.compiles;
     if row.error.is_none() {
@@ -555,6 +618,7 @@ fn run_one(us: &UnitSlot, ext: &(ExternIndex, ExternIndex), c: &Cand, a: &Harves
     }
     row.status = if r.exact {
         row.source = Some(super::search_cmds::polish_exact(ui, &scorer, &r.best_src));
+        row.extra_data = row.source.as_deref().map(|s| scorer.extra_data(s)).unwrap_or_default();
         if row.first_exact { "exact".into() } else { "searched".into() }
     } else if r.initial.is_some() {
         // keep the best candidate of a miss for later analysis / longer searches

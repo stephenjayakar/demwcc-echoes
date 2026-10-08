@@ -125,12 +125,12 @@ fn mentions(s: &Stmt, v: VarId) -> bool {
 }
 
 fn method(cls: &str, name: &str, ret: Type, is_const: bool) -> FuncSig {
-    FuncSig { qualified_name: format!("{cls}::{name}"), mangled: None, ret, params: vec![], this_class: Some(cls.to_string()), is_const, is_static: false, is_virtual: false, variadic: false }
+    FuncSig { qualified_name: format!("{cls}::{name}"), mangled: None, ret, params: vec![], this_class: Some(cls.to_string()), is_const, is_static: false, is_virtual: false, variadic: false, runs_code: false }
 }
 
 /// Rewrite pointer-walk loops over `reserved_vector`s; returns the number rewritten.
 pub fn apply(ir: &mut IrFunction, db: &TypeDb) -> usize {
-    let mut n = 0;
+    let mut n = iterator_steps(ir, db);
     let mut k = 0;
     while k < ir.body.len() {
         if try_loop(ir, db, k).or_else(|| try_index_loop(ir, db, k)).is_some() {
@@ -143,6 +143,54 @@ pub fn apply(ir: &mut IrFunction, db: &TypeDb) -> usize {
         object_pointer_locals(ir);
         n += push_backs(ir, db);
     }
+    n
+}
+
+/// `it.current = it.current->mPrev` (`mNext`) on a list iterator member: `--it` (`++it`).
+fn iterator_steps(ir: &mut IrFunction, db: &TypeDb) -> usize {
+    let Some(this) = ir.this_var else { return 0 };
+    let Some(own) = ir.sig.this_class.clone() else { return 0 };
+    let Some(c) = mwdec_lift::sig::find_class(db, &own) else { return 0 };
+    // list iterator members: offset -> (type, mPrev offset, mNext offset)
+    let mut members: Vec<(i32, Type, i32, i32)> = vec![];
+    for f in &c.fields {
+        let ft = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
+        let Some(cls) = crate::util::class_name(&ft, db) else { continue };
+        let Some(list) = cls.strip_suffix("::iterator").or_else(|| cls.strip_suffix("::const_iterator")) else { continue };
+        if list_layout(db, list).is_none() {
+            continue;
+        }
+        let (prev, next) = match mwdec_lift::sig::find_class(db, &format!("{list}::node")) {
+            Some(n) => {
+                let o = |x: &str| n.fields.iter().find(|f| f.name == x).map(|f| f.offset as i32);
+                (o("mPrev").unwrap_or(0), o("mNext").unwrap_or(4))
+            }
+            None => (0, 4),
+        };
+        members.push((f.offset as i32, ft, prev, next));
+    }
+    if members.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        for s in b.iter_mut() {
+            let Stmt::Assign { dst: Expr::Load { base, offset: k, .. }, src } = s else { continue };
+            if !matches!(strip_casts(base), Expr::Var(v) if *v == this) {
+                continue;
+            }
+            let Some((_, ty, prev, next)) = members.iter().find(|m| m.0 == *k) else { continue };
+            let Expr::Load { base: cur, offset: o, .. } = strip_casts(src) else { continue };
+            let same = matches!(strip_casts(cur), Expr::Load { base: b2, offset: k2, .. } if k2 == k && matches!(strip_casts(b2), Expr::Var(v) if *v == this));
+            let delta = if *o == *prev { -1 } else if *o == *next { 1 } else { continue };
+            if !same || prev == next {
+                continue;
+            }
+            let lv = Expr::Load { base: Box::new(Expr::Var(this)), offset: *k, ty: ty.clone() };
+            *s = Stmt::Expr(Expr::IncDec { e: Box::new(lv), delta, post: false });
+            n += 1;
+        }
+    });
     n
 }
 
@@ -184,7 +232,7 @@ fn push_backs(ir: &mut IrFunction, db: &TypeDb) -> usize {
                 _ => return None,
             };
             let ps = vec![mwdec_core::Param { name: None, ty: Type::Ref(Box::new(Type::Const(Box::new(t.clone())))) }];
-            let sig = FuncSig { qualified_name: format!("{cls}::push_back"), mangled: None, ret: Type::Void, params: ps, this_class: Some(cls.clone()), is_const: false, is_static: false, is_virtual: false, variadic: false };
+            let sig = FuncSig { qualified_name: format!("{cls}::push_back"), mangled: None, ret: Type::Void, params: ps, this_class: Some(cls.clone()), is_const: false, is_static: false, is_virtual: false, variadic: false, runs_code: false };
             Some(Stmt::Expr(Expr::Call { callee: Callee::Method { symbol: String::new(), sig, this: obj.clone(), qualified: false }, args: vec![arg], ret: Type::Void }))
         })();
         if let Some(st) = hit {
@@ -321,6 +369,14 @@ pub fn lists_prefold(ir: &mut IrFunction, db: &TypeDb) -> Vec<Vec<Stmt>> {
                 ir.body.insert(w - 1, Stmt::Comment(format!("{STASH}{}", stash.len())));
                 stash.push(pair);
             }
+        } else if let Some(w) = try_map_loop(ir, db, k) {
+            let one = std::mem::replace(&mut ir.body[w], Stmt::Comment(format!("{STASH}{}", stash.len())));
+            stash.push(vec![one]);
+            k = w;
+        } else if let Some(at) = try_list_find(ir, db, k) {
+            let one = std::mem::replace(&mut ir.body[at], Stmt::Comment(format!("{STASH}{}", stash.len())));
+            stash.push(vec![one]);
+            k = at;
         }
         k += 1;
     }
@@ -525,7 +581,7 @@ fn as_find(ir: &mut IrFunction, db: &TypeDb, w: usize, p: VarId, cls: &str, size
         return None;
     }
     let pt = ir.vars[p].ty.clone();
-    let find = FuncSig { qualified_name: "rstl::find".into(), mangled: None, ret: pt.clone(), params: vec![], this_class: None, is_const: false, is_static: false, is_virtual: false, variadic: false };
+    let find = FuncSig { qualified_name: "rstl::find".into(), mangled: None, ret: pt.clone(), params: vec![], this_class: None, is_const: false, is_static: false, is_virtual: false, variadic: false, runs_code: false };
     let call = Expr::Call { callee: Callee::Direct { symbol: "rstl::find".into(), sig: find }, args: vec![begin.clone(), (**end).clone(), val], ret: pt };
     let _ = cls;
     ir.body[w - 1] = Stmt::Assign { dst: Expr::Var(p), src: call };
@@ -655,7 +711,7 @@ fn try_list_loop(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<usize> {
     let obj = Box::new(Expr::AddrOf(Box::new(cont.clone())));
     let call = |name: &str| Expr::Call { callee: Callee::Method { symbol: String::new(), sig: method(&cls, name, it_ty.clone(), cst), this: obj.clone(), qualified: false }, args: vec![], ret: it_ty.clone() };
     let arrow = Expr::Call {
-        callee: Callee::Method { symbol: String::new(), sig: FuncSig { qualified_name: format!("{iter_cls}::operator->"), mangled: None, ret: elem_ptr.clone(), params: vec![], this_class: Some(iter_cls.clone()), is_const: true, is_static: false, is_virtual: false, variadic: false }, this: Box::new(Expr::AddrOf(Box::new(Expr::Var(p)))), qualified: false },
+        callee: Callee::Method { symbol: String::new(), sig: FuncSig { qualified_name: format!("{iter_cls}::operator->"), mangled: None, ret: elem_ptr.clone(), params: vec![], this_class: Some(iter_cls.clone()), is_const: true, is_static: false, is_virtual: false, variadic: false, runs_code: false }, this: Box::new(Expr::AddrOf(Box::new(Expr::Var(p)))), qualified: false },
         args: vec![],
         ret: elem_ptr,
     };
@@ -755,6 +811,353 @@ fn try_list_loop(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<usize> {
     ir.body.insert(w, Stmt::Assign { dst: Expr::Var(p), src: call("begin") });
     // (returns where the loop ends up)
     Some(sink_param_reads(ir, w + 1))
+}
+
+// ---------------------------------------------------------------- rstl::red_black_tree
+
+/// A class that is (or derives at offset 0 from) an `rstl::red_black_tree`: (tree class, offset
+/// of its header, offset of a node's value, value type).
+fn tree_layout(db: &TypeDb, cls: &str) -> Option<(String, i32, i32, Type)> {
+    let c = mwdec_lift::sig::find_class(db, cls)?;
+    if cls.split('<').next()?.trim() != "rstl::red_black_tree" {
+        let b = c.bases.iter().find(|b| b.offset == 0)?;
+        return tree_layout(db, &b.name);
+    }
+    let header = c.fields.iter().find(|f| f.name == "mHeader")?.offset as i32;
+    let value = mwdec_lift::sig::find_class(db, &format!("{cls}::node")).and_then(|n| n.fields.iter().find(|f| f.name == "mValue").map(|f| f.offset as i32)).unwrap_or(16);
+    let inner = &cls[cls.find('<')? + 1..cls.rfind('>')?];
+    let args = mwdec_lift::sig::split_top(inner, ',');
+    let p = mwdec_lift::sig::parse_type(args.get(1)?.trim());
+    Some((cls.to_string(), header, value, p))
+}
+
+/// A walk over a tree's nodes (`rstl::map`, `rstl::set`) as an iterator loop:
+/// `t = &m.mHeader; for (p = t->mLeftmost; p || t != t; p = rbtree_traverse_forward(t, p)) {...}`
+/// (the expansion of `it != m.end()` and `++it`) is
+/// `for (const_iterator it = m.begin(); it != m.end(); ++it) { ... it->second ... }`.
+/// Returns the index of the loop.
+fn try_map_loop(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<usize> {
+    if let Stmt::For { init, cond, step, body } = &ir.body[w] {
+        let ([i @ Stmt::Assign { .. }], [s]) = (init.as_slice(), step.as_slice()) else { return None };
+        let mut t = ir.clone();
+        let (i, c, s, b) = (i.clone(), cond.clone(), s.clone(), body.clone());
+        let mut nb = b;
+        nb.push(s);
+        t.body[w] = Stmt::While { cond: c, body: nb };
+        t.body.insert(w, i);
+        let r = try_map_loop(&mut t, db, w + 1)?;
+        *ir = t;
+        return Some(r);
+    }
+    let Stmt::While { cond, .. } = &ir.body[w] else { return None };
+    let Expr::Binary { op: BinOp::LogOr, l, r, .. } = cond else { return None };
+    let p = match strip_casts(l) {
+        Expr::Var(p) => *p,
+        Expr::Binary { op: BinOp::Ne, l: a, r: z, .. } if z.as_int() == Some(0) => match strip_casts(a) {
+            Expr::Var(p) => *p,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let t = match strip_casts(r) {
+        Expr::Binary { op: BinOp::Ne, l: a, r: b, .. } => match (strip_casts(a), strip_casts(b)) {
+            (Expr::Var(x), Expr::Var(y)) if x == y => *x,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !matches!(ir.vars[p].kind, VarKind::Local | VarKind::Stack { .. }) || !matches!(ir.vars[t].kind, VarKind::Local) {
+        return None;
+    }
+    // the init of the walk just before the loop, the header address before that
+    let Stmt::Assign { dst: Expr::Var(x), src: first } = &ir.body[w.checked_sub(1)?] else { return None };
+    if *x != p {
+        return None;
+    }
+    let tdefs: Vec<usize> = (0..w).filter(|&i| matches!(&ir.body[i], Stmt::Assign { dst: Expr::Var(x), .. } if *x == t)).collect();
+    let [td] = tdefs.as_slice() else { return None };
+    let td = *td;
+    let Stmt::Assign { src: hdr, .. } = &ir.body[td] else { return None };
+    let (cbase, k) = base_plus(hdr)?;
+    // the walk starts at the header's leftmost node: `t->mLeftmost`, or the same word read
+    // from the container (`m.mHeader.mLeftmost`)
+    let starts = match strip_casts(first) {
+        Expr::Load { base: fb, offset: 0, .. } | Expr::Member { base: fb, offset: 0, .. } if matches!(strip_casts(fb), Expr::Var(y) if *y == t) => true,
+        Expr::Load { base: fb, offset, .. } | Expr::Member { base: fb, offset, .. } => *offset as i64 == k && strip_casts(fb) == cbase,
+        _ => false,
+    };
+    if !starts {
+        return None;
+    }
+    let cb = cbase.clone();
+    map_loop_rewrite(ir, db, w, p, t, td, cb, k)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_loop_rewrite(ir: &mut IrFunction, db: &TypeDb, w: usize, p: VarId, t: VarId, td: usize, cbase: Expr, k: i64) -> Option<usize> {
+    // the container: a reference parameter, or a member of this
+    let param_obj = |v: VarId| -> Option<(Expr, String, bool)> {
+        let cls = crate::util::class_name(strip(&ir.vars[v].ty), db)?;
+        let index = match ir.vars[v].kind {
+            VarKind::Param { index } => index,
+            _ => return None,
+        };
+        let cst = matches!(&ir.vars[v].ty, Type::Const(_)) || ir.sig.params.get(index).is_some_and(|q| matches!(&q.ty, Type::Ref(r) if matches!(&**r, Type::Const(_))));
+        Some((Expr::Var(v), cls, cst))
+    };
+    let (cont, cls, cst) = match &cbase {
+        // a reference parameter's object
+        Expr::Var(v) if matches!(ir.vars[*v].kind, VarKind::Param { .. }) && !matches!(strip(&ir.vars[*v].ty), Type::Ptr(_)) => param_obj(*v)?,
+        Expr::AddrOf(x) => match &**x {
+            Expr::Var(v) if matches!(ir.vars[*v].kind, VarKind::Param { .. }) => {
+                let cls = crate::util::class_name(strip(&ir.vars[*v].ty), db)?;
+                let cst = matches!(&ir.vars[*v].ty, Type::Const(_)) || ir.sig.params.get(match ir.vars[*v].kind {
+                    VarKind::Param { index } => index,
+                    _ => usize::MAX,
+                }).is_some_and(|q| matches!(&q.ty, Type::Ref(r) if matches!(&**r, Type::Const(_))));
+                (Expr::Var(*v), cls, cst)
+            }
+            _ => return None,
+        },
+        Expr::Var(v) if Some(*v) == ir.this_var => {
+            // `(char*)this + k`: the member holding the header
+            let own = ir.sig.this_class.as_deref()?;
+            let c = mwdec_lift::sig::find_class(db, own)?;
+            let mut hit = None;
+            for f in &c.fields {
+                let ft = mwdec_lift::types::resolve(Some(db), &f.ty).into_owned();
+                let Some(fc) = crate::util::class_name(&ft, db) else { continue };
+                if let Some((_, h, _, _)) = tree_layout(db, &fc) {
+                    if f.offset as i64 + h as i64 == k {
+                        hit = Some((Expr::Load { base: Box::new(Expr::Var(*v)), offset: f.offset as i32, ty: ft.clone() }, fc, ir.sig.is_const));
+                    }
+                }
+            }
+            let (lv, fc, cst) = hit?;
+            let (_, h, _, _) = tree_layout(db, &fc)?;
+            return map_loop_finish(ir, db, w, p, t, td, lv, fc, cst, h as i64);
+        }
+        _ => return None,
+    };
+    let (_, h, _, _) = tree_layout(db, &cls)?;
+    if h as i64 != k {
+        return None;
+    }
+    map_loop_finish(ir, db, w, p, t, td, cont, cls, cst, k)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_loop_finish(ir: &mut IrFunction, db: &TypeDb, w: usize, p: VarId, t: VarId, td: usize, cont: Expr, cls: String, cst: bool, _k: i64) -> Option<usize> {
+    let (_, _, value, vty) = tree_layout(db, &cls)?;
+    let Stmt::While { body, .. } = &ir.body[w] else { return None; };
+    // the step last: `p = rbtree_traverse_forward(t, p)`
+    let (last, rest) = body.split_last()?;
+    let Stmt::Assign { dst: Expr::Var(x), src } = last else { return None; };
+    let Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } = strip_casts(src) else { return None; };
+    if *x != p || !symbol.starts_with("rbtree_traverse_forward") || !matches!(args.as_slice(), [a, b] if matches!(strip_casts(a), Expr::Var(y) if *y == t) && matches!(strip_casts(b), Expr::Var(y) if *y == p)) {
+        return None;
+    }
+    // the header local and the walk used nowhere else (but as the element's address)
+    if rest.iter().any(|s| mentions(s, t)) || ir.body[w + 1..].iter().any(|s| mentions(s, t) || mentions(s, p)) || (td + 1..w - 1).any(|i| mentions(&ir.body[i], t) || mentions(&ir.body[i], p)) {
+        return None;
+    }
+    let iter_cls = format!("{cls}::{}", if cst { "const_iterator" } else { "iterator" });
+    let it_ty = Type::Named(iter_cls.clone());
+    let vty = if cst { Type::Const(Box::new(vty)) } else { vty };
+    let elem_ptr = Type::Ptr(Box::new(vty));
+    let obj = Box::new(Expr::AddrOf(Box::new(cont.clone())));
+    let call = |name: &str| Expr::Call { callee: Callee::Method { symbol: String::new(), sig: method(&cls, name, it_ty.clone(), cst), this: obj.clone(), qualified: false }, args: vec![], ret: it_ty.clone() };
+    let arrow = Expr::Call {
+        callee: Callee::Method { symbol: String::new(), sig: FuncSig { qualified_name: format!("{iter_cls}::operator->"), mangled: None, ret: elem_ptr.clone(), params: vec![], this_class: Some(iter_cls.clone()), is_const: true, is_static: false, is_virtual: false, variadic: false, runs_code: false }, this: Box::new(Expr::AddrOf(Box::new(Expr::Var(p)))), qualified: false },
+        args: vec![],
+        ret: elem_ptr,
+    };
+    let mut new_body: Vec<Stmt> = rest.to_vec();
+    Stmt::rewrite_exprs(&mut new_body, &mut |e| {
+        e.rewrite(&mut |x| {
+            if let Expr::Load { base, offset, ty } = x {
+                if matches!(strip_casts(base), Expr::Var(y) if *y == p) && *offset >= value {
+                    *x = Expr::Load { base: Box::new(arrow.clone()), offset: *offset - value, ty: ty.clone() };
+                }
+            }
+        })
+    });
+    // the walk left only inside the element reads (`&it` of each `it->`)
+    let (mut bare, mut arrows) = (0, 0);
+    Stmt::walk_exprs(&new_body, &mut |e| match e {
+        Expr::Var(y) if *y == p => bare += 1,
+        Expr::Call { callee: Callee::Method { this, .. }, .. } if matches!(&**this, Expr::AddrOf(z) if matches!(&**z, Expr::Var(y) if *y == p)) => arrows += 1,
+        _ => {}
+    });
+    if bare != arrows {
+        return None;
+    }
+    ir.vars[p].ty = it_ty.clone();
+    // (a tree iterator has no default constructor: declared by the loop's init)
+    ir.body[w] = Stmt::For {
+        init: vec![Stmt::Assign { dst: Expr::Var(p), src: call("begin") }],
+        cond: Expr::Binary { op: BinOp::Ne, l: Box::new(Expr::Var(p)), r: Box::new(call("end")), ty: Type::Bool },
+        step: vec![Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(p)), delta: 1, post: false })],
+        body: new_body,
+    };
+    ir.body.remove(w - 1);
+    ir.body.remove(td);
+    Some(w - 2)
+}
+
+/// `p = l.mStart; while (p != l.mEnd && p->mItem != x) p = p->mNext;` is `rstl::find`'s
+/// expansion over a list: `it = rstl::find(l.begin(), l.end(), x)`, the node pointer an
+/// iterator, `l.end()` for the end after the loop and `l.erase(it)` for `l.do_erase(p)`.
+/// Returns the index of the `find` assignment.
+fn try_list_find(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<usize> {
+    // (`for (p = l.mStart; ...; p = p->mNext) {}` the same)
+    if let Stmt::For { init, cond, step, body } = &ir.body[w] {
+        let ([i @ Stmt::Assign { .. }], [s], []) = (init.as_slice(), step.as_slice(), body.as_slice()) else { return None };
+        let mut t = ir.clone();
+        let (i, c, s) = (i.clone(), cond.clone(), s.clone());
+        t.body[w] = Stmt::While { cond: c, body: vec![s] };
+        t.body.insert(w, i);
+        let r = try_list_find(&mut t, db, w + 1)?;
+        *ir = t;
+        return Some(r);
+    }
+    let Stmt::While { cond, body } = &ir.body[w] else { return None };
+    let Expr::Binary { op: BinOp::LogAnd, l: test, r: cmp, .. } = cond else { return None };
+    let Expr::Binary { op: BinOp::Ne, l: ta, r: tb, .. } = strip_casts(test) else { return None };
+    let (p, end) = match (strip_casts(ta), strip_casts(tb)) {
+        (Expr::Var(p), e) => (*p, e.clone()),
+        _ => return None,
+    };
+    if !matches!(ir.vars[p].kind, VarKind::Local | VarKind::Stack { .. }) {
+        return None;
+    }
+    let defs: Vec<usize> = (0..w).filter(|&i| matches!(&ir.body[i], Stmt::Assign { dst: Expr::Var(x), .. } if *x == p)).collect();
+    let [d] = defs.as_slice() else { return None };
+    let d = *d;
+    let Stmt::Assign { src, .. } = &ir.body[d] else { return None };
+    let (cont, cls, (_start, endo, next, item), cst) = list_of(ir, db, src)?;
+    let (bv, boff) = lv_loc(&cont)?;
+    let is_end_load = |e: &Expr| matches!(strip_casts(e), Expr::Load { base, offset, .. } if matches!(strip_casts(base), Expr::Var(v) if *v == bv) && *offset == boff + endo);
+    let end_var = match &end {
+        Expr::Var(e) => {
+            let ds: Vec<usize> = (0..w).filter(|&i| matches!(&ir.body[i], Stmt::Assign { dst: Expr::Var(x), .. } if x == e)).collect();
+            let [de] = ds.as_slice() else { return None };
+            let Stmt::Assign { src, .. } = &ir.body[*de] else { return None };
+            if !is_end_load(src) {
+                return None;
+            }
+            Some((*e, *de))
+        }
+        e if is_end_load(e) => None,
+        _ => return None,
+    };
+    // the body: only the step
+    let [Stmt::Assign { dst: Expr::Var(x), src: step }] = body.as_slice() else { return None };
+    let at_p = |e: &Expr, k: i32| matches!(strip_casts(e), Expr::Load { base, offset, .. } if matches!(strip_casts(base), Expr::Var(y) if *y == p) && *offset == k);
+    if *x != p || !at_p(step, next) {
+        return None;
+    }
+    // the item against a value free of the walk
+    let Expr::Binary { op: BinOp::Ne, l: a, r: b, .. } = strip_casts(cmp) else { return None };
+    let val = if at_p(a, item) {
+        b
+    } else if at_p(b, item) {
+        a
+    } else {
+        return None;
+    };
+    let val = strip_casts(val).clone();
+    if val.uses_var(p) || val.has_call() || end_var.is_some_and(|(e, _)| val.uses_var(e)) {
+        return None;
+    }
+    // nothing else between uses the walk or the end
+    if (d + 1..w).any(|i| Some(i) != end_var.map(|x| x.1) && (mentions(&ir.body[i], p) || end_var.is_some_and(|(e, _)| mentions(&ir.body[i], e)))) {
+        return None;
+    }
+    let iter_cls = format!("{cls}::{}", if cst { "const_iterator" } else { "iterator" });
+    let it_ty = Type::Named(iter_cls);
+    let obj = Box::new(Expr::AddrOf(Box::new(cont.clone())));
+    let call = |name: &str, args: Vec<Expr>| Expr::Call { callee: Callee::Method { symbol: String::new(), sig: method(&cls, name, it_ty.clone(), cst), this: obj.clone(), qualified: false }, args, ret: it_ty.clone() };
+    // after the loop: copies of the walk are the walk, the end `l.end()`, comparisons without
+    // the pointer casts, `do_erase(p)` `erase(it)`; any other use and the rewrite is off
+    let mut tail: Vec<Stmt> = ir.body[w + 1..].to_vec();
+    let mut k = 0;
+    while k < tail.len() {
+        if let Stmt::Assign { dst: Expr::Var(t), src } = &tail[k] {
+            let t = *t;
+            if matches!(strip_casts(src), Expr::Var(y) if *y == p) && matches!(ir.vars[t].kind, VarKind::Local) && !ir.body[..=w].iter().any(|s| mentions(s, t)) {
+                let others = tail.iter().enumerate().any(|(i, s)| i != k && matches!(s, Stmt::Assign { dst: Expr::Var(y), .. } if *y == t || *y == p));
+                if !others {
+                    tail.remove(k);
+                    Stmt::rewrite_exprs(&mut tail, &mut |e| {
+                        e.rewrite(&mut |y| {
+                            if matches!(y, Expr::Var(v) if *v == t) {
+                                *y = Expr::Var(p);
+                            }
+                        })
+                    });
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+    let is_p = |e: &Expr| matches!(strip_casts(e), Expr::Var(y) if *y == p);
+    let end_call = call("end", vec![]);
+    let mut ok = true;
+    Stmt::rewrite_exprs(&mut tail, &mut |e| {
+        e.rewrite(&mut |y| {
+            let is_end = match &*y {
+                Expr::Var(v) => end_var.is_some_and(|(ev, _)| ev == *v),
+                Expr::Load { base, offset, ty } => matches!(strip_casts(base), Expr::Var(v) if *v == bv) && *offset == boff + endo && crate::util::class_name(ty, db).is_some(),
+                _ => false,
+            };
+            if is_end {
+                *y = end_call.clone();
+            }
+        });
+        e.rewrite(&mut |y| match y {
+            Expr::Binary { op: BinOp::Ne | BinOp::Eq, l, r, .. } if is_p(l) || is_p(r) => {
+                let (a, b) = (strip_casts(l).clone(), strip_casts(r).clone());
+                **l = a;
+                **r = b;
+            }
+            Expr::Call { callee: Callee::Method { sig, this, .. }, args, .. } if sig.qualified_name.ends_with("::do_erase") && matches!(args.as_slice(), [a] if is_p(a)) => {
+                if let Expr::AddrOf(l) = &**this {
+                    if lv_loc(l) == Some((bv, boff)) {
+                        *y = Expr::Call { callee: Callee::Method { symbol: String::new(), sig: method(&cls, "erase", it_ty.clone(), false), this: this.clone(), qualified: false }, args: vec![Expr::Var(p)], ret: it_ty.clone() };
+                    }
+                }
+            }
+            _ => {}
+        });
+    });
+    // (the walk left only as the iterator itself)
+    Stmt::walk_exprs(&tail, &mut |y| match y {
+        Expr::Cast { e, .. } if matches!(&**e, Expr::Var(v) if *v == p) => ok = false,
+        Expr::Load { base, .. } if is_p(base) => ok = false,
+        _ => {}
+    });
+    if !ok || end_var.is_some_and(|(e, _)| tail.iter().any(|s| mentions(s, e))) {
+        return None;
+    }
+    let find = FuncSig { qualified_name: "rstl::find".into(), mangled: None, ret: it_ty.clone(), params: vec![], this_class: None, is_const: false, is_static: false, is_virtual: false, variadic: false, runs_code: false };
+    let found = Expr::Call { callee: Callee::Direct { symbol: "rstl::find".into(), sig: find }, args: vec![call("begin", vec![]), end_call, val], ret: it_ty.clone() };
+    ir.vars[p].ty = it_ty;
+    ir.body.truncate(w + 1);
+    ir.body.extend(tail);
+    ir.body[w] = Stmt::Assign { dst: Expr::Var(p), src: found };
+    let mut gone = vec![d];
+    if let Some((_, de)) = end_var {
+        gone.push(de);
+    }
+    gone.sort_unstable();
+    let mut w = w;
+    for &i in gone.iter().rev() {
+        ir.body.remove(i);
+        w -= 1;
+    }
+    Some(w)
 }
 
 /// Locals set before the loop at `w` from a by-value parameter's member (`t = id.value`) and used
@@ -901,7 +1304,7 @@ fn try_index_loop(ir: &mut IrFunction, db: &TypeDb, w: usize) -> Option<()> {
     let istep = if s1.0 == i { body[k - 2].clone() } else { body[k - 1].clone() };
     let obj = Box::new(Expr::AddrOf(Box::new(cont.clone())));
     let elem = Expr::Call {
-        callee: Callee::Method { symbol: String::new(), sig: FuncSig { qualified_name: format!("{cls}::operator[]"), mangled: None, ret: Type::Ref(Box::new(t.clone())), params: vec![mwdec_core::Param { name: None, ty: Type::Int { size: 4, signed: true } }], this_class: Some(cls.clone()), is_const: ir.sig.is_const, is_static: false, is_virtual: false, variadic: false }, this: obj.clone(), qualified: false },
+        callee: Callee::Method { symbol: String::new(), sig: FuncSig { qualified_name: format!("{cls}::operator[]"), mangled: None, ret: Type::Ref(Box::new(t.clone())), params: vec![mwdec_core::Param { name: None, ty: Type::Int { size: 4, signed: true } }], this_class: Some(cls.clone()), is_const: ir.sig.is_const, is_static: false, is_virtual: false, variadic: false, runs_code: false }, this: obj.clone(), qualified: false },
         args: vec![Expr::Var(i)],
         ret: Type::Ref(Box::new(t.clone())),
     };

@@ -120,6 +120,7 @@ fn sig_of_decl(d: &DeclInfo, class: Option<&str>, qname: &str) -> FuncSig {
         is_static: d.is_static,
         is_virtual: d.is_virtual,
         variadic: d.variadic,
+        runs_code: false,
     }
 }
 

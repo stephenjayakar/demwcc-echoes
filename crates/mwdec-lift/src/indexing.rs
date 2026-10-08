@@ -274,3 +274,153 @@ pub fn undo_strength_reduction(body: &mut Vec<Stmt>, vars: &[Var]) {
         }
     });
 }
+
+/// `p = p + K` (through casts, or `&*(p + K)`): K.
+fn walk_step(src: &Expr, p: VarId) -> Option<i64> {
+    match uncast(src) {
+        Expr::Binary { op: BinOp::Add, l, r, .. } if matches!(uncast(l), Expr::Var(y) if *y == p) => r.as_int(),
+        // `&p->field` (`&*(p + k)`)
+        Expr::AddrOf(x) => match &**x {
+            Expr::Load { base, offset, .. } if matches!(uncast(base), Expr::Var(y) if *y == p) => Some(*offset as i64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `i = i + 1` / `i++`
+fn is_inc(s: &Stmt, i: VarId) -> bool {
+    match s {
+        Stmt::Assign { dst: Expr::Var(x), src } if *x == i => matches!(uncast(src), Expr::Binary { op: BinOp::Add, l, r, .. } if matches!(uncast(l), Expr::Var(y) if *y == i) && r.as_int() == Some(1)),
+        Stmt::Expr(Expr::IncDec { e, delta: 1, .. }) => matches!(**e, Expr::Var(x) if x == i),
+        _ => false,
+    }
+}
+
+fn assigns_var(b: &[Stmt], v: VarId) -> usize {
+    let mut n = 0;
+    for s in b {
+        match s {
+            Stmt::Assign { dst: Expr::Var(x), .. } if *x == v => n += 1,
+            Stmt::Expr(Expr::IncDec { e, .. }) if matches!(**e, Expr::Var(x) if x == v) => n += 1,
+            Stmt::If { then, els, .. } => n += assigns_var(then, v) + assigns_var(els, v),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => n += assigns_var(body, v),
+            Stmt::For { init, step, body, .. } => n += assigns_var(init, v) + assigns_var(step, v) + assigns_var(body, v),
+            Stmt::Switch { cases, .. } => n += cases.iter().map(|c| assigns_var(&c.body, v)).sum::<usize>(),
+            _ => {}
+        }
+    }
+    n
+}
+
+/// A pointer walking an array in lockstep with a loop counter that starts at 0 (`p = a; i = 0;
+/// do { .. *p ..; p = p + K; i = i + 1; } while (i < n);`, the compiler's strength reduction of
+/// `a[i]`): its element reads are `a[i]` again (`((T*)a)[i]`), and the pointer goes.
+pub fn pointer_walks(body: &mut Vec<Stmt>, vars: &[Var]) {
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for k in 0..b.len() {
+            // the loop: (counter, its body, the counter's step inside the body if any)
+            let (i, lb, inc_at) = match &b[k] {
+                Stmt::DoWhile { body: lb, cond } => {
+                    let Expr::Binary { op: BinOp::Lt, l, .. } = uncast(cond) else { continue };
+                    let Expr::Var(i) = uncast(l) else { continue };
+                    let Some(at) = lb.iter().position(|s| is_inc(s, *i)) else { continue };
+                    (*i, lb, Some(at))
+                }
+                Stmt::For { init, cond, step, body: lb } => {
+                    let Expr::Binary { op: BinOp::Lt, l, .. } = uncast(cond) else { continue };
+                    let Expr::Var(i) = uncast(l) else { continue };
+                    if !matches!(step.as_slice(), [s] if is_inc(s, *i)) || !matches!(init.as_slice(), [Stmt::Assign { dst: Expr::Var(x), src }] if x == i && src.as_int() == Some(0)) {
+                        continue;
+                    }
+                    (*i, lb, None)
+                }
+                _ => continue,
+            };
+            if assigns_var(lb, i) != inc_at.is_some() as usize {
+                continue;
+            }
+            if inc_at.is_some() {
+                let Some(ii) = b[..k].iter().rposition(|s| crate::idioms::stmt_mentions(s, i)) else { continue };
+                if !matches!(&b[ii], Stmt::Assign { dst: Expr::Var(x), src } if *x == i && src.as_int() == Some(0)) {
+                    continue;
+                }
+            }
+            // a local stepped once at the top level of the body, after its last read
+            let mut found = None;
+            for (at, s) in lb.iter().enumerate() {
+                let Stmt::Assign { dst: Expr::Var(p), src } = s else { continue };
+                let Some(kk) = walk_step(src, *p) else { continue };
+                let p = *p;
+                if p == i || !matches!(vars[p].kind, VarKind::Local) || kk <= 0 || assigns_var(lb, p) != 1 || lb[at + 1..].iter().any(|s| crate::idioms::stmt_mentions(s, p)) {
+                    continue;
+                }
+                // the counter steps after the pointer's reads
+                if inc_at.map_or(false, |ia| lb[ia..].iter().any(|s| crate::idioms::stmt_mentions(s, p) && !matches!(s, Stmt::Assign { dst: Expr::Var(x), .. } if *x == p))) {
+                    continue;
+                }
+                found = Some((p, at, kk));
+                break;
+            }
+            let Some((p, at, kk)) = found else { continue };
+            // set up from a base before the loop, not read after it
+            let Some(pi) = b[..k].iter().rposition(|s| crate::idioms::stmt_mentions(s, p)) else { continue };
+            let Stmt::Assign { dst: Expr::Var(x), src: base } = &b[pi] else { continue };
+            if *x != p || base.uses_var(p) || b[k + 1..].iter().any(|s| crate::idioms::stmt_mentions(s, p)) {
+                continue;
+            }
+            let mut base_vars = vec![];
+            base.walk(&mut |e| {
+                if let Expr::Var(v) = e {
+                    base_vars.push(*v);
+                }
+            });
+            if base.has_call() || base_vars.iter().any(|&v| assigns_var(&b[pi + 1..=k], v) > 0) {
+                continue;
+            }
+            // every read of p is a K-byte load through it
+            let mut reads = 0;
+            let mut loads = 0;
+            let mut elem: Option<Type> = None;
+            let mut same = true;
+            Stmt::walk_exprs(&lb[..at], &mut |e| {
+                if matches!(e, Expr::Var(y) if *y == p) {
+                    reads += 1;
+                }
+                if let Expr::Load { base: lbase, offset: 0, ty } = e {
+                    if matches!(uncast(lbase), Expr::Var(y) if *y == p) {
+                        loads += 1;
+                        if scalar_size(ty) != Some(kk as u32) {
+                            same = false;
+                        }
+                        match &elem {
+                            Some(t) if t != ty => same = false,
+                            _ => elem = Some(ty.clone()),
+                        }
+                    }
+                }
+            });
+            let Some(ety) = elem else { continue };
+            if !same || reads != loads {
+                continue;
+            }
+            let ety = if matches!(strip_cv(&ety), Type::Unknown { .. }) { t_int(kk as u8, true) } else { ety };
+            let ebase = match base {
+                Expr::AddrOf(g) if matches!(&**g, Expr::Global { ty: Type::Unknown { .. }, .. }) => base.clone(),
+                Expr::Global { ty: Type::Unknown { .. }, .. } => Expr::AddrOf(Box::new(base.clone())),
+                _ => Expr::cast(t_ptr(ety.clone()), base.clone()),
+            };
+            let (Stmt::DoWhile { body: lb, .. } | Stmt::For { body: lb, .. }) = &mut b[k] else { unreachable!() };
+            lb.remove(at);
+            Stmt::rewrite_exprs(lb, &mut |e| {
+                if let Expr::Load { base: lbase, offset: 0, .. } = &*e {
+                    if matches!(uncast(lbase), Expr::Var(y) if *y == p) {
+                        *e = Expr::Index { base: Box::new(ebase.clone()), index: Box::new(Expr::Var(i)), ty: ety.clone() };
+                    }
+                }
+            });
+            b.remove(pi);
+            return;
+        }
+    });
+}

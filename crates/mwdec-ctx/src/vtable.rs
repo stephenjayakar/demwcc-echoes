@@ -41,6 +41,7 @@ fn placeholder_sig(name: &str) -> FuncSig {
         is_static: false,
         is_virtual: true,
         variadic: false,
+        runs_code: false,
     }
 }
 
@@ -126,6 +127,7 @@ fn name_pure_slot(class: &str, slots: &mut Vec<VirtualMethod>, size: u32, db: &T
         is_static: false,
         is_virtual: true,
         variadic: d.variadic,
+        runs_code: false,
     };
     let empties: Vec<usize> = slots.iter().enumerate().filter(|(_, s)| s.symbol.is_empty()).map(|(i, _)| i).collect();
     match empties.len() {
@@ -353,6 +355,7 @@ fn declared_slots(db: &TypeDb, cls: &str, memo: &mut BTreeMap<String, Option<Vec
                 is_static: false,
                 is_virtual: true,
                 variadic: d.variadic,
+                runs_code: false,
             };
             match overrides {
                 Some(i) => {

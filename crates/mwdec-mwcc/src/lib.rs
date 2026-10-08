@@ -395,6 +395,7 @@ impl Mwcc {
         // dir was replacing or deleting it, a virus scanner held it, ...) is retried, and reported
         // as an I/O failure (never cached as a compile error) if it keeps failing.
         let mut attempt = 0;
+        let mut starts = 0;
         let res = loop {
             std::fs::write(&src, source).map_err(io("writing TU"))?;
             let res = self.compile_src(&src, &obj, &stem, cflags, prefix);
@@ -405,6 +406,12 @@ impl Mwcc {
                         break Err(MwccError::Io(format!("compiler could not open a work file: {}", messages.lines().take(3).collect::<Vec<_>>().join(" | "))));
                     }
                     std::thread::sleep(Duration::from_millis(150 * attempt as u64));
+                }
+                // the compiler process could not start or allocate (the machine is out of
+                // resources): back off and run it again
+                Err(MwccError::Crash { status: Some(s), .. }) if resource_status(*s) && starts < START_RETRIES => {
+                    starts += 1;
+                    std::thread::sleep(Duration::from_millis(500 << starts));
                 }
                 _ => break res,
             }
@@ -768,6 +775,16 @@ pub const MAX_FAST_WORKERS: usize = 6;
 pub fn fast_workers_from_env(default: usize) -> usize {
     std::env::var("MWDEC_FAST_WORKERS").ok().and_then(|v| v.trim().parse().ok()).map_or(default, |n: usize| n.clamp(1, MAX_FAST_WORKERS))
 }
+
+/// Exit statuses of a compiler that failed for lack of system resources, not because of the
+/// source: DLL initialization failed (0xC0000142, process creation under resource exhaustion),
+/// no memory (0xC0000017), commitment limit (0xC000012D), insufficient resources (0xC000009A).
+pub fn resource_status(s: i32) -> bool {
+    matches!(s as u32, 0xC000_0142 | 0xC000_0017 | 0xC000_012D | 0xC000_009A)
+}
+
+/// Re-runs of a compile that failed with a [`resource_status`] (backing off 1, 2, 4, 8 s).
+const START_RETRIES: u32 = 4;
 
 /// Attempts of a compile whose compiler could not open one of our work files.
 const IO_RETRIES: u32 = 3;

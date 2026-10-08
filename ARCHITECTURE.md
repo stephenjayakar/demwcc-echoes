@@ -231,6 +231,16 @@ per unit) and prints one line, `GATE PASS|FAIL: <n> of 1200 drafts changed; chan
 exact, new .. exact; gained g, lost l (<secs>)`; exit 0 means nothing was lost. About 10-15
 minutes.
 
+Generalization: `tools/xval.py --base <exe> --new <exe> [--list rows.jsonl]` (or `--reuse <drafts_diff
+dir>`) splits the train units into 5 folds by a hash of the unit name and prints drafts_diff gains and
+losses per fold, with a verdict: a change whose gains sit in fewer folds than random spread would give
+is likely fitted to the units its author studied.
+
+Determinism: a draft and its verdict must not depend on run order or on the unit's other functions.
+Emit in ordered containers (no hash-map iteration into output); a non-exact draft verdict is
+re-checked with a normal compile (`Scorer::eval_normal`), since a persistent compiler's state is
+shaped by the candidates compiled before.
+
 ## Caches
 
 Disk caches are content-addressed (inputs, flags, compiler and a version salt in the key) and

@@ -111,6 +111,7 @@ pub fn parse_type(s: &str) -> Type {
             is_static: false,
             is_virtual: false,
             variadic: false,
+            runs_code: false,
         }));
     }
     if s.contains("::*") {
@@ -241,6 +242,7 @@ pub fn sig_of(mangled: &str, db: Option<&TypeDb>) -> FuncSig {
             is_static: false,
             is_virtual: false,
             variadic: false,
+            runs_code: false,
         };
     };
     let mut sig = parse_demangled(&text, db);
@@ -349,6 +351,7 @@ pub fn parse_demangled(text: &str, db: Option<&TypeDb>) -> FuncSig {
         is_static: false,
         is_virtual: false,
         variadic,
+        runs_code: false,
     }
 }
 

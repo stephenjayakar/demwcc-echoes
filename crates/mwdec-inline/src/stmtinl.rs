@@ -252,6 +252,7 @@ fn forwarder(d: &DeclInfo, name: &str, class: &str, c: &mwdec_core::Class, _db: 
         is_static: false,
         is_virtual: false,
         variadic: false,
+        runs_code: false,
     };
     Some(Fwd { sig, callee: callee.to_string(), args })
 }
@@ -433,6 +434,18 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     let mut n = forward_calls(&mut ir.body, &env);
     n += negated_predicates(&mut ir.body, &env);
     let on = CONTAINER_LOCALS.with(|c| c.get());
+    // scalar helpers in folded / reoriented forms (`scalarinl`): counted, applied in the variant
+    {
+        let mut copy = ir.body.clone();
+        let k = crate::scalarinl::rewrite(&mut copy, &env, &idx);
+        if k > 0 {
+            FORWARDED.with(|c| c.set(c.get() + k));
+            if on {
+                ir.body = copy;
+                n += k;
+            }
+        }
+    }
     let sc = stream_ctors(&mut ir.body, lib, db, on);
     if sc > 0 {
         FORWARDED.with(|c| c.set(c.get() + sc));
@@ -508,6 +521,9 @@ fn stream_ctors(body: &mut Vec<Stmt>, lib: &InlineLib, db: &TypeDb, apply: bool)
 /// After the template passes: drop the forwarder marks; in the container-local variant, a
 /// forwarder on a member container goes through a local holding its address.
 pub fn finish(ir: &mut IrFunction) {
+    // (by-value results of real calls read once: also when nothing else folded, so the post
+    // passes didn't run)
+    crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
     let on = CONTAINER_LOCALS.with(|c| c.get());
     let mut new_vars: Vec<Var> = vec![];
     let base = ir.vars.len();

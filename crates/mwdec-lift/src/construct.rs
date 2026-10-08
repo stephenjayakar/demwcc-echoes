@@ -73,6 +73,7 @@ fn ctors(db: &TypeDb, cls: &str) -> Vec<(FuncSig, Vec<String>)> {
             is_static: false,
             is_virtual: false,
             variadic: false,
+            runs_code: false,
         };
         out.push((s, fields.into_iter().map(|f| f.unwrap()).collect()));
     }
@@ -149,6 +150,7 @@ fn member_ctors_d(db: &TypeDb, cls: &str, depth: u32) -> Vec<(FuncSig, Vec<i32>)
             is_static: false,
             is_virtual: false,
             variadic: false,
+            runs_code: false,
         };
         out.push((s, offs.into_iter().map(|o| o.unwrap()).collect()));
     }
@@ -468,7 +470,7 @@ fn fold_with(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, defs: &HashMap<Var
 /// Does construction `e` run out-of-line code (a member constructed by a call)? See
 /// [`build_with_member_calls`].
 pub fn runs_code(e: &Expr) -> bool {
-    matches!(e, Expr::Construct { ctor: Some(s), .. } if s.is_virtual)
+    matches!(e, Expr::Construct { ctor: Some(s), .. } if s.runs_code)
 }
 
 /// `&v.m->M(args)`: a member of stack object `v` at offset `off` constructed in place by a
@@ -573,10 +575,10 @@ fn build_with_ctor_decl(
         this_class: Some(cls.to_string()),
         is_const: false,
         is_static: false,
-        // (constructors are never virtual: the flag marks a construction that runs out-of-line
-        // code, a member constructor call, so it is ordered like a call; see `runs_code`)
-        is_virtual: true,
+        is_virtual: false,
         variadic: false,
+        // a member constructor call: the construction is ordered like a call
+        runs_code: true,
     };
     Some(Expr::Construct { class: Type::Named(cls.to_string()), ctor: Some(s), args: args.into_iter().map(|a| a.unwrap()).collect() })
 }

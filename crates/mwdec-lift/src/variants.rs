@@ -39,6 +39,12 @@ pub const STRUCTCOPY_RETURN_WHOLE: &str = "structcopy.return_whole";
 /// Values read from memory once and kept in a local read again at every use (MWCC CSEs the reads).
 /// (named to sort after the other points: the driver tries the first `MAX_VARIANT_POINTS` asked)
 pub const REREAD_TEMPS: &str = "temps.reread";
+/// Runs of one constant stored to consecutive array elements (`a[0] = 1; a[1] = 1;`, MWCC's full
+/// unroll of a small constant loop) rerolled into `for (i = 0; i < n; i++) a[i] = 1;`.
+pub const REROLL_CONST_STORES: &str = "unroll.const_stores";
+/// The same, the loop placed before the constant stores to other objects right before it (the
+/// scheduler moved those first).
+pub const REROLL_CONST_STORES_EARLY: &str = "unroll.const_stores_early";
 
 /// A value computed once and used to start several register words (`t = id << 1; ra = (t +
 /// 224) << 24; bg = (t + 225) << 24;`) is written out at each start, as the SDK does
@@ -62,6 +68,10 @@ pub const STRUCTCOPY_WORDS_BLOCK: &str = "structcopy.words_block";
 /// of its own (`v = a | b | c; v |= d;`: the compiler copies the partial word before the insert).
 pub const ORDER_SPLIT_LAST_FIELD: &str = "order.split_last_field";
 
+/// Bool locals defined once become `const bool` (a returned `&&`/`||` chain goes through one): the
+/// compiler re-extends (`clrlwi`) a const bool where it is used.
+pub const BOOL_CONST_LOCAL: &str = "bool.const_local";
+
 /// GC/1.2.5n: draft locals in volatile registers holding a global read are folded into their
 /// single use when the target's frame shows no scalar-local slots (`mwdec_lift::sdkframe`).
 pub const SDK_FOLD_SLOT_LOCALS: &str = "sdk.fold_slot_locals";
@@ -77,12 +87,38 @@ pub const NAMED_ALGORITHM_RESULT: &str = "inline.named_algorithm_result";
 /// Successive webs of one callee-saved register (`temp_r31`, `temp_r31_2`) are one variable.
 pub const MERGE_REGISTER_WEBS: &str = "regs.merge_webs";
 
+/// A `clrlslwi` (mask ending where the shift starts) is `(x & m) << s` instead of `x << s & M`.
+pub const EXPR_MASK_THEN_SHIFT: &str = "expr.mask_then_shift";
+
+/// A condition-selected constant passed to a call becomes `c ? (T)K2 : (T)K1` of the parameter's type.
+pub const SELECT_TYPED_ARG: &str = "expr.select_typed_arg";
+
+/// Computed call arguments become named locals assigned in argument order before the call.
+pub const ARGS_NAMED_LOCALS: &str = "expr.args_named_locals";
+
+/// The leading run of parameter loads ordered by parameter, then offset (source order).
+pub const ORDER_PARAM_LOADS: &str = "order.param_loads";
+
+/// A global object copied word by word behind a pointer becomes one struct assignment.
+pub const GLOBAL_STRUCT_COPY: &str = "structcopy.global_whole";
+
+/// A pointer step after a read the next statement uses (`t = *p; p += 1; f(t);`) is a statement
+/// of its own after it (`f(*p); ++p;`) instead of a post-increment inside it (`f(*p++)`).
+pub const INCDEC_STEP_AFTER: &str = "incdec.step_after";
+
+/// Byte/halfword fields packed into a word as narrowing conversions (`(uchar)x << 16`), not masks.
+pub const EXPR_BYTE_FIELDS: &str = "expr.byte_fields";
+/// Externs the function only reads (scalars) are declared `const`.
+pub const CONST_READ_ONLY_EXTERNS: &str = "types.const_read_only_externs";
+
 /// Registered decision points: (name, what the alternative does).
 pub const POINTS: &[(&str, &str)] = &[
     (EXPLICIT_DEFAULT_ARGS, "trailing arguments equal to their declared defaults are passed explicitly"),
     (STRUCTCOPY_SETTERS, "a run of member setters from one object's getters becomes a whole-object copy"),
     (STRUCTCOPY_NO_TEMP, "a temporary built from every member of one object stays a construction"),
     (STRUCTCOPY_NO_RETURN, "a returned object stays built in the struct-return storage"),
+    (REROLL_CONST_STORES, "runs of one constant stored to consecutive array elements become a for loop"),
+    (REROLL_CONST_STORES_EARLY, "the same, the loop moved before the constant stores right before it"),
     (REREAD_TEMPS, "single-assignment locals of pure memory reads are re-read where they are used"),
     (STRUCTCOPY_WORDS_LL, "a run of word copies between two objects becomes 64-bit copies (one per word pair)"),
     (STRUCTCOPY_WORDS_BLOCK, "a run of word copies between two objects becomes one block copy (helper struct)"),
@@ -91,9 +127,18 @@ pub const POINTS: &[(&str, &str)] = &[
     (SDK_FOLD_SLOT_LOCALS, "volatile-register locals holding a global read fold into their use (no frame slots)"),
     (INDEX_NAMED_SCALED, "a scaled array index comes from a named local assigned before its statement"),
     (MERGE_REGISTER_WEBS, "successive webs of one callee-saved register are one variable"),
+    (EXPR_MASK_THEN_SHIFT, "a clrlslwi becomes (x & m) << s (mask first) instead of x << s & M"),
+    (SELECT_TYPED_ARG, "a condition-selected constant passed to a call is a select of typed constants in the call"),
+    (ARGS_NAMED_LOCALS, "computed call arguments become named locals assigned in argument order"),
+    (ORDER_PARAM_LOADS, "the leading parameter loads are ordered by parameter, then offset"),
+    (GLOBAL_STRUCT_COPY, "a global object copied word by word behind a pointer becomes one struct assignment"),
+    (INCDEC_STEP_AFTER, "a step after a read the next statement uses is a statement after it, not a post-increment"),
+    (EXPR_BYTE_FIELDS, "byte/halfword fields packed into a word are narrowing conversions, not masks"),
+    (CONST_READ_ONLY_EXTERNS, "scalar externs the function only reads are declared const"),
     (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),
     (ORDER_SPLIT_LAST_FIELD, "a packed word built from field inserts gets its last field in a statement of its own"),
+    (BOOL_CONST_LOCAL, "bool locals defined once are const (re-extended at their uses)"),
     (SRET_CLASS_BY_LAYOUT, "an unnamed struct return takes the one context class whose layout and constructor fit its stores"),
 ];
 

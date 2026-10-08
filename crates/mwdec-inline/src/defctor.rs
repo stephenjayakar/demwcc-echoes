@@ -15,7 +15,7 @@
 
 use crate::util::strip as strip_cv;
 use mwdec_core::{ObjectFile, Type, TypeDb};
-use mwdec_lift::{BinOp, Expr, InitTarget, IrFunction, Stmt, VarId, VarKind};
+use mwdec_lift::{BinOp, Callee, Expr, InitTarget, IrFunction, Stmt, VarId, VarKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -82,6 +82,11 @@ struct Canon<'a> {
     params: HashSet<VarId>,
     /// locals set once from a call's result: the callee
     calls: HashMap<VarId, String>,
+    /// values of locals while walking a straight-line run (reassigned locals, see `run_stores`)
+    cur: std::cell::RefCell<HashMap<VarId, CE>>,
+    /// when set, the object's fields stored so far in a run (`run_stores`): reads of them are
+    /// the stored values
+    mem: std::cell::RefCell<Option<Vec<(i32, u32, CE)>>>,
     defs: &'a HashMap<VarId, Expr>,
     db: &'a TypeDb,
 }
@@ -93,6 +98,7 @@ impl Canon<'_> {
         }
         match e {
             Expr::Var(v) if Some(*v) == self.this => Some(CE::This(0)),
+            Expr::Var(v) if self.cur.borrow().contains_key(v) => self.cur.borrow().get(v).cloned(),
             Expr::Var(v) => match self.defs.get(v) {
                 Some(d) => self.val(d, depth + 1),
                 None if self.unset.contains(v) => Some(CE::Unset),
@@ -101,11 +107,27 @@ impl Canon<'_> {
             },
             Expr::Int { value, .. } => Some(CE::Int(*value)),
             Expr::Float { bits, .. } => Some(CE::Float(*bits)),
+            // compiler intrinsics (`__rlwimi` of a bitfield store) by value
+            Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } if is_intrinsic(symbol) => {
+                let mut acc = CE::Sym(symbol.clone(), 0);
+                for a in args {
+                    acc = CE::Bin("arg".into(), Box::new(acc), Box::new(self.val(a, depth + 1)?));
+                }
+                Some(acc)
+            }
             // (only the copy-construction steps let calls through stores, see `op`)
             Expr::Call { callee, .. } => call_name(callee).map(CE::Ret),
             Expr::Cast { e, .. } => self.val(e, depth + 1),
             Expr::AddrOf(x) => self.addr(x, depth + 1),
-            Expr::Global { ty, .. } | Expr::Load { ty, .. } | Expr::Member { ty, .. } => Some(CE::Load(Box::new(self.addr(e, depth + 1)?), size_of(ty, self.db)?)),
+            Expr::Global { ty, .. } | Expr::Load { ty, .. } | Expr::Member { ty, .. } => {
+                let (a, size) = (self.addr(e, depth + 1)?, size_of(ty, self.db)?);
+                if let (CE::This(k), Some(mem)) = (&a, &*self.mem.borrow()) {
+                    if let Some(m) = mem.iter().rev().find(|m| m.0 == *k && m.1 == size) {
+                        return Some(m.2.clone());
+                    }
+                }
+                Some(CE::Load(Box::new(a), size))
+            }
             Expr::Binary { op, l, r, .. } => {
                 let (l, r) = (self.val(l, depth + 1)?, self.val(r, depth + 1)?);
                 match (op, &l, &r) {
@@ -123,6 +145,7 @@ impl Canon<'_> {
             Expr::Load { base, offset, .. } => Some(add_off(self.val(base, depth + 1)?, *offset as i64)),
             Expr::Member { base, offset, .. } => Some(add_off(self.addr(base, depth + 1)?, *offset as i64)),
             Expr::Global { symbol, .. } => Some(CE::Sym(symbol.clone(), 0)),
+            Expr::Var(v) if Some(*v) == self.this => Some(CE::This(0)),
             Expr::Var(v) if self.params.contains(v) => Some(CE::Param(*v, 0)),
             _ => None,
         }
@@ -131,7 +154,7 @@ impl Canon<'_> {
     /// A store statement; None for anything else.
     fn store(&self, s: &Stmt) -> Option<CStore> {
         match s {
-            Stmt::Assign { dst, src } if !matches!(dst, Expr::Var(_)) && !src.has_call() => {
+            Stmt::Assign { dst, src } if !matches!(dst, Expr::Var(_)) && !real_call(src) => {
                 let ty = match dst {
                     Expr::Load { ty, .. } | Expr::Member { ty, .. } | Expr::Global { ty, .. } => ty,
                     _ => return None,
@@ -151,6 +174,54 @@ impl Canon<'_> {
             _ => None,
         }
     }
+}
+
+/// `__rlwimi`, `__cntlzw`...: compiler intrinsics (no effects, no linkage).
+fn is_intrinsic(sym: &str) -> bool {
+    sym.starts_with("__") && mwdec_lift::sig::demangle(sym).is_none()
+}
+
+/// A call other than an intrinsic.
+fn real_call(e: &Expr) -> bool {
+    let mut hit = false;
+    e.walk(&mut |x| match x {
+        Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if is_intrinsic(symbol) => {}
+        Expr::Call { .. } | Expr::New { .. } => hit = true,
+        _ => {}
+    });
+    hit
+}
+
+/// Stores of a straight-line run, locals followed through reassignments (`t = x; t = f(t);
+/// *p = t`); the indices of the statements used. None when a statement is neither a store nor
+/// a call-free local assignment.
+fn run_stores(c: &Canon, stmts: &[(usize, &Stmt)], vars: &[mwdec_lift::Var]) -> Option<(Vec<CStore>, Vec<usize>)> {
+    let mut out = vec![];
+    let mut used = vec![];
+    for (i, s) in stmts {
+        match s {
+            Stmt::Assign { dst: Expr::Var(v), src } if vars[*v].kind == VarKind::Local && !real_call(src) => {
+                let val = c.val(src, 0)?;
+                c.cur.borrow_mut().insert(*v, val);
+                used.push(*i);
+            }
+            s => {
+                let st = c.store(s)?;
+                if let (CE::This(k), Some(mem)) = (&st.addr, &mut *c.mem.borrow_mut()) {
+                    let (lo, hi) = (*k, *k + st.size as i32);
+                    mem.retain(|m| m.0 + m.1 as i32 <= lo || m.0 >= hi);
+                    mem.push((*k, st.size, st.val.clone()));
+                }
+                out.push(st);
+                used.push(*i);
+            }
+        }
+    }
+    c.cur.borrow_mut().clear();
+    if let Some(m) = &mut *c.mem.borrow_mut() {
+        m.clear();
+    }
+    Some((out, used))
 }
 
 /// Single-definition call-free locals of a statement list (temporaries) and their values.
@@ -255,15 +326,9 @@ fn from_probe(ir: &IrFunction, db: &TypeDb) -> Option<Vec<CStore>> {
         return None;
     }
     let defs = temp_defs(&ir.body, &ir.vars);
-    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
-    let mut out = vec![];
-    for s in &ir.body {
-        match s {
-            Stmt::Assign { dst: Expr::Var(v), .. } if defs.contains_key(v) => {}
-            Stmt::Return(None) => {}
-            s => out.push(c.store(s)?),
-        }
-    }
+    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
+    let run: Vec<(usize, &Stmt)> = ir.body.iter().enumerate().filter(|(_, s)| !matches!(s, Stmt::Return(None))).collect();
+    let (out, _) = run_stores(&c, &run, &ir.vars)?;
     (!out.is_empty()).then_some(out)
 }
 
@@ -355,7 +420,7 @@ impl DefCache {
 
 const PROBE: &str = "__mwdec_dc";
 /// Version of the canonical form (part of the cache key).
-const VERSION: &str = "defctor v12";
+const VERSION: &str = "defctor v13";
 
 fn probe_text(spelled: &str, k: usize) -> String {
     format!("struct {PROBE}{k} {{ {spelled} m; {PROBE}{k}(); }};\n{PROBE}{k}::{PROBE}{k}() {{}}\n")
@@ -447,7 +512,7 @@ pub fn strip(ir: &mut IrFunction, db: &TypeDb, dc: &DefCtors) -> (usize, Pending
     }
     // the leading run of stores (temporaries in between)
     let defs = temp_defs(&ir.body, &ir.vars);
-    let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+    let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
     let mut lead: Vec<(usize, CStore)> = vec![];
     for (i, s) in ir.body.iter().enumerate() {
         match s {
@@ -527,7 +592,7 @@ fn explicit_inits(ir: &mut IrFunction, db: &TypeDb, this: VarId, unmatched: &[(i
         }
         let Some(size) = mwdec_lift::types::size_of(Some(db), fty) else { continue };
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         // the first top-level statement writing into the member
         let mut found = None;
         for (i, s) in ir.body.iter().enumerate() {
@@ -635,7 +700,7 @@ fn memberwise_copies(ir: &mut IrFunction, db: &TypeDb, this: VarId, unmatched: &
             continue;
         }
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         let mut src: Option<usize> = None;
         let mut hits: Vec<(usize, i32, i32)> = vec![];
         let mut ok = true;
@@ -891,7 +956,7 @@ fn copy_inits(ir: &mut IrFunction, db: &TypeDb, this: VarId, members: &[(i32, St
         }
         let Some(size) = mwdec_lift::types::size_of(Some(db), fty) else { continue };
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         let same = |t: &Type| crate::util::class_name(t, db).is_some_and(|c| mwdec_lift::sig::norm_name(&c) == mwdec_lift::sig::norm_name(cls));
         // `this->m = src` with src an object of the class
         let Some(b) = ir.body.iter().position(|s| {
@@ -971,7 +1036,7 @@ fn call_copy_inits(ir: &mut IrFunction, db: &TypeDb, this: VarId, members: &[(i3
         }
         let Some(size) = mwdec_lift::types::size_of(Some(db), fty) else { continue };
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         let same = |t: &Type| crate::util::class_name(t, db).is_some_and(|x| mwdec_lift::sig::norm_name(&x) == mwdec_lift::sig::norm_name(cls));
         let mut found = None;
         for (k, s) in ir.body.iter().enumerate() {
@@ -1028,7 +1093,7 @@ pub fn finish(ir: &mut IrFunction, db: &TypeDb, pending: &Pending) -> usize {
     // the lifter built the initializer list): entries now, with the members set before them
     loop {
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         let found = ir.body.iter().enumerate().find_map(|(k, s)| match s {
             Stmt::Expr(Expr::Call { callee: mwdec_lift::Callee::Method { sig, this: obj, .. }, args, .. }) if mwdec_lift::sig::is_ctor(sig) => {
                 let Some(CE::This(off)) = cn.val(obj, 0) else { return None };
@@ -1098,7 +1163,7 @@ pub fn finish(ir: &mut IrFunction, db: &TypeDb, pending: &Pending) -> usize {
         .collect();
     for (off, size, root) in copies {
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         let mut gone = copy_residue(ir, &cn, &defs, 0, off, size);
         if let (Some(r), true) = (root, gone.is_empty()) {
             // `*(bool*)&src = false` (an owning pointer's transfer) right at the start
@@ -1273,7 +1338,7 @@ impl Canon<'_> {
 
 fn ops_from_probe(ir: &IrFunction, db: &TypeDb) -> Option<Vec<COp>> {
     let defs = temp_defs(&ir.body, &ir.vars);
-    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+    let c = Canon { this: ir.this_var, unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
     let mut out = vec![];
     // constructor calls the lifter put in the initializer list (bases of the member)
     let own = ir.sig.this_class.clone().unwrap_or_default();
@@ -1423,7 +1488,7 @@ fn residue_of_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors, c: &mwdec_
         }
         let off = f.offset as i32;
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         let body_ops: Vec<Option<COp>> = ir.body.iter().map(|s| cn.op(s)).collect();
         let mut pick = vec![];
         let mut at = 0;
@@ -1473,7 +1538,7 @@ pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usiz
         let Some(cls) = crate::util::class_name(&ft, db) else { continue };
         let off = f.offset as i32;
         let defs = temp_defs(&ir.body, &ir.vars);
-        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), defs: &defs, db };
+        let cn = Canon { this: Some(this), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
         let body_ops: Vec<Option<COp>> = ir.body.iter().map(|s| cn.op(s)).collect();
         let mut params: Vec<VarId> = param_vars(ir).into_iter().collect();
         params.sort_unstable();
@@ -1527,5 +1592,220 @@ pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usiz
         drop_unused_temps(&mut ir.body, &vars);
     }
     moved
+}
+
+// ---------------------------------------------------------------- default-constructed arguments
+
+/// Classes passed by `const T&` to the functions `obj` calls (candidates for `T()` arguments).
+pub fn wanted_arg_classes(obj: &ObjectFile, db: &TypeDb) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for f in &obj.functions {
+        for r in &f.relocs {
+            if !matches!(r.kind, mwdec_core::RelocKind::Rel24) {
+                continue;
+            }
+            let sig = mwdec_lift::sig::sig_of(&r.target, Some(db));
+            for p in &sig.params {
+                let Type::Ref(x) = strip_cv(&p.ty) else { continue };
+                let Type::Const(inner) = &**x else { continue };
+                let Some(c) = crate::util::class_name(inner, db) else { continue };
+                if !out.contains(&c) && out.len() < 48 && mwdec_lift::sig::find_class(db, &c).is_some_and(|k| !k.is_declaration && k.vptr_offset.is_none()) {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Stores with reads of the object's own fields replaced by the value stored there before
+/// (`b = f(b); b = g(b)` whether or not the code reads the field back in between).
+fn forward_stores(stores: &[CStore]) -> Vec<CStore> {
+    fn sub(e: &CE, mem: &[(i32, u32, CE)]) -> CE {
+        match e {
+            CE::Load(a, size) => match &**a {
+                CE::This(k) => match mem.iter().rev().find(|m| m.0 == *k && m.1 == *size) {
+                    Some(m) => m.2.clone(),
+                    None => e.clone(),
+                },
+                _ => CE::Load(Box::new(sub(a, mem)), *size),
+            },
+            CE::Bin(op, a, b) => CE::Bin(op.clone(), Box::new(sub(a, mem)), Box::new(sub(b, mem))),
+            _ => e.clone(),
+        }
+    }
+    let mut mem: Vec<(i32, u32, CE)> = vec![];
+    let mut out = vec![];
+    for st in stores {
+        let val = sub(&st.val, &mem);
+        if let CE::This(k) = st.addr {
+            let (lo, hi) = (k, k + st.size as i32);
+            mem.retain(|m| m.0 + m.1 as i32 <= lo || m.0 >= hi);
+            mem.push((k, st.size, val.clone()));
+        }
+        out.push(CStore { addr: st.addr.clone(), size: st.size, val });
+    }
+    out
+}
+
+/// `t.~T()` (or a member's destructor), possibly behind tests reading only `t` (`if (t.valid
+/// && &t) ...`, an inline destructor's expansion): a statement that only destroys stack object `v`.
+fn destroys_only(s: &Stmt, v: VarId) -> bool {
+    let dtor = |s: &Stmt| match s {
+        Stmt::Expr(Expr::Call { callee: Callee::Method { sig, this, .. }, args, .. }) => {
+            mwdec_lift::sig::is_dtor(sig) && args.iter().all(|a| a.as_int().is_some()) && only_var(this, v)
+        }
+        _ => false,
+    };
+    match s {
+        Stmt::If { cond, then, els } => els.is_empty() && !then.is_empty() && then.iter().all(|t| destroys_only(t, v)) && only_var(cond, v) && !cond.has_call(),
+        s => dtor(s),
+    }
+}
+
+/// Every variable `e` reads is `v` (and it reads it).
+fn only_var(e: &Expr, v: VarId) -> bool {
+    let (mut hit, mut other) = (false, false);
+    e.walk(&mut |x| {
+        if let Expr::Var(w) = x {
+            if *w == v {
+                hit = true;
+            } else {
+                other = true;
+            }
+        }
+    });
+    hit && !other
+}
+
+/// The same stores, as a multiset.
+fn same_stores(a: &[CStore], b: &[CStore]) -> bool {
+    let mut left: Vec<&CStore> = a.iter().collect();
+    a.len() == b.len()
+        && b.iter().all(|st| match left.iter().position(|w| *w == st) {
+            Some(k) => {
+                left.remove(k);
+                true
+            }
+            None => false,
+        })
+}
+
+/// Arguments of a direct call that pass a stack object by `const T&`: (argument index, var, T).
+fn stack_object_args(vars: &[mwdec_lift::Var], db: &TypeDb, call: &Expr) -> Vec<(usize, VarId, String)> {
+    let (sig, skip, args) = match call {
+        Expr::Call { callee: Callee::Direct { sig, .. }, args, .. } => (sig, usize::from(sig.this_class.is_some() && !sig.is_static), args),
+        Expr::Call { callee: Callee::Method { sig, .. }, args, .. } => (sig, 0, args),
+        _ => return vec![],
+    };
+    let mut out = vec![];
+    for (k, p) in sig.params.iter().enumerate() {
+        let Some(a) = args.get(k + skip) else { break };
+        let Type::Ref(x) = strip_cv(&p.ty) else { continue };
+        let Type::Const(inner) = &**x else { continue };
+        let Some(cls) = crate::util::class_name(inner, db) else { continue };
+        let mut b = a;
+        loop {
+            match b {
+                Expr::Cast { e, .. } => b = e,
+                _ => break,
+            }
+        }
+        if let Expr::AddrOf(v) = b {
+            if let Expr::Var(v) = &**v {
+                if matches!(vars[*v].kind, VarKind::Stack { .. }) {
+                    out.push((k + skip, *v, cls));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A stack buffer filled exactly as `T`'s default constructor does and then passed by `const T&`:
+/// the temporary `T()`.
+pub fn default_temps(ir: &mut IrFunction, db: &TypeDb, dc: &DefCtors) -> usize {
+    let mut n = 0;
+    let mut j = 0;
+    while j < ir.body.len() {
+        let mut args: Vec<(VarId, String)> = vec![];
+        Stmt::walk_exprs(std::slice::from_ref(&ir.body[j]), &mut |e| {
+            for (_, v, c) in stack_object_args(&ir.vars, db, e) {
+                args.push((v, c));
+            }
+        });
+        let dbg = std::env::var("MWDI_DEFCTOR_DEBUG").is_ok();
+        for (sv, cls) in args {
+            if dbg {
+                eprintln!("default temp {cls}: probe {:?}", dc.get(&cls));
+            }
+            let Some(want) = dc.get(&cls) else { continue };
+            // the statements before j that fill the buffer, with the locals they use
+            let first = (0..j).find(|&i| mentions(&ir.body[i], sv));
+            let Some(first) = first else { continue };
+            let mut pick: Vec<usize> = vec![];
+            let mut ok = true;
+            for i in first..j {
+                let st = &ir.body[i];
+                let local_def = matches!(st, Stmt::Assign { dst: Expr::Var(v), src } if ir.vars[*v].kind == VarKind::Local && !real_call(src) && !ir.body[j..].iter().any(|t| mentions(t, *v)));
+                if mentions(st, sv) || local_def {
+                    pick.push(i);
+                } else if matches!(st, Stmt::Assign { .. }) || matches!(st, Stmt::Expr(_)) {
+                    // (unrelated statements may sit between)
+                    continue;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || pick.is_empty() {
+                continue;
+            }
+            let defs = temp_defs(&ir.body, &ir.vars);
+            let c = Canon { this: Some(sv), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
+            let run: Vec<(usize, &Stmt)> = pick.iter().map(|&i| (i, &ir.body[i])).collect();
+            let Some((plain, _)) = run_stores(&c, &run, &ir.vars) else { continue };
+            // (and with field reads forwarded from the stores before them: the probe may read a
+            // bitfield's byte back where this code keeps it in a register)
+            *c.mem.borrow_mut() = Some(vec![]);
+            let Some((fwd, _)) = run_stores(&c, &run, &ir.vars) else { continue };
+            let same = same_stores(want, &plain) || same_stores(&forward_stores(want), &fwd);
+            if dbg {
+                eprintln!("default temp {cls}: same {same}; want {want:?}; got {fwd:?}");
+            }
+            if !same {
+                continue;
+            }
+            // the buffer is used by nothing else after but its (inline) destruction right after
+            // the call: the temporary's, at the end of the full expression
+            let dtor_after = ir.body.get(j + 1).is_some_and(|t| destroys_only(t, sv));
+            let rest = j + 1 + usize::from(dtor_after);
+            if ir.body[rest..].iter().any(|t| mentions(t, sv)) {
+                continue;
+            }
+            if dtor_after {
+                ir.body.remove(j + 1);
+            }
+            let ctor = Expr::Construct { class: Type::Named(cls.clone()), ctor: None, args: vec![] };
+            let vars = ir.vars.clone();
+            Stmt::rewrite_exprs(std::slice::from_mut(&mut ir.body[j]), &mut |e| {
+                let hits = stack_object_args(&vars, db, e);
+                if let Expr::Call { args: a, .. } = e {
+                    for (k, v, _) in hits {
+                        if v == sv {
+                            a[k] = ctor.clone();
+                        }
+                    }
+                }
+            });
+            for &i in pick.iter().rev() {
+                ir.body.remove(i);
+                j -= 1;
+            }
+            n += 1;
+        }
+        j += 1;
+    }
+    n
 }
 

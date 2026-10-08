@@ -77,6 +77,27 @@ impl Fitness {
     pub fn better_than(&self, o: &Fitness) -> bool {
         self.cmp_better(o) == Ordering::Less
     }
+
+    /// Order for choosing among drafts (structure first): exact; then the target's size and
+    /// branch skeleton; then score; then penalty. A draft with the target's shape and only
+    /// register or order differences is closer to a match than one of another size, even when
+    /// the size mismatch costs fewer penalty points (the search and register repair can fix the
+    /// former, rarely the latter).
+    pub fn draft_cmp(&self, o: &Fitness) -> Ordering {
+        let shape = |f: &Fitness| (f.size_delta == 0, f.profile.branch == 0);
+        o.exact
+            .cmp(&self.exact)
+            .then(shape(o).cmp(&shape(self)))
+            .then(o.score.partial_cmp(&self.score).unwrap_or(Ordering::Equal))
+            .then(self.penalty.cmp(&o.penalty))
+    }
+    pub fn draft_better_than(&self, o: &Fitness) -> bool {
+        // (ablation: the search order instead)
+        if std::env::var_os("MWDEC_PENALTY_CHOOSER").is_some() {
+            return self.better_than(o);
+        }
+        self.draft_cmp(o) == Ordering::Less
+    }
 }
 
 /// Opcode identity: primary opcode plus extended opcode where it exists, plus Rc.
@@ -525,6 +546,20 @@ pub fn first_error(msg: &str) -> String {
     lines.iter().rev().find(|l| !l.trim().is_empty()).map(|s| s.trim().to_string()).unwrap_or_default()
 }
 
+/// `compiler crash (status 0x...): <first message line>` (the exit status tells resource failures,
+/// e.g. 0xC0000142 / 0xC0000017 on a saturated machine, from a real access violation 0xC0000005).
+fn crash_text(e: &MwccError) -> String {
+    let status = match e {
+        MwccError::Crash { status, .. } | MwccError::Compile { status, .. } => *status,
+        _ => None,
+    };
+    let st = status.map_or("killed".to_string(), |s| format!("0x{:08X}", s as u32));
+    format!("compiler crash (status {st}): {}", first_error(e.messages()))
+}
+
+/// Normal recompiles of a candidate whose compile crashed, before the crash is recorded.
+pub const CRASH_RETRIES: usize = 2;
+
 impl Scorer<'_> {
     /// Compile + compare. Second value: whether the compiler actually ran (not a cache hit).
     pub fn eval(&self, src: &str) -> (Eval, bool) {
@@ -541,9 +576,23 @@ impl Scorer<'_> {
                 r = self.mwcc.compile_in(plain, src);
             }
         }
+        // A crash on a saturated machine (out of memory or commit in the compiler, a killed
+        // process) is not a property of the source: compile again normally, twice at most,
+        // before recording it (crashes are never cached).
+        for k in 1..=CRASH_RETRIES {
+            if !r.as_ref().err().is_some_and(is_crash) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300 * k as u64));
+            let ctx = match self.plain {
+                Some(p) if self.pch_broken.load(Relaxed) => p,
+                _ => self.ctx,
+            };
+            r = self.mwcc.compile_in_normal(ctx, src);
+        }
         let c = match r {
             Ok(c) => c,
-            Err(e) if is_crash(&e) => return (Eval::CompileError(format!("compiler crash: {}", first_error(e.messages()))), true),
+            Err(e) if is_crash(&e) => return (Eval::CompileError(crash_text(&e)), true),
             Err(e @ MwccError::Compile { .. }) => return (Eval::CompileError(first_error(e.messages())), true),
             Err(e) => return (Eval::Io(e.to_string()), true),
         };
@@ -606,6 +655,56 @@ impl Scorer<'_> {
     }
 
     /// Fitness of the target function in a compiled object (`None`: unreadable or missing).
+    /// [`Scorer::eval`] with a normal compiler run (no persistent compiler). The normal object
+    /// also replaces a fast-path result of the same candidate in the driver's memory cache, so
+    /// later evaluations agree with it. For verdicts that must not depend on the state of a
+    /// persistent compiler (which earlier, unrelated candidates of the unit shaped).
+    pub fn eval_normal(&self, src: &str) -> (Eval, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ctx = match self.plain {
+            Some(p) if self.pch_broken.load(Relaxed) => p,
+            _ => self.ctx,
+        };
+        let mut r = self.mwcc.compile_in_normal(ctx, src);
+        if let (Err(e), Some(plain)) = (&r, self.plain) {
+            if is_crash(e) {
+                r = self.mwcc.compile_in_normal(plain, src);
+            }
+        }
+        match r {
+            Ok(c) => match self.fitness_of(&c.obj) {
+                // an exact match goes through `eval` for its remaining confirmations
+                Some(f) if f.exact => self.eval(src),
+                Some(f) => (Eval::Ok(f), !c.cache_hit),
+                None => (Eval::Missing(vec![]), !c.cache_hit),
+            },
+            Err(e) if is_crash(&e) => (Eval::CompileError(crash_text(&e)), true),
+            Err(e @ MwccError::Compile { .. }) => (Eval::CompileError(first_error(e.messages())), true),
+            Err(e) => (Eval::Io(e.to_string()), true),
+        }
+    }
+
+    /// Data the candidate's object defines that the target unit's object lacks: named, non-weak
+    /// data symbols (not compiler/splitter-generated names) absent from the target object. The function's
+    /// verdict compares its code only; such data (a string-pool seed array, a synthesized
+    /// global) would add a definition to the unit if the source were integrated as is.
+    pub fn extra_data(&self, src: &str) -> Vec<String> {
+        let Ok(c) = self.mwcc.compile_in(self.ctx, src).or_else(|_| self.plain.map_or(Err(()), |p| self.mwcc.compile_in(p, src).map_err(|_| ()))) else { return vec![] };
+        let Ok(o) = mwdec_obj::load_object_bytes("candidate.o", &c.obj) else { return vec![] };
+        let target = self.target.obj;
+        let mut out: Vec<String> = o
+            .data
+            .values()
+            // (weak definitions, e.g. vtables of classes with inline virtuals, merge at link time)
+            .filter(|d| d.binding != mwdec_core::SymBinding::Weak && !mwdec_mwcc::compare::is_generated_name(&d.name))
+            .filter(|d| !target.data.contains_key(&d.name) && !target.symbols.iter().any(|s| s.name == d.name))
+            .map(|d| d.name.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn fitness_of(&self, obj: &[u8]) -> Option<Fitness> {
         let o = mwdec_obj::load_object_bytes("candidate.o", obj).ok()?;
         let of = mwdec_obj::find_function(&o, &self.symbol)?;

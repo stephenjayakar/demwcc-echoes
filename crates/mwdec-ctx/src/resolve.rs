@@ -213,6 +213,7 @@ impl<'a> Resolver<'a> {
                     is_static: false,
                     is_virtual: false,
                     variadic,
+                    runs_code: false,
                 };
                 return Some((Type::FuncPtr(Box::new(sig)), name));
             }
@@ -548,6 +549,7 @@ pub fn fill_methods(db: &mut TypeDb) {
                     is_static: d.is_static,
                     is_virtual: d.is_virtual,
                     variadic: d.variadic,
+                    runs_code: false,
                 });
             }
         }

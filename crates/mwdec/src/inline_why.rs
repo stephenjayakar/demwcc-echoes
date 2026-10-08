@@ -199,6 +199,13 @@ fn template_prints(t: &Template) -> Vec<TemplatePrint> {
 /// One near match.
 #[derive(Clone, Debug)]
 pub struct Candidate {
+    /// At least one matched access reads or writes a private/protected member of a class the
+    /// function isn't a member of: code its source can't have written, so an inline's.
+    pub foreign_private: bool,
+    /// The template's fingerprint: loads, stores and calls through the matched object.
+    pub loads: usize,
+    pub stores: usize,
+    pub calls: usize,
     pub template: String,
     pub root: String,
     pub offset: i32,
@@ -209,8 +216,16 @@ pub struct Candidate {
 }
 
 impl Candidate {
+    /// Specific enough to be a real unfolded expansion (TRAIN calibration against hand-written
+    /// source: partial matches and small read-only fingerprints are mostly coincidences of
+    /// ordinary member reads): every access present, and either a member the function can't
+    /// touch itself, or a fingerprint with a store or call and at least four elements.
+    pub fn credible(&self) -> bool {
+        self.matched == self.total && (self.foreign_private || ((self.stores + self.calls) > 0 && self.loads + self.stores + self.calls >= 4))
+    }
+
     fn json(&self) -> serde_json::Value {
-        serde_json::json!({"template": self.template, "root": self.root, "offset": self.offset, "matched": self.matched, "total": self.total, "reason": self.reason, "detail": self.detail})
+        serde_json::json!({"credible": self.credible(), "foreign_private": self.foreign_private, "loads": self.loads, "stores": self.stores, "calls": self.calls, "template": self.template, "root": self.root, "offset": self.offset, "matched": self.matched, "total": self.total, "reason": self.reason, "detail": self.detail})
     }
 }
 
@@ -223,12 +238,37 @@ fn root_class(root: &Expr, vars: &[mwdec_lift::Var], db: &TypeDb) -> Option<Stri
 
 /// Near matches of the library's templates in `ir` (after folding), best first.
 pub fn diagnose(ir: &mwdec_lift::IrFunction, lib: &mwdec_inline::InlineLib, db: &TypeDb, max: usize) -> Vec<Candidate> {
+    diagnose_only(ir, lib, db, max, None)
+}
+
+/// Last name component of a template (`rstl::vector<T>::push_back` -> `push_back`).
+fn method_name(t: &str) -> &str {
+    let mut depth = 0;
+    let mut last = 0;
+    let b = t.as_bytes();
+    for i in 0..b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && i + 1 < b.len() && b[i + 1] == b':' => last = i + 2,
+            _ => {}
+        }
+    }
+    &t[last..]
+}
+
+/// [`diagnose`] restricted to templates whose method name is in `only` (then every template of
+/// those names is reported, however little of it matches: `absent` when nothing does).
+pub fn diagnose_only(ir: &mwdec_lift::IrFunction, lib: &mwdec_inline::InlineLib, db: &TypeDb, max: usize, only: Option<&[String]>) -> Vec<Candidate> {
     let mut fp = Fingerprint::default();
     let mut seq = 0;
     collect_stmts(&ir.body, &mut seq, &mut fp);
     let mut cands: Vec<(f64, usize, Candidate)> = vec![];
     let dbg = std::env::var("MWDEC_IW_TEMPLATE").ok();
     for t in &lib.templates {
+        if only.is_some_and(|o| !o.iter().any(|n| n == method_name(&t.name))) {
+            continue;
+        }
         if dbg.as_deref().is_some_and(|n| t.name.contains(n)) {
             eprintln!("template {}: holes {:?}
   shape {:?}", t.name, t.holes, t.shape);
@@ -237,13 +277,23 @@ pub fn diagnose(ir: &mwdec_lift::IrFunction, lib: &mwdec_inline::InlineLib, db: 
             }
             eprintln!("  target calls {:?}", fp.calls);
         }
-        for tp in template_prints(t) {
+        let before = cands.len();
+        let prints = template_prints(t);
+        if only.is_some() && prints.is_empty() {
+            // asked for by name but nothing to fingerprint: no object parameter (arithmetic
+            // helpers, constructors of scalars) or an object it never reads or writes
+            let scalar = !t.holes.iter().any(|h| matches!(h, HoleKind::Obj { .. }));
+            let reason = if scalar { "absent:no-object-parameter" } else { "absent:no-member-access" };
+            cands.push((0.0, 0, Candidate { foreign_private: false, loads: 0, stores: 0, calls: 0, template: t.name.clone(), root: String::new(), offset: 0, matched: 0, total: 1, reason: reason.into(), detail: String::new() }));
+            continue;
+        }
+        for tp in prints {
             if tp.accesses.is_empty() {
                 // a template that only calls (`out.WriteReal32(x)` -> `out.DoPut(&tmp, 4)`):
                 // its callees are all there, but the expansion wasn't recognised
                 if tp.calls.iter().all(|c| fp.calls.contains(c)) && !tp.calls.is_empty() {
                     let total = tp.calls.len();
-                    cands.push((1.0, total, Candidate { template: t.name.clone(), root: String::new(), offset: 0, matched: total, total, reason: "complete:calls-only".into(), detail: tp.calls.join(",") }));
+                    cands.push((1.0, total, Candidate { foreign_private: false, loads: 0, stores: 0, calls: total, template: t.name.clone(), root: String::new(), offset: 0, matched: total, total, reason: "complete:calls-only".into(), detail: tp.calls.join(",") }));
                 }
                 continue;
             }
@@ -269,6 +319,7 @@ pub fn diagnose(ir: &mwdec_lift::IrFunction, lib: &mwdec_inline::InlineLib, db: 
                         p
                     };
                     let mut matched = 0;
+                    let mut private = false;
                     let mut type_diff = 0;
                     let mut seqs = vec![];
                     let (mut miss_store, mut miss_load) = (0, 0);
@@ -284,6 +335,9 @@ pub fn diagnose(ir: &mwdec_lift::IrFunction, lib: &mwdec_inline::InlineLib, db: 
                                 }
                                 matched += 1;
                                 seqs.push(*s);
+                                if let (Some(r), 1) = (&rc, b.path.len()) {
+                                    private |= foreign_private(db, r, b.path[0], b.size, ir.sig.this_class.as_deref());
+                                }
                             }
                             None if a.store => miss_store += 1,
                             None => miss_load += 1,
@@ -292,7 +346,7 @@ pub fn diagnose(ir: &mwdec_lift::IrFunction, lib: &mwdec_inline::InlineLib, db: 
                     let calls_missing: Vec<&String> = tp.calls.iter().filter(|c| !fp.calls.contains(*c)).collect();
                     let total = tp.accesses.len() + tp.calls.len();
                     let got = matched + tp.calls.len() - calls_missing.len();
-                    if got * 2 < total || matched == 0 {
+                    if (got * 2 < total || matched == 0) && only.is_none() {
                         continue;
                     }
                     seqs.sort();
@@ -321,16 +375,37 @@ pub fn diagnose(ir: &mwdec_lift::IrFunction, lib: &mwdec_inline::InlineLib, db: 
                     cands.push((
                         score,
                         total,
-                        Candidate { template: t.name.clone(), root: short(key), offset: d, matched: got, total, reason: reason.into(), detail },
+                        Candidate {
+                            foreign_private: private,
+                            loads: tp.accesses.iter().filter(|a| !a.store).count(),
+                            stores: tp.accesses.iter().filter(|a| a.store).count(),
+                            calls: tp.calls.len(),
+                            template: t.name.clone(), root: short(key), offset: d, matched: got, total, reason: reason.into(), detail },
                     ));
                 }
             }
         }
+        if only.is_some() && cands.len() == before {
+            cands.push((0.0, 0, Candidate { foreign_private: false, loads: 0, stores: 0, calls: 0, template: t.name.clone(), root: String::new(), offset: 0, matched: 0, total: 1, reason: "absent:object-not-found".into(), detail: "no object of its class with any of its accesses".into() }));
+        }
     }
     // best: highest share, then the most specific (largest fingerprint)
-    cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(b.1.cmp(&a.1)));
+    cands.sort_by(|a, b| b.2.credible().cmp(&a.2.credible()).then(b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)).then(b.1.cmp(&a.1)));
     let mut seen = HashSet::new();
     cands.into_iter().filter(|c| seen.insert((c.2.template.clone(), c.2.root.clone()))).take(max).map(|c| c.2).collect()
+}
+
+/// Whether the member at `off` (`size` bytes) of `class` is private or protected in a class
+/// other than `own` (the function's class).
+fn foreign_private(db: &TypeDb, class: &str, off: i32, size: u32, own: Option<&str>) -> bool {
+    let Some((path, _)) = mwdec_lift::types::field_path(db, class, off, size) else { return false };
+    path.iter().any(|pe| match pe {
+        mwdec_lift::types::PathElem::Field(name, owner) => {
+            own.is_none_or(|o| !sig_eq(o, owner))
+                && mwdec_lift::sig::find_class(db, owner).and_then(|c| c.fields.iter().find(|f| f.name == *name)).is_some_and(|f| f.access != mwdec_core::Access::Public)
+        }
+        _ => false,
+    })
 }
 
 fn sig_eq(a: &str, b: &str) -> bool {
@@ -341,34 +416,51 @@ fn short(s: &str) -> String {
     s.chars().take(60).collect()
 }
 
-fn diagnose_fn(ui: &UnitInputs, f: &Function, max: usize) -> Result<Vec<Candidate>> {
+/// Candidates, and the inline calls the draft did fold (their method names).
+fn diagnose_fn(ui: &UnitInputs, f: &Function, max: usize, only: Option<&[String]>) -> Result<(Vec<Candidate>, Vec<String>, Vec<String>)> {
     let db = ui.db.as_ref().ok_or_else(|| anyhow!("no TypeDb"))?;
     let mut ir = mwdec_lift::lift_function(ui.lift_obj.as_ref().unwrap_or(&ui.target), f, Some(db))?;
     let lib = ui.inlines.get(ui, &format!("{}\n{}", ui.mwcc.compiler, ui.ctx.cflags.join(" ")));
     mwdec_inline::apply(&mut ir, &lib, db);
-    Ok(diagnose(&ir, &lib, db, max))
+    let mut folded: Vec<String> = vec![];
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } = e {
+            if mwdec_lift::postinline::is_inline_call(e) {
+                folded.push(method_name(&sig.qualified_name).to_string());
+            }
+        }
+    });
+    folded.sort();
+    folded.dedup();
+    // of the asked names, those the library has a template for
+    let mut known: Vec<String> = only.unwrap_or(&[]).iter().filter(|n| lib.templates.iter().any(|t| method_name(&t.name) == n.as_str())).cloned().collect();
+    known.sort();
+    known.dedup();
+    Ok((diagnose_only(&ir, &lib, db, max, only), folded, known))
 }
 
 /// `mwdec inline-why`: one function (`unit`, `symbol`), or every function of a `--list` JSONL
 /// (with `--out` rows and a ranked summary of the best candidate's reason per function).
 pub fn cmd_inline_why(root: &Path, work: &Path, unit: Option<String>, symbol: Option<String>, list: Option<std::path::PathBuf>, out: Option<std::path::PathBuf>) -> Result<()> {
     let p = crate::load_project(root)?;
-    let mut items: Vec<(String, String)> = vec![];
+    // (unit, symbol, templates to look at: method names; empty = all)
+    let mut items: Vec<(String, String, Vec<String>)> = vec![];
     if let (Some(u), Some(s)) = (unit, symbol) {
-        items.push((u, s));
+        items.push((u, s, vec![]));
     }
     if let Some(l) = list {
         for line in std::fs::read_to_string(&l)?.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if let (Some(u), Some(s)) = (v["unit"].as_str(), v["symbol"].as_str()) {
-                    items.push((u.into(), s.into()));
+                    let only: Vec<String> = v["templates"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+                    items.push((u.into(), s.into(), only));
                 }
             }
         }
     }
-    let mut by_unit: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (u, s) in items {
-        by_unit.entry(u).or_default().push(s);
+    let mut by_unit: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
+    for (u, s, only) in items {
+        by_unit.entry(u).or_default().push((s, only));
     }
     let cc = Compilers::new(root, work, 4).with_fast_workers(0);
     let mut outf = match &out {
@@ -389,28 +481,33 @@ pub fn cmd_inline_why(root: &Path, work: &Path, unit: Option<String>, symbol: Op
                 continue;
             }
         };
-        for s in syms {
+        for (s, only) in syms {
             let Some(f) = mwdec_obj::find_function(&ui.target, &s) else { continue };
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diagnose_fn(&ui, f, 5)));
-            let cands = match res {
+            let only_ref = (!only.is_empty()).then_some(only.as_slice());
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diagnose_fn(&ui, f, if only_ref.is_some() { 50 } else { 5 }, only_ref)));
+            let (cands, folded, known) = match res {
                 Ok(Ok(c)) => c,
                 _ => continue,
             };
             n += 1;
             let best = cands.first();
-            let reason = best.map_or("none".to_string(), |c| c.reason.clone());
+            let reason = match best {
+                Some(c) if c.credible() => c.reason.clone(),
+                Some(_) => "weak (only partial or unspecific matches)".to_string(),
+                None => "none".to_string(),
+            };
             let e = summary.entry(reason).or_default();
             e.0 += 1;
             if e.1.len() < 6 {
                 e.1.push(format!("{} {} [{}]", uname, s, best.map_or(String::new(), |c| c.template.clone())));
             }
-            if let Some(c) = best {
+            if let Some(c) = best.filter(|c| c.credible()) {
                 *templates.entry(c.template.clone()).or_default() += 1;
             }
             if single {
                 println!("{uname} {s}");
                 for c in &cands {
-                    println!("  {:.0}% {} on {} +0x{:x}: {} {}", 100.0 * c.matched as f64 / c.total as f64, c.template, c.root, c.offset, c.reason, c.detail);
+                    println!("  {}{:.0}% {} on {} +0x{:x}: {} {}", if c.credible() { "" } else { "(weak) " }, 100.0 * c.matched as f64 / c.total as f64, c.template, c.root, c.offset, c.reason, c.detail);
                 }
                 if cands.is_empty() {
                     println!("  no template matches half of its fingerprint");
@@ -418,7 +515,7 @@ pub fn cmd_inline_why(root: &Path, work: &Path, unit: Option<String>, symbol: Op
             }
             if let Some(f) = outf.as_mut() {
                 use std::io::Write;
-                let _ = writeln!(f, "{}", serde_json::json!({"unit": uname, "symbol": s, "candidates": cands.iter().map(|c| c.json()).collect::<Vec<_>>()}));
+                let _ = writeln!(f, "{}", serde_json::json!({"unit": uname, "symbol": s, "folded": folded, "known": known, "candidates": cands.iter().map(|c| c.json()).collect::<Vec<_>>()}));
             }
         }
     }
@@ -441,3 +538,4 @@ pub fn cmd_inline_why(root: &Path, work: &Path, unit: Option<String>, symbol: Op
     }
     Ok(())
 }
+

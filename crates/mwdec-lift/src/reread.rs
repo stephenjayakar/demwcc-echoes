@@ -9,6 +9,18 @@ enum Ev {
     Def(VarId),
     Use(VarId),
     Effect,
+    /// a store through the object a variable points to (None: another lvalue)
+    Store(Option<VarId>),
+}
+
+/// The variable at the root of an lvalue's address (`this->a.b`, `p[i].c`, `*(T*)&o`).
+fn root_var(e: &Expr) -> Option<VarId> {
+    match e {
+        Expr::Var(v) => Some(*v),
+        Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } | Expr::Index { base, .. } => root_var(base),
+        Expr::AddrOf(x) | Expr::Cast { e: x, .. } => root_var(x),
+        _ => None,
+    }
 }
 
 type Path = Vec<(usize, u8)>;
@@ -17,11 +29,27 @@ struct Evs {
     list: Vec<(Ev, bool, Path)>,
     path: Path,
     next_if: usize,
+    /// the outermost loop of each event
+    loops: Vec<Option<usize>>,
+    cur_loop: Option<usize>,
+    next_loop: usize,
 }
 
 impl Evs {
     fn push(&mut self, e: Ev, l: bool) {
         self.list.push((e, l, self.path.clone()));
+        self.loops.push(self.cur_loop);
+    }
+
+    /// Run `f` inside a loop (numbered when it is an outermost one).
+    fn in_loop(&mut self, f: impl FnOnce(&mut Evs)) {
+        let outer = self.cur_loop;
+        if outer.is_none() {
+            self.cur_loop = Some(self.next_loop);
+            self.next_loop += 1;
+        }
+        f(self);
+        self.cur_loop = outer;
     }
 }
 
@@ -59,7 +87,7 @@ fn events(b: &[Stmt], in_loop: bool, out: &mut Evs) {
             Stmt::Assign { dst, src } => {
                 expr_events(src, in_loop, out);
                 expr_events(dst, in_loop, out);
-                out.push(Ev::Effect, in_loop);
+                out.push(Ev::Store(root_var(dst)), in_loop);
             }
             Stmt::Expr(e) | Stmt::Return(Some(e)) => expr_events(e, in_loop, out),
             Stmt::If { cond, then, els } => {
@@ -73,16 +101,16 @@ fn events(b: &[Stmt], in_loop: bool, out: &mut Evs) {
                 events(els, in_loop, out);
                 out.path.pop();
             }
-            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => out.in_loop(|out| {
                 expr_events(cond, true, out);
                 events(body, true, out);
-            }
-            Stmt::For { init, cond, step, body } => {
+            }),
+            Stmt::For { init, cond, step, body } => out.in_loop(|out| {
                 events(init, true, out);
                 expr_events(cond, true, out);
                 events(step, true, out);
                 events(body, true, out);
-            }
+            }),
             Stmt::Switch { e, cases } => {
                 expr_events(e, in_loop, out);
                 for c in cases {
@@ -104,9 +132,13 @@ fn has_load(e: &Expr) -> bool {
 
 /// Candidates: (var, its value).
 fn candidates(body: &[Stmt], vars: &[Var]) -> Vec<(VarId, Expr)> {
-    let mut evs = Evs { list: vec![], path: vec![], next_if: 0 };
+    let mut evs = Evs { list: vec![], path: vec![], next_if: 0, loops: vec![], cur_loop: None, next_loop: 0 };
     events(body, false, &mut evs);
+    let loops = evs.loops;
     let ev: Vec<(Ev, bool, Path)> = evs.list;
+    // a use in a loop sees the value read before it on every iteration when nothing in the loop
+    // stores or calls
+    let calm_loop = |u: usize| loops[u].is_some_and(|l| !(0..ev.len()).any(|k| loops[k] == Some(l) && matches!(ev[k].0, Ev::Effect | Ev::Store(_))));
     let mut defs: HashMap<VarId, usize> = HashMap::new();
     for (e, _, _) in &ev {
         if let Ev::Def(v) = e {
@@ -154,11 +186,29 @@ fn candidates(body: &[Stmt], vars: &[Var]) -> Vec<(VarId, Expr)> {
             continue;
         }
         let uses: Vec<usize> = ev.iter().enumerate().filter(|(_, (e, _, _))| *e == Ev::Use(v)).map(|(i, _)| i).collect();
-        if uses.len() < 2 || uses.iter().any(|&u| u < d || ev[u].1 || exclusive(&ev[u].2, &ev[d].2)) {
+        if uses.len() < 2 || uses.iter().any(|&u| u < d || (ev[u].1 && !calm_loop(u)) || exclusive(&ev[u].2, &ev[d].2)) {
             continue;
         }
-        // no store or call can run between the read and any use
-        let blocked = uses.iter().any(|&u| (d..u).any(|k| matches!(ev[k].0, Ev::Effect) && !exclusive(&ev[k].2, &ev[u].2)));
+        // no call can run between the read and any use, nor a store that may reach what it
+        // reads: a store through `this` or a parameter leaves reads through the others (MWCC
+        // keeps such a read across it)
+        let roots: Vec<VarId> = {
+            let mut r = vec![];
+            src.walk(&mut |x| {
+                if let Expr::Var(y) = x {
+                    r.push(*y);
+                }
+            });
+            r
+        };
+        let objectish = |w: VarId| matches!(vars[w].kind, VarKind::This | VarKind::Param { .. });
+        let may_reach = |k: usize| match ev[k].0 {
+            Ev::Effect => true,
+            Ev::Store(Some(r)) => !(objectish(r) && roots.iter().all(|&x| objectish(x) && x != r)),
+            Ev::Store(None) => true,
+            _ => false,
+        };
+        let blocked = uses.iter().any(|&u| (d..u).any(|k| may_reach(k) && !exclusive(&ev[k].2, &ev[u].2)));
         if blocked {
             continue;
         }

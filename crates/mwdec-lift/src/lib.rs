@@ -31,11 +31,17 @@ pub mod localtypes;
 pub mod objcmp;
 pub mod postinline;
 pub mod reread;
+pub mod reroll;
 pub mod insn;
 pub mod ir;
 pub mod sig;
 pub mod scalars;
 pub mod sdkframe;
+pub mod shapes;
+pub mod globalcopy;
+pub mod loadorder;
+pub mod arglocals;
+pub mod selects;
 pub mod samereg;
 pub mod namedindex;
 pub mod simplify;
@@ -296,6 +302,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     if opts.inline_temps {
         reinline(&mut body, &l.is_temp, &l.vars);
     }
+    indexing::pointer_walks(&mut body, &l.vars);
     indexing::undo_strength_reduction(&mut body, &l.vars);
     indexing::recover(&mut body, &l.vars, db);
     indexing::raw_index(&mut body, &l.vars);
@@ -305,11 +312,20 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::inline_ternary_results(&mut body);
     bitfields::insert_chains(&mut body, &mut l.vars, &mut l.is_temp, l.param_home_slots);
     namedindex::name_scaled_index(&mut body, &mut l.vars, &mut l.is_temp);
+    selects::typed_select_args(&mut body);
+    arglocals::args_to_locals(&mut body, &mut l.vars, &mut l.is_temp, db);
+    loadorder::order_param_loads(&mut body, &l.vars);
+    shapes::byte_fields(&mut body);
+    shapes::const_read_only_externs(&mut body, &mut l.globals);
+    if let Some(db) = db {
+        globalcopy::global_struct_copies(&mut body, &l.vars, db);
+    }
     localtypes::forward_global_pointers(&mut body, &l.vars, &l.is_temp);
     if ret_void {
         simplify::drop_trailing_return(&mut body);
     }
     reread::reread_temps(&mut body, &l.vars);
+    reroll::reroll_const_stores(&mut body, &mut l.vars, &mut l.is_temp);
     simplify::drop_garbage_return(&mut body);
 
     // GC/1.2.5n reserves a frame slot for every declared local once the frame has a local area,
@@ -378,6 +394,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     frameobj::whole_object_copies(&mut ir, db);
     frameobj::unknown_callee_byval(&mut ir, db);
     idioms::apply(&mut ir, db);
+    idioms::narrow_float_stores(&mut ir, db);
     scalars::regroup(&mut ir, db);
     debug::stage("idioms", &ir.body, &ir.vars);
     if opts.for_loops {
@@ -385,6 +402,9 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     }
     simplify::name_vars(&ir.body, &mut ir.vars);
     structure::guard_not_swap(&mut ir.body);
+    for w in structure::invariant_loop_conditions(&ir.body) {
+        ir.warnings.push(w);
+    }
     Ok(ir)
 }
 

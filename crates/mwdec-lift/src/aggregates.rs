@@ -342,7 +342,10 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
                     if fields.len() != group.len() {
                         continue;
                     }
-                    let ok = fields.iter().all(|(o, s, f)| group.iter().any(|c| c.dst_off - dmin == *o && c.size == *s && c.float == *f));
+                    // an all-float object copied word by word through integer registers (a POD
+                    // copy-construction: `new (p) T(x)`, a by-value copy) is a whole copy too
+                    let words = group.iter().all(|c| !c.float && c.size == 4);
+                    let ok = fields.iter().all(|(o, s, f)| group.iter().any(|c| c.dst_off - dmin == *o && c.size == *s && (c.float == *f || (words && *f && *s == 4))));
                     if !ok {
                         continue;
                     }

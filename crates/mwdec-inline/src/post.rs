@@ -50,7 +50,9 @@ fn pure_stmt(s: &Stmt, vars: &[Var]) -> bool {
 
 /// Replace the argument `&v` / `v` of a call or construction in `e` by `with`. Returns the
 /// number of replacements.
-fn replace_arg(e: &mut Expr, v: VarId, with: &Expr, only_folded: bool) -> usize {
+/// `real_call`: `with` is a real call's by-value result (also the object of a const inline and
+/// the base of a member read).
+fn replace_arg(e: &mut Expr, v: VarId, with: &Expr, only_folded: bool, real_call: bool) -> usize {
     let mut n = 0;
     let is_v = |a: &Expr| match a {
         Expr::Var(x) => *x == v,
@@ -58,6 +60,15 @@ fn replace_arg(e: &mut Expr, v: VarId, with: &Expr, only_folded: bool) -> usize 
         _ => false,
     };
     e.rewrite(&mut |x| {
+        // a member read of the object: of the value itself (`GetAverage().m_valid`, read
+        // through its accessor)
+        if let Expr::Member { base, .. } = &mut *x {
+            if real_call && matches!(&**base, Expr::Var(w) if *w == v) {
+                **base = with.clone();
+                n += 1;
+            }
+            return;
+        }
         let sig = match &*x {
             Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } => Some(sig.clone()),
             Expr::Construct { ctor, .. } | Expr::New { ctor, .. } => ctor.clone(),
@@ -68,8 +79,9 @@ fn replace_arg(e: &mut Expr, v: VarId, with: &Expr, only_folded: bool) -> usize 
         if only_folded && !sig.as_ref().is_some_and(|s| s.mangled.is_none()) {
             return;
         }
-        // the object of a const member function call: `(a - b).MagSquared()`
-        if let (false, Expr::Call { callee: Callee::Method { this, sig: msig, .. }, .. }) = (only_folded, &mut *x) {
+        // the object of a const member function call: `(a - b).MagSquared()` (a real call's
+        // result too, into a folded inline: `GetAverage().valid()`)
+        if let (true, Expr::Call { callee: Callee::Method { this, sig: msig, .. }, .. }) = (!only_folded || real_call, &mut *x) {
             if msig.is_const && matches!(&**this, Expr::AddrOf(y) if matches!(&**y, Expr::Var(w) if *w == v)) {
                 *this = Box::new(Expr::AddrOf(Box::new(with.clone())));
                 n += 1;
@@ -92,10 +104,12 @@ fn replace_arg(e: &mut Expr, v: VarId, with: &Expr, only_folded: bool) -> usize 
     n
 }
 
-fn stmt_replace_arg(s: &mut Stmt, v: VarId, with: &Expr, only_folded: bool) -> usize {
+fn stmt_replace_arg(s: &mut Stmt, v: VarId, with: &Expr, only_folded: bool, real_call: bool) -> usize {
     match s {
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => replace_arg(e, v, with, only_folded),
-        Stmt::Assign { dst, src } => replace_arg(src, v, with, only_folded) + replace_arg(dst, v, with, only_folded),
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => replace_arg(e, v, with, only_folded, real_call),
+        Stmt::Assign { dst, src } => replace_arg(src, v, with, only_folded, real_call) + replace_arg(dst, v, with, only_folded, real_call),
+        // (a condition, evaluated before the branches)
+        Stmt::If { cond, .. } => replace_arg(cond, v, with, only_folded, real_call),
         _ => 0,
     }
 }
@@ -106,18 +120,18 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
     Stmt::for_each_block_mut(body, &mut |b| {
         let mut i = 0;
         while i < b.len() {
-            let (v, val, only_folded) = match &b[i] {
+            let (v, val, only_folded, real_call) = match &b[i] {
                 Stmt::Assign { dst: Expr::Var(v), src }
                     if matches!(vars[*v].kind, VarKind::Stack { .. } | VarKind::Local) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && folded_value(src) && counts.get(v) == Some(&2) =>
                 {
-                    (*v, src.clone(), false)
+                    (*v, src.clone(), false, false)
                 }
                 // a stack object holding a real call's by-value result, passed on once into a
                 // folded inline (`Deltas(Lerp(..), Slerp(..))`)
                 Stmt::Assign { dst: Expr::Var(v), src: src @ Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. } | Callee::Virtual { sig: Some(sig), .. }, .. } }
                     if sig.mangled.is_some() && matches!(vars[*v].kind, VarKind::Stack { .. }) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && counts.get(v) == Some(&2) =>
                 {
-                    (*v, src.clone(), true)
+                    (*v, src.clone(), true, true)
                 }
                 // a stack object built by a constructor call, passed on once (`X(CAABox(a, b))`)
                 Stmt::Expr(Expr::Call { callee: Callee::Method { symbol, sig, this, .. }, args, .. })
@@ -125,7 +139,7 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
                 {
                     let Expr::AddrOf(x) = &**this else { unreachable!() };
                     let Expr::Var(v) = &**x else { unreachable!() };
-                    (*v, Expr::Construct { class: vars[*v].ty.clone(), ctor: Some(sig.clone()), args: args.clone() }, true)
+                    (*v, Expr::Construct { class: vars[*v].ty.clone(), ctor: Some(sig.clone()), args: args.clone() }, true, false)
                 }
                 _ => {
                     i += 1;
@@ -141,7 +155,7 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
                 continue;
             }
             let mut s = b[j].clone();
-            if stmt_replace_arg(&mut s, v, &val, only_folded) == 1 && mentions(&s, v) == 0 {
+            if stmt_replace_arg(&mut s, v, &val, only_folded, real_call) == 1 && mentions(&s, v) == 0 {
                 b[j] = s;
                 b.remove(i);
                 n += 1;
@@ -158,7 +172,9 @@ fn collect_folded<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         // (a non-const method has effects: two `in.Read()` are two reads, whatever the
         // typedef'd result type looks like)
         let mutator = matches!(x, Expr::Call { callee: Callee::Method { sig, .. }, .. } if !sig.is_const);
-        if folded_value(x) && !mutator && matches!(x, Expr::Call { ret, .. } if matches!(crate::util::strip(ret), Type::Named(_))) {
+        // (`l.end()` / `l.begin()`: the source calls the accessors again)
+        let bounds = matches!(x, Expr::Call { callee: Callee::Method { sig, .. }, args, .. } if args.is_empty() && matches!(sig.qualified_name.rsplit("::").next(), Some("begin" | "end")));
+        if folded_value(x) && !mutator && !bounds && matches!(x, Expr::Call { ret, .. } if matches!(crate::util::strip(ret), Type::Named(_))) {
             out.push(x);
         }
     });

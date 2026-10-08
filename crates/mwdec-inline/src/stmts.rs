@@ -8,7 +8,7 @@ use crate::matcher::{make_call, Bind, Env, Index, M};
 use crate::probe::Probe;
 use crate::template::{hole_kind, HoleKind, Shape, Template};
 use mwdec_core::TypeDb;
-use mwdec_lift::{Expr, IrFunction, Stmt, VarId, VarKind};
+use mwdec_lift::{Callee, Expr, IrFunction, Stmt, VarId, VarKind};
 use std::collections::HashMap;
 
 fn rename(e: &Expr, map: &HashMap<VarId, usize>) -> Option<Expr> {
@@ -280,6 +280,25 @@ fn match_stmt(m: &mut M, p: &Stmt, t: &Stmt) -> bool {
         }
         (Stmt::Assign { dst, src }, Stmt::Assign { dst: d2, src: s2 }) => !matches!(dst, Expr::Var(_)) && m.m(dst, d2) && m.m(src, s2),
         (Stmt::Expr(e), Stmt::Expr(e2)) => m.m(e, e2),
+        // a guarded constructor call on a pointer (`if (p) p->T(a)`) is the placement new the
+        // lifter made of the same code (`new (p) T(a)`)
+        (Stmt::If { cond, then, els }, Stmt::Expr(Expr::New { placement, ctor: Some(c2), args: a2, .. })) if els.is_empty() && placement.len() == 1 => {
+            let [Stmt::Expr(Expr::Call { callee: Callee::Method { sig, this, .. }, args, .. })] = then.as_slice() else { return false };
+            if **this != *cond || !mwdec_lift::sig::is_ctor(sig) || args.len() != a2.len() || mwdec_lift::sig::norm_name(&sig.qualified_name) != mwdec_lift::sig::norm_name(&c2.qualified_name) {
+                return false;
+            }
+            if !m.m(cond, &placement[0]) {
+                return false;
+            }
+            args.iter().zip(a2).all(|(p, t)| {
+                let snap = m.b.clone();
+                if m.m(p, t) {
+                    return true;
+                }
+                m.b = snap;
+                m.m(p, &Expr::AddrOf(Box::new(t.clone())))
+            })
+        }
         (Stmt::If { cond, then, els }, Stmt::If { cond: c2, .. }) => {
             let mut tt = vec![t.clone()];
             canon_blocks(&mut tt);
@@ -450,6 +469,20 @@ pub fn try_stmts_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, idx:
             continue;
         }
         let mut m = M::new(env, t);
+        static TRS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if let Some(f) = TRS.get_or_init(|| std::env::var("MWDI_TRACE_STMT").ok()) {
+            if t.name.contains(f.as_str()) && b.len() >= i + stmts.len() {
+                let mut m2 = M::new(env, t);
+                let mut k = 0;
+                while k < stmts.len() && match_stmt(&mut m2, &stmts[k], &b[i + k]) {
+                    k += 1;
+                }
+                if k > 0 {
+                    eprintln!("STMT {} at {i}: {k} of {} match; next {:?}
+  vs {:?}", t.name, stmts.len(), stmts.get(k), b.get(i + k));
+                }
+            }
+        }
         let Some(end) = match_seq(&mut m, stmts, b, i) else {
             // independent statements the compiler scheduled between the inline's own
             if try_interleaved_at(b, i, whole, env, t, stmts, result) {
@@ -704,53 +737,90 @@ fn movable_def(s: &Stmt, whole: &[Stmt], env: &Env) -> Option<VarId> {
 /// Statement template `t` at `b[i]` with independent definitions interleaved: the expansion's
 /// statements are matched with those set aside, which then go before the folded call.
 fn try_interleaved_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, t: &Template, stmts: &[Stmt], result: &Option<Expr>) -> bool {
-    if result.is_some() || stmts.len() < 2 || i >= b.len() || movable_def(&b[i], whole, env).is_some() {
+    if result.is_some() || stmts.len() < 2 || i >= b.len() {
         return false;
     }
-    // the window: the pattern's length plus up to 3 set-aside statements
-    let mut kept: Vec<usize> = vec![];
-    let mut aside: Vec<usize> = vec![];
-    let mut k = i;
-    while k < b.len() && kept.len() < stmts.len() && aside.len() <= 3 {
-        match movable_def(&b[k], whole, env) {
-            Some(_) if !kept.is_empty() => aside.push(k),
-            _ => kept.push(k),
-        }
-        k += 1;
-    }
-    if aside.is_empty() || kept.len() != stmts.len() || aside.len() > 3 {
+    let wend = (i + stmts.len() + 3).min(b.len());
+    let movable: Vec<usize> = (i + 1..wend).filter(|&k| movable_def(&b[k], whole, env).is_some()).take(6).collect();
+    if movable.is_empty() {
         return false;
     }
-    // a set-aside statement moves before the expansion's earlier statements: it must not read
-    // what they write, and they must not use what it defines
-    for &a in &aside {
-        let Stmt::Assign { dst: Expr::Var(v), src } = &b[a] else { return false };
-        let mut rd = vec![];
-        crate::safety::reads(&crate::matcher::expand(src, env.defs), env, &mut rd);
-        for &w in kept.iter().filter(|&&w| w < a) {
-            if crate::safety::clobbers(&b[w], &rd, env) || uses_in(std::slice::from_ref(&b[w]), *v) > 0 {
-                return false;
+    // set-aside choices: one, then two, then three of the movable definitions
+    let mut choices: Vec<Vec<usize>> = movable.iter().map(|&k| vec![k]).collect();
+    for x in 0..movable.len() {
+        for y in x + 1..movable.len() {
+            choices.push(vec![movable[x], movable[y]]);
+            for z in y + 1..movable.len() {
+                choices.push(vec![movable[x], movable[y], movable[z]]);
             }
         }
     }
-    let view: Vec<Stmt> = kept.iter().map(|&w| b[w].clone()).collect();
-    let mut m = M::new(env, t);
-    if match_seq(&mut m, stmts, &view, 0) != Some(view.len()) {
-        return false;
-    }
-    // locals bound by the pattern: used nowhere else
-    for (h, kd) in t.holes.iter().enumerate() {
-        if let (HoleKind::Local, Some(Bind::Val(Expr::Var(v)))) = (kd, &m.b[h]) {
-            if uses_in(whole, *v) != uses_in(&view, *v) {
-                return false;
+    for aside in choices {
+        let kept: Vec<usize> = (i..wend).filter(|k| !aside.contains(k)).collect();
+        let view: Vec<Stmt> = kept.iter().map(|&w| b[w].clone()).collect();
+        let mut m = M::new(env, t);
+        static TRI: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if let Some(f) = TRI.get_or_init(|| std::env::var("MWDI_TRACE_STMT").ok()) {
+            if t.name.contains(f.as_str()) {
+                let mut m2 = M::new(env, t);
+                let mut k = 0;
+                while k < stmts.len() && k < view.len() && match_stmt(&mut m2, &stmts[k], &view[k]) {
+                    k += 1;
+                }
+                eprintln!("INTER {} at {i} aside {aside:?}: {k} of {} match; next {:?}
+  vs {:?}", t.name, stmts.len(), stmts.get(k), view.get(k));
             }
         }
+        let Some(n) = match_seq(&mut m, stmts, &view, 0) else { continue };
+        if n < 2 {
+            continue;
+        }
+        let end = kept[n - 1] + 1;
+        // every set-aside statement lies inside the expansion
+        if aside.iter().any(|&a| a >= end) {
+            if TRI.get().cloned().flatten().is_some_and(|f| t.name.contains(f.as_str())) {
+                eprintln!("INTER aside past end {n}");
+            }
+            continue;
+        }
+        let used: Vec<usize> = kept[..n].to_vec();
+        // a set-aside statement moves before the expansion's earlier statements: it must not
+        // read what they write, and they must not use what it defines
+        let ok = aside.iter().all(|&a| {
+            let Stmt::Assign { dst: Expr::Var(v), src } = &b[a] else { return false };
+            let mut rd = vec![];
+            crate::safety::reads(&crate::matcher::expand(src, env.defs), env, &mut rd);
+            used.iter().filter(|&&w| w < a).all(|&w| !crate::safety::clobbers(&b[w], &rd, env) && uses_in(std::slice::from_ref(&b[w]), *v) == 0)
+        });
+        let tr = TRI.get().cloned().flatten().is_some_and(|f| t.name.contains(f.as_str()));
+        if !ok {
+            if tr {
+                eprintln!("INTER dependence");
+            }
+            continue;
+        }
+        let window: Vec<Stmt> = used.iter().map(|&w| b[w].clone()).collect();
+        let locals_ok = t.holes.iter().enumerate().all(|(h, kd)| match (kd, &m.b[h]) {
+            (HoleKind::Local, Some(Bind::Val(Expr::Var(v)))) => uses_in(whole, *v) == uses_in(&window, *v),
+            _ => true,
+        });
+        if !locals_ok {
+            if tr {
+                eprintln!("INTER locals");
+            }
+            continue;
+        }
+        let Some((args, _)) = m.finalize(0) else {
+            if tr {
+                eprintln!("INTER finalize {:?}", m.b);
+            }
+            continue;
+        };
+        let call = make_call(t, args);
+        let mut repl: Vec<Stmt> = aside.iter().map(|&a| b[a].clone()).collect();
+        repl.push(Stmt::Expr(call));
+        b.splice(i..end, repl);
+        return true;
     }
-    let Some((args, _)) = m.finalize(0) else { return false };
-    let call = make_call(t, args);
-    let end = *kept.last().unwrap() + 1;
-    let mut repl: Vec<Stmt> = aside.iter().map(|&a| b[a].clone()).collect();
-    repl.push(Stmt::Expr(call));
-    b.splice(i..end, repl);
-    true
+    false
 }

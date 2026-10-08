@@ -162,6 +162,7 @@ fn finish_standin(ir: &mut IrFunction, mut body: Vec<Stmt>, first: usize, fields
         is_static: false,
         is_virtual: false,
         variadic: false,
+        runs_code: false,
     };
     body.truncate(first);
     body.push(Stmt::Return(Some(Expr::Construct { class: class.clone(), ctor: Some(ctor), args: fields.into_iter().map(|f| f.2).collect() })));
@@ -302,6 +303,7 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
     }
     let vars = ir.vars.clone();
     if let Some(db) = db {
+        constructed_arg_temporaries(&mut ir.body, &vars);
         drop_frame_object_dtor_calls(&mut ir.body, &vars, db);
         // a value kept in a register across the destructor call is returned directly
         return_kept_values(&mut ir.body, &vars);
@@ -326,6 +328,36 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
     }
     let body = ir.body.clone();
     untype_undeclarable(&body, &mut ir.vars, db);
+}
+
+/// `m = (int)f` into a char or short (a store or an initializer-list entry): the conversion the
+/// store makes itself, `m = f` (the explicit int cast schedules the conversion differently).
+pub fn narrow_float_stores(ir: &mut IrFunction, db: Option<&TypeDb>) {
+    let narrow = |t: &Type| matches!(types::resolve(db, strip_cv(t)).as_ref(), Type::Int { size: 1 | 2, .. });
+    let vars = ir.vars.clone();
+    let unwrap = |e: &mut Expr| {
+        if let Expr::Cast { ty: Type::Int { size: 4, .. }, e: inner } = e {
+            if is_float(&types::ty_of(inner, &vars)) {
+                *e = (**inner).clone();
+            }
+        }
+    };
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        for s in b.iter_mut() {
+            if let Stmt::Assign { dst, src } = s {
+                if !matches!(dst, Expr::Var(_)) && narrow(&types::ty_of(dst, &vars)) {
+                    unwrap(src);
+                }
+            }
+        }
+    });
+    for init in &mut ir.init_list {
+        if init.ctor.is_none() && init.member_ty.as_ref().is_some_and(|t| narrow(t)) {
+            if let [a] = init.args.as_mut_slice() {
+                unwrap(a);
+            }
+        }
+    }
 }
 
 /// Scalar leaf members of a class in layout order: (offset, type).
@@ -1666,6 +1698,88 @@ fn inline_dtor_callees(db: &TypeDb, cls: &str) -> Vec<String> {
     out
 }
 
+/// `T::T(&t, args); f(..., &t, ...); T::~T(&t, -1);` with `t` a frame object passed by
+/// reference and mentioned nowhere else: the temporary `f(..., T(args), ...)` (destroyed at the
+/// end of the full expression, right after the call).
+fn constructed_arg_temporaries(body: &mut Vec<Stmt>, vars: &[Var]) {
+    let snapshot = body.clone();
+    let total = |v: VarId| -> usize { snapshot.iter().map(|s| mentions(s, v)).sum() };
+    let on = |e: &Expr| -> Option<VarId> {
+        match e {
+            Expr::AddrOf(x) => match &**x {
+                Expr::Var(w) if matches!(vars[*w].kind, VarKind::Stack { .. }) => Some(*w),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 2 < b.len() {
+            let ctor = match &b[i] {
+                Stmt::Expr(Expr::Call { callee: Callee::Method { sig: cs, this, .. }, args, .. }) if sig::is_ctor(cs) => on(this).map(|v| (v, cs.clone(), args.clone())),
+                _ => None,
+            };
+            let dtor = match &b[i + 2] {
+                Stmt::Expr(Expr::Call { callee: Callee::Method { sig: ds, this, .. }, args, .. }) if sig::is_dtor(ds) && args.iter().all(|a| a.as_int().is_some()) => on(this),
+                _ => None,
+            };
+            let Some((v, cs, cargs)) = ctor else {
+                i += 1;
+                continue;
+            };
+            if dtor != Some(v) || total(v) != 3 || mentions(&b[i + 1], v) != 1 || cargs.iter().any(|a| a.uses_var(v)) {
+                i += 1;
+                continue;
+            }
+            // the use: a reference argument of the next statement's call, its other operands
+            // free of calls (they would run after the constructor)
+            let mut hit = false;
+            let mut calls = 0;
+            let call_free = |e: &Expr| !e.has_call();
+            let ok_stmt = match &b[i + 1] {
+                Stmt::Expr(e) | Stmt::Assign { src: e, .. } => {
+                    e.walk(&mut |x| {
+                        if let Expr::Call { callee, args, .. } = x {
+                            calls += 1;
+                            let params = match callee {
+                                Callee::Direct { sig, .. } | Callee::Method { sig, .. } => Some(&sig.params),
+                                _ => None,
+                            };
+                            for (k, a) in args.iter().enumerate() {
+                                if on(a) == Some(v) && params.and_then(|p| p.get(k)).is_some_and(|p| matches!(&p.ty, Type::Ref(_))) {
+                                    hit = true;
+                                }
+                            }
+                        }
+                    });
+                    calls == 1 && matches!(e, Expr::Call { callee: Callee::Direct { .. } | Callee::Method { .. }, .. }) && match e {
+                        Expr::Call { callee: Callee::Method { this, .. }, args, .. } => call_free(this) && args.iter().all(call_free),
+                        Expr::Call { args, .. } => args.iter().all(call_free),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if !ok_stmt || !hit || !matches!(&b[i + 1], Stmt::Expr(_)) {
+                i += 1;
+                continue;
+            }
+            let temp = Expr::Construct { class: Type::Named(cs.this_class.clone().unwrap_or_default()), ctor: Some(cs), args: cargs };
+            if let Stmt::Expr(Expr::Call { args, .. }) = &mut b[i + 1] {
+                for a in args.iter_mut() {
+                    if on(a) == Some(v) {
+                        *a = temp.clone();
+                    }
+                }
+            }
+            b.remove(i + 2);
+            b.remove(i);
+            i += 1;
+        }
+    });
+}
+
 /// The end of a frame object's life written out: its destructor (or what its inline destructor
 /// calls), possibly behind a null test of its address, as the last statement mentioning it.
 /// C++ destroys objects implicitly (temporaries at the end of their full expression, named
@@ -1963,6 +2077,22 @@ pub fn stmt_mentions(s: &Stmt, v: VarId) -> bool {
 /// statement mentioning them defines them entirely, and every later mention is in the same
 /// statement list (so the declaration's scope covers all uses).
 pub fn decl_at_first_def(body: &[Stmt], vars: &[Var]) -> HashSet<VarId> {
+    first_def_decls(body, vars, &|var| {
+        // stack objects, register locals holding a small object (`TUniqueId id = ...`), and
+        // const scalars (initialized where declared)
+        let small_object = matches!(var.kind, VarKind::Local)
+            && named(&var.ty).map_or(false, |n| (n.starts_with(|c: char| c.is_ascii_uppercase()) && crate::types::is_aggregate(None, &var.ty)) || n.ends_with("::iterator") || n.ends_with("::const_iterator"));
+        let const_scalar = matches!(var.kind, VarKind::Local) && matches!(&var.ty, Type::Const(t) if matches!(**t, Type::Bool));
+        matches!(var.kind, VarKind::Stack { .. }) || small_object || const_scalar
+    })
+}
+
+/// Register locals that could be declared where they are first defined (see [`decl_at_first_def`]).
+pub fn decl_at_first_def_scalars(body: &[Stmt], vars: &[Var]) -> HashSet<VarId> {
+    first_def_decls(body, vars, &|var| matches!(var.kind, VarKind::Local))
+}
+
+fn first_def_decls(body: &[Stmt], vars: &[Var], pick: &dyn Fn(&Var) -> bool) -> HashSet<VarId> {
     fn lists<'a>(b: &'a [Stmt], out: &mut Vec<&'a [Stmt]>) {
         out.push(b);
         for s in b {
@@ -1990,10 +2120,7 @@ pub fn decl_at_first_def(body: &[Stmt], vars: &[Var]) -> HashSet<VarId> {
     lists(body, &mut all);
     let mut out = HashSet::new();
     for (v, var) in vars.iter().enumerate() {
-        // stack objects, and register locals holding a small object (`TUniqueId id = ...`)
-        let small_object = matches!(var.kind, VarKind::Local)
-            && named(&var.ty).map_or(false, |n| n.starts_with(|c: char| c.is_ascii_uppercase()) && crate::types::is_aggregate(None, &var.ty));
-        if !matches!(var.kind, VarKind::Stack { .. }) && !small_object {
+        if !pick(var) {
             continue;
         }
         // find the list whose statement first mentions v (pre-order over lists is fine: a list's
@@ -2010,6 +2137,14 @@ pub fn decl_at_first_def(body: &[Stmt], vars: &[Var]) -> HashSet<VarId> {
             };
             if own_mention == Some(false) {
                 continue;
+            }
+            // a loop whose init defines it, every mention in the loop: `for (T v = ...; ...)`
+            if let Stmt::For { init, .. } = &l[i] {
+                let total: usize = body.iter().map(|s| count_mentions(s, v)).sum();
+                if named(&var.ty).is_some() && init.first().is_some_and(|s| defines_object(s, v)) && count_mentions(&l[i], v) == total {
+                    out.insert(v);
+                }
+                break;
             }
             if defines_object(&l[i], v) {
                 // all mentions of v must be inside l[i..]

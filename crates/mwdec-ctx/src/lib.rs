@@ -449,6 +449,7 @@ fn sig_from_decl(d: &DeclInfo, mangled: Option<&str>, db: &TypeDb) -> FuncSig {
         is_static: d.is_static,
         is_virtual: d.is_virtual,
         variadic: d.variadic,
+        runs_code: false,
     }
 }
 
@@ -542,6 +543,7 @@ pub fn sig_from_mangled(mangled: &str, db: &TypeDb) -> Option<FuncSig> {
         is_static,
         is_virtual: in_vtable || decl.is_some_and(|d| d.is_virtual),
         variadic: m.variadic,
+        runs_code: false,
     })
 }
 
@@ -637,6 +639,7 @@ pub fn runtime_helper(name: &str) -> Option<FuncSig> {
         is_static: false,
         is_virtual: false,
         variadic: false,
+        runs_code: false,
     })
 }
 

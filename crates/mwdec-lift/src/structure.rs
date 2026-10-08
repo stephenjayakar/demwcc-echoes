@@ -29,6 +29,8 @@ pub struct Structurer<'a> {
     pub extra_vars: Vec<Var>,
     /// The last `case_tree` was confirmed against MWCC's tree builder.
     tree_confirmed: std::cell::Cell<bool>,
+    /// A loop header `bool_region` may start at (its value is the loop test).
+    bool_header: Option<usize>,
 }
 
 enum TreeCheck {
@@ -66,6 +68,7 @@ impl<'a> Structurer<'a> {
             insns: &[],
             extra_vars: vec![],
             tree_confirmed: std::cell::Cell::new(false),
+            bool_header: None,
         }
     }
 
@@ -262,6 +265,10 @@ impl<'a> Structurer<'a> {
                         cur = next;
                         continue;
                     }
+                    if let Some(next) = self.shared_return_or_chain(cur, out) {
+                        cur = next;
+                        continue;
+                    }
                     self.build_if(cur, join, out);
                     match join {
                         Some(j) => cur = j,
@@ -269,6 +276,20 @@ impl<'a> Structurer<'a> {
                     }
                 }
                 Term::CondReturn { fall } => {
+                    // a void leaf's compare tree can start with a conditional return
+                    if self.ret_void && self.blocks[cur].ret.is_none() {
+                        self.tree_confirmed.set(false);
+                        if let Some((e, cases, default, nodes)) = self.case_tree(cur) {
+                            if self.tree_confirmed_last() {
+                                for n in &nodes {
+                                    self.emitted[*n] = true;
+                                }
+                                let stmt = self.build_cases(e, cases, default, None);
+                                out.push(stmt);
+                                return;
+                            }
+                        }
+                    }
                     if let Some(next) = self.leaf_or_return(cur, out) {
                         cur = next;
                         continue;
@@ -439,7 +460,7 @@ impl<'a> Structurer<'a> {
             }
         };
         edges_of(self, s)?;
-        if self.loops.contains_key(&s) {
+        if self.loops.contains_key(&s) && self.bool_header != Some(s) {
             return None;
         }
         // statements a test may carry: definitions of temps only read by later tests
@@ -697,6 +718,149 @@ impl<'a> Structurer<'a> {
         Some(cont)
     }
 
+    /// See `build_loop`: (condition, body start) of a loop whose header computes its test as a
+    /// value-context `&&`/`||` into a flag the next block tests.
+    fn bool_loop_test(&mut self, h: usize, body: &BTreeSet<usize>) -> Option<(Expr, usize)> {
+        let saved = self.emitted.clone();
+        self.bool_header = Some(h);
+        let mut tmp = vec![];
+        let r = self.bool_region(h, &mut tmp);
+        self.bool_header = None;
+        let res = (|| {
+            let j = r??;
+            let [Stmt::Assign { dst: Expr::Var(v), src: c }] = tmp.as_slice() else { return None };
+            // the header carries nothing but the flag's preload
+            let real: Vec<&Stmt> = self.blocks[h].stmts.iter().filter(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))).collect();
+            if !matches!(real.as_slice(), [Stmt::Assign { dst: Expr::Var(x), .. }] if x == v) {
+                return None;
+            }
+            if !body.contains(&j) || self.has_stmts(j) || tested_var_any(&self.cond_of(j)) != Some(*v) || self.reads_of(*v) != 1 {
+                return None;
+            }
+            let (t, f) = self.cond_edges(j)?;
+            let mut jc = self.cond_of(j);
+            jc.rewrite(&mut |e| {
+                if matches!(e, Expr::Var(x) if x == v) {
+                    *e = c.clone();
+                }
+            });
+            self.emitted[j] = true;
+            match (body.contains(&t), body.contains(&f)) {
+                (true, false) => Some((jc, t)),
+                (false, true) => Some((jc.negate(self.vars), f)),
+                _ => None,
+            }
+        })();
+        if res.is_none() {
+            self.emitted = saved;
+        }
+        res
+    }
+
+    /// `if (a || b) return k;` with one return block shared by the tests: the first ones branch
+    /// to it, the last falls into it. A test after the first may load a value the code after the
+    /// `if` reuses (`if (!p || p->n == 0) return -1; ... p->n ...`): the load is substituted into
+    /// the test and repeated after the `if` (MWCC CSEs the two reads).
+    fn shared_return_or_chain(&mut self, s: usize, out: &mut Vec<Stmt>) -> Option<usize> {
+        let nb = self.cfg.blocks.len();
+        let (t0, _) = self.cond_edges(s)?;
+        let r = t0;
+        if r >= nb || !matches!(self.cfg.blocks[r].term, Term::Return) || self.has_stmts(r) || self.emitted[r] {
+            return None;
+        }
+        let mut conds = vec![self.cond_of(s)];
+        let mut chain = vec![s];
+        let mut defs: Vec<(VarId, Expr)> = vec![];
+        let (_, mut cur) = self.cond_edges(s)?;
+        loop {
+            if cur >= nb || cur == r || self.emitted[cur] || self.cfg.blocks[cur].preds.len() != 1 || self.loops.contains_key(&cur) {
+                return None;
+            }
+            for st in &self.blocks[cur].stmts {
+                match st {
+                    Stmt::Label(_) | Stmt::Comment(_) => {}
+                    Stmt::Assign { dst: Expr::Var(v), src } if !src.has_call() && self.vars[*v].name.starts_with("temp_") => defs.push((*v, src.clone())),
+                    _ => return None,
+                }
+            }
+            let (mut t, mut f) = self.cond_edges(cur)?;
+            let mut c = self.cond_of(cur);
+            if c.has_call() {
+                return None;
+            }
+            // a flag set to 0 or 1 by the test and tested next (`entryIsDir(n)` as `x ? 1 : 0`):
+            // the flag's test with the ternary in place
+            let set01 = |me: &Self, b: usize| -> Option<(VarId, i64, usize)> {
+                if b >= nb || me.cfg.blocks[b].preds.len() != 1 || me.emitted[b] {
+                    return None;
+                }
+                let st: Vec<&Stmt> = me.blocks[b].stmts.iter().filter(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))).collect();
+                let [Stmt::Assign { dst: Expr::Var(v), src }] = st.as_slice() else { return None };
+                let k = src.as_int().filter(|k| *k == 0 || *k == 1)?;
+                match me.cfg.blocks[b].term {
+                    Term::Fall(m) | Term::Jump(m) => Some((*v, k, m)),
+                    _ => None,
+                }
+            };
+            if let (Some((vt, kt, mt)), Some((vf, kf, mf))) = (set01(self, t), set01(self, f)) {
+                if vt == vf && mt == mf && kt != kf && mt < nb && !self.has_stmts(mt) && !self.emitted[mt] && self.cfg.blocks[mt].preds.len() == 2 {
+                    // (the fallthrough value is the ternary's first arm)
+                    let flag = Expr::Ternary { c: Box::new(c.clone().negate(self.vars)), t: Box::new(Expr::int(kf)), f: Box::new(Expr::int(kt)), ty: t_s32() };
+                    let (t2, f2) = self.cond_edges(mt)?;
+                    let mut c2 = self.cond_of(mt);
+                    if tested_var_any(&c2) != Some(vt) || self.reads_of(vt) != 1 {
+                        return None;
+                    }
+                    c2.rewrite(&mut |e| {
+                        if matches!(e, Expr::Var(x) if *x == vt) {
+                            *e = flag.clone();
+                        }
+                    });
+                    chain.push(t);
+                    chain.push(f);
+                    // (the flag blocks and the test of the flag join the chain)
+                    chain.push(cur);
+                    cur = mt;
+                    c = c2;
+                    t = t2;
+                    f = f2;
+                }
+            }
+            for (v, src) in defs.iter().rev() {
+                c.rewrite(&mut |e| {
+                    if matches!(e, Expr::Var(x) if x == v) {
+                        *e = src.clone();
+                    }
+                });
+            }
+            chain.push(cur);
+            if t == r {
+                conds.push(c);
+                cur = f;
+                continue;
+            }
+            if f == r {
+                // the last test falls into the shared return
+                conds.push(c.negate(self.vars));
+                chain.dedup();
+                if !self.cfg.blocks[r].preds.iter().all(|p| chain.contains(p)) || chain.len() < 2 {
+                    return None;
+                }
+                for &n in &chain[1..] {
+                    self.emitted[n] = true;
+                }
+                self.emitted[r] = true;
+                let cond = conds.into_iter().reduce(|a, b| Expr::cmp(BinOp::LogOr, a, b))?;
+                out.push(Stmt::If { cond, then: vec![Stmt::Return(self.blocks[r].ret.clone())], els: vec![] });
+                for (v, src) in defs {
+                    out.push(Stmt::Assign { dst: Expr::Var(v), src });
+                }
+                return Some(t);
+            }
+            return None;
+        }
+    }
+
     /// The leaf form of `or_return_chain`: `b<c>lr` for the first terms, the last one branching
     /// over a lone `blr` (`bne L; blr; L:`): `if (a || !b) return;`.
     fn leaf_or_return(&mut self, s: usize, out: &mut Vec<Stmt>) -> Option<usize> {
@@ -803,6 +967,12 @@ impl<'a> Structurer<'a> {
             work.extend(self.cfg.blocks[x].succs.iter().copied());
         }
         false
+    }
+
+    /// Whether the last `case_tree` call was confirmed by the tree builder (call `case_tree`
+    /// after resetting it via `confirmed_tree` or directly).
+    fn tree_confirmed_last(&self) -> bool {
+        self.tree_confirmed.get()
     }
 
     /// Is `n` the root of a compare tree MWCC's tree builder reproduces (not merely a run of
@@ -1202,6 +1372,9 @@ impl<'a> Structurer<'a> {
         // (MWCC moves a `while`'s test to the bottom)
         let top_test = l.body.iter().all(|&b| self.cfg.blocks[b].start >= self.cfg.blocks[h].start)
             && l.latches.iter().all(|&lt| matches!(self.cfg.blocks[lt].term, Term::Jump(t) if t == h));
+        // the loop test is an `&&`/`||` computed into a flag (`li r0,0; ...; li r0,1;` then
+        // `clrlwi. r0; bne body`, an inlined `it != end`): the chain is the while condition
+        let a = a.or_else(|| self.bool_loop_test(h, &l.body));
         if let Some((cond, body_start)) = a {
             self.emitted[h] = true;
             let mut body = vec![Stmt::Label(h)];
@@ -1260,9 +1433,8 @@ impl<'a> Structurer<'a> {
                     self.cfg.idom[*bi] == usize::MAX
                         && bb.end == bb.start + 1
                         && bb.start < first_body
-                        && self.insns[bb.start].is_jump()
-                        && self.insns[bb.start].reloc.is_none()
-                        && join_off.map(|o| self.insns[o].off) == self.insns[bb.start].target()
+                        && ((self.insns[bb.start].is_jump() && self.insns[bb.start].reloc.is_none() && join_off.map(|o| self.insns[o].off) == self.insns[bb.start].target())
+                            || (join.is_none() && self.ret_void && matches!(self.insns[bb.start].op(), ppc750cl::Opcode::Bclr) && self.insns[bb.start].ins.field_bo() & 0x14 == 0x14))
                 }).map(|(_, bb)| bb.start).max()
             })
             .flatten();
@@ -1278,7 +1450,10 @@ impl<'a> Structurer<'a> {
                 continue;
             }
             let mut body = vec![];
-            if Some(t) == join || t >= EXTRA_CASE {
+            if t >= EXTRA_CASE && join.is_none() && self.ret_void && t != RET_LEAF {
+                // an empty case of a switch ending the function: `return;` (MWCC keeps its `blr`)
+                body.push(Stmt::Return(None));
+            } else if Some(t) == join || t >= EXTRA_CASE {
                 body.push(Stmt::Break);
             } else {
                 self.build(t, join, false, &mut body);
@@ -1583,7 +1758,8 @@ impl<'a> Structurer<'a> {
         let off_of = |b: usize| -> Option<u32> { self.cfg.blocks.get(b).map(|bb| self.insns[bb.start].off) };
         let join = self.join_of_set(nodes);
         let def_off = if default == Some(RET_LEAF) { Some(RET_OFF) } else { default.and_then(off_of) };
-        let join_off = join.and_then(off_of);
+        // (a void leaf's tree ending in returns: empty cases return too)
+        let join_off = join.and_then(off_of).or((default == Some(RET_LEAF)).then_some(RET_OFF));
         let addr = |l: Lab| -> Option<u32> {
             match l {
                 Lab::Default => def_off,
@@ -1665,8 +1841,19 @@ impl<'a> Structurer<'a> {
                 }
             }
         }
+        // a dead `b end` after the tree is an empty case body: empty cases before labels on the
+        // default's body
+        // (a void leaf's tree: a dead lone `blr`)
+        let dead_jump = join_off.map_or(false, |j| {
+            self.cfg.blocks.iter().enumerate().any(|(bi, bb)| {
+                self.cfg.idom[bi] == usize::MAX
+                    && bb.end == bb.start + 1
+                    && ((self.insns[bb.start].is_jump() && self.insns[bb.start].reloc.is_none() && self.insns[bb.start].target() == Some(j))
+                        || (j == RET_OFF && self.insns[bb.start].is_blr() && matches!(self.insns[bb.start].op(), ppc750cl::Opcode::Bclr) && self.insns[bb.start].ins.field_bo() & 0x14 == 0x14))
+            })
+        });
         for sub in &subsets {
-            if let Some(def) = default {
+            if let (Some(def), false) = (default, dead_jump) {
                 let on_default: Vec<(i64, Lab)> = sub.iter().map(|&v| (v, Lab::Default)).collect();
                 if try_set(&on_default) {
                     return TreeCheck::Match(vec![(sub.clone(), def)]);
@@ -1678,6 +1865,18 @@ impl<'a> Structurer<'a> {
             // one shared empty body (`case a: case b: break;`) or one per value
             let shared: Vec<(i64, Lab)> = sub.iter().map(|&v| (v, Lab::Extra(0))).collect();
             if try_set(&shared) {
+                // the kept dead `b end` also takes the value after the largest case (folded into
+                // the default range on its own, see above)
+                if dead_jump {
+                    let hi = base.iter().map(|c| c.0).max().unwrap_or(0) + 1;
+                    // (the tree simulation doesn't model that fold: no re-check)
+                    if !sub.contains(&hi) && !used.contains(&hi) {
+                        let mut vs = sub.clone();
+                        vs.push(hi);
+                        vs.sort();
+                        return TreeCheck::Match(vec![(vs, EXTRA_CASE)]);
+                    }
+                }
                 return TreeCheck::Match(vec![(sub.clone(), EXTRA_CASE)]);
             }
             if sub.len() > 1 {
@@ -1824,6 +2023,17 @@ fn ternary_assign(stmts: &[Stmt], reads: &dyn Fn(VarId) -> usize) -> Option<(Var
     }
 }
 
+/// The variable a test compares (`v == 0`, `(T)v != 0`, `v`).
+fn tested_var_any(e: &Expr) -> Option<VarId> {
+    match e {
+        Expr::Var(v) => Some(*v),
+        Expr::Cast { e, .. } => tested_var_any(e),
+        Expr::Unary { op: UnOp::Not, e, .. } => tested_var_any(e),
+        Expr::Binary { op: BinOp::Ne | BinOp::Eq, l, r, .. } if r.as_int() == Some(0) => tested_var_any(l),
+        _ => None,
+    }
+}
+
 /// `v`, `(T)v`, `v != 0`: the variable a condition tests for truth.
 fn tested_var(e: &Expr) -> Option<VarId> {
     match e {
@@ -1883,7 +2093,16 @@ pub fn guard_not_swap(body: &mut Vec<Stmt>) {
                 matches!(r.as_slice(), [Stmt::Return(Some(_))])
             };
             let els_empty = els.iter().all(|s| matches!(s, Stmt::Label(_) | Stmt::Comment(_)));
-            if !single_ret(then) || !(single_ret(els) || (els_empty && next_ret)) {
+            // (the same swap for two single assignments of one variable: `if (!p) v = a; else v = b;`)
+            let single_assign = |v: &Vec<Stmt>| -> Option<VarId> {
+                let r: Vec<&Stmt> = v.iter().filter(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))).collect();
+                match r.as_slice() {
+                    [Stmt::Assign { dst: Expr::Var(x), .. }] => Some(*x),
+                    _ => None,
+                }
+            };
+            let assigns = single_assign(then).is_some() && single_assign(then) == single_assign(els);
+            if !assigns && (!single_ret(then) || !(single_ret(els) || (els_empty && next_ret))) {
                 continue;
             }
             if let Expr::Unary { op: UnOp::Not, e, .. } = cond {
@@ -2077,4 +2296,102 @@ pub fn ctr_break_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut 
         vars.push(v);
         is_temp.push(false);
     }
+}
+
+/// Warning text of `invariant_loop_conditions` (eval rows flag drafts carrying it).
+pub const WARN_INVARIANT_LOOP: &str = "condition never changes in the loop";
+
+/// Loops whose condition reads only variables nothing in the loop changes (no memory, no call)
+/// and that are not `while (1)`: a source loop never looks like that (it would not end), so it is
+/// a structuring or loop-recovery error. Returns one line per such loop.
+pub fn invariant_loop_conditions(body: &[Stmt]) -> Vec<String> {
+    fn assigned(b: &[Stmt], out: &mut Vec<VarId>) {
+        for s in b {
+            match s {
+                Stmt::Assign { dst: Expr::Var(x), .. } => out.push(*x),
+                Stmt::If { then, els, .. } => {
+                    assigned(then, out);
+                    assigned(els, out);
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => assigned(body, out),
+                Stmt::For { init, step, body, .. } => {
+                    assigned(init, out);
+                    assigned(step, out);
+                    assigned(body, out);
+                }
+                Stmt::Switch { cases, .. } => {
+                    for c in cases {
+                        assigned(&c.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Stmt::walk_exprs(b, &mut |e| {
+            if let Expr::IncDec { e: x, .. } = e {
+                if let Expr::Var(v) = **x {
+                    out.push(v);
+                }
+            }
+            // `&v` passed anywhere may change v
+            if let Expr::AddrOf(x) = e {
+                if let Expr::Var(v) = **x {
+                    out.push(v);
+                }
+            }
+        });
+    }
+    fn check(cond: &Expr, parts: &[&[Stmt]], what: &str, out: &mut Vec<String>) {
+        if matches!(cond, Expr::Int { .. }) {
+            return;
+        }
+        let mut opaque = false;
+        let mut vs = vec![];
+        cond.walk(&mut |e| match e {
+            Expr::Var(v) => vs.push(*v),
+            Expr::Load { .. } | Expr::Global { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Call { .. } | Expr::IncDec { .. } | Expr::BitField { .. } | Expr::New { .. } => opaque = true,
+            _ => {}
+        });
+        if opaque || vs.is_empty() {
+            return;
+        }
+        let mut a = vec![];
+        for p in parts {
+            assigned(p, &mut a);
+        }
+        if !vs.iter().any(|v| a.contains(v)) {
+            out.push(format!("{what} {WARN_INVARIANT_LOOP}"));
+        }
+    }
+    let mut out = vec![];
+    fn walk(b: &[Stmt], out: &mut Vec<String>) {
+        for s in b {
+            match s {
+                Stmt::While { cond, body } => {
+                    check(cond, &[body], "while", out);
+                    walk(body, out);
+                }
+                Stmt::DoWhile { body, cond } => {
+                    check(cond, &[body], "do-while", out);
+                    walk(body, out);
+                }
+                Stmt::For { cond, step, body, .. } => {
+                    check(cond, &[body, step], "for", out);
+                    walk(body, out);
+                }
+                Stmt::If { then, els, .. } => {
+                    walk(then, out);
+                    walk(els, out);
+                }
+                Stmt::Switch { cases, .. } => {
+                    for c in cases {
+                        walk(&c.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
 }

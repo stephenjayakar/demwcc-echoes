@@ -215,6 +215,10 @@ pub struct FuncSig {
     pub is_static: bool,
     pub is_virtual: bool,
     pub variadic: bool,
+    /// For a construction's constructor (`Expr::Construct`): building the object runs
+    /// out-of-line code (a member constructed in place by a call), so it is ordered like a call.
+    #[serde(default)]
+    pub runs_code: bool,
 }
 
 /// C++ member access (DWARF 1.1 AT_public/AT_protected/AT_private, or the header's access section).

@@ -371,7 +371,16 @@ impl<'a> Lifter<'a> {
             }
         }
         let demangled = sig::demangle(&self.f.name).unwrap_or_default();
-        let spellings = param_spellings(&demangled);
+        let mut spellings = param_spellings(&demangled);
+        // a header's `const` on a by-value scalar parameter (not in the mangled name; MWCC
+        // trusts a const bool parameter's value where it would re-truncate a plain one)
+        if let Some(db) = db {
+            for (i, c) in header_const_params(db, &self.sig).into_iter().enumerate() {
+                if let Some(s) = spellings.get_mut(i).filter(|s| c && !s.is_empty() && !s.starts_with("const ") && !s.contains('*') && !s.contains('&')) {
+                    *s = format!("const {s}");
+                }
+            }
+        }
         for (i, p) in self.sig.params.clone().iter().enumerate() {
             let name = p.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("arg{i}"));
             // References are objects in C++: the register holds their address.
@@ -761,7 +770,40 @@ impl<'a> Lifter<'a> {
                 return false;
             }
         }
-        false
+        // set up in a dominating block (an incoming value copied before a loop, passed after
+        // it): the register's only touch in the function, on the dominator path, no call between
+        let mut bb = b;
+        loop {
+            let up = self.cfg.idom[bb];
+            if up == usize::MAX || up == bb {
+                return false;
+            }
+            bb = up;
+            let blk = &self.cfg.blocks[bb];
+            for j in (blk.start..blk.end).rev() {
+                let i = &self.insns[j];
+                if i.is_call() || i.is_bctrl() {
+                    return false;
+                }
+                if self.frame.skip.contains(&j) {
+                    continue;
+                }
+                let (d, u) = defs_uses(i);
+                if u.contains(&reg) {
+                    return false;
+                }
+                if d.contains(&reg) {
+                    let touches = (0..self.insns.len()).filter(|&q| !self.frame.skip.contains(&q) && !self.insns[q].is_call() && !self.insns[q].is_bctrl() && {
+                        let (d2, u2) = defs_uses(&self.insns[q]);
+                        d2.contains(&reg) || u2.contains(&reg)
+                    }).count();
+                    return touches == 1;
+                }
+            }
+            if bb == 0 {
+                return false;
+            }
+        }
     }
 
     /// Like `reg_written_in_block`, continuing into single predecessors (an argument loaded before
@@ -4165,6 +4207,11 @@ impl<'a> Lifter<'a> {
             let lm = if mb == 0 { u32::MAX } else { (1u32 << (32 - mb as u32)) - 1 };
             return arith(BinOp::And, shifted, Expr::uint(lm as i64), v);
         }
+        // `clrlslwi`: the field ends where the shift starts; the source may have masked first
+        // (`(x & 3) << 1`) — a draft variant, the instruction is the same
+        if mb <= me && me as u32 == 31 - sh as u32 && crate::variants::alt(crate::variants::EXPR_MASK_THEN_SHIFT) {
+            return arith(BinOp::Shl, arith(BinOp::And, s, Expr::uint((m >> sh) as i64), v), Expr::int(sh as i64), v);
+        }
         if mb <= me && (me as u32) <= 31 - sh as u32 {
             return arith(BinOp::And, arith(BinOp::Shl, s, Expr::int(sh as i64), v), Expr::uint(m as i64), v);
         }
@@ -4203,6 +4250,22 @@ fn strip_tmpl(s: &str) -> String {
 }
 
 /// Demangled parameter spellings, exactly as in the symbol.
+/// Parameters the header declares with a top-level `const` (by-value scalars), when exactly one
+/// declaration fits the signature.
+fn header_const_params(db: &TypeDb, s: &FuncSig) -> Vec<bool> {
+    let Some(ds) = db.decls.get(&s.qualified_name) else { return vec![] };
+    let same = |a: &Type, b: &Type| types::resolve(Some(db), strip_cv(a)).into_owned() == types::resolve(Some(db), strip_cv(b)).into_owned();
+    let fits: Vec<&mwdec_core::DeclInfo> = ds.iter().filter(|d| d.params.len() == s.params.len() && d.is_const == s.is_const && d.params.iter().zip(&s.params).all(|(a, b)| same(&a.ty, &b.ty))).collect();
+    let [d] = fits.as_slice() else { return vec![] };
+    d.params
+        .iter()
+        .map(|p| match &p.ty {
+            Type::Const(x) => matches!(types::resolve(Some(db), x).as_ref(), Type::Bool | Type::Int { .. } | Type::Long { .. } | Type::Float { .. }),
+            _ => false,
+        })
+        .collect()
+}
+
 pub fn param_spellings(demangled: &str) -> Vec<String> {
     let mut t = demangled.trim();
     if let Some(r) = t.strip_suffix(" const") {
@@ -4291,6 +4354,7 @@ pub fn builtin_sig(name: &str, n: usize) -> FuncSig {
         is_static: false,
         is_virtual: false,
         variadic: false,
+        runs_code: false,
     }
 }
 

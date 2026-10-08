@@ -344,6 +344,7 @@ impl<'a> Em<'a> {
                 is_static: false,
                 is_virtual: false,
                 variadic: false,
+                runs_code: false,
             };
             out.push((s, offs.into_iter().map(|o| o.unwrap()).collect()));
         }
@@ -606,6 +607,7 @@ public:
                         is_static: false,
                         is_virtual: false,
                         variadic: false,
+                        runs_code: false,
                     };
                     let vals: Vec<Expr> = fs.iter().map(|f| f.2.clone()).collect();
                     let a = self.args(&vals, Some(&cs));

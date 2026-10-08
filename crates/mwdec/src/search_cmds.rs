@@ -323,6 +323,11 @@ pub fn choose_draft(ui: &UnitInputs, f: &Function, scorer: &Scorer, with_inlines
 /// that is not exact: the best variant, repaired too, replaces it only if strictly better (so a
 /// variant never costs a match the default pipeline finds).
 pub fn repair_or_variant(scorer: &Scorer, chosen: String, variants: Vec<String>, tracer: Option<&mwdec_search::trace::Tracer>) -> String {
+    // an exact draft is kept whatever a persistent compiler said about it (its verdict must not
+    // depend on the candidates compiled before it)
+    if !scorer.eval(&chosen).0.fitness().is_some_and(|f| f.exact) && scorer.eval_normal(&chosen).0.fitness().is_some_and(|f| f.exact) {
+        return chosen;
+    }
     let best = repair_or_variant_only(scorer, chosen, variants, tracer);
     near_miss_pass(scorer, best, tracer)
 }
@@ -375,7 +380,7 @@ fn repair_or_variant_only(scorer: &Scorer, chosen: String, variants: Vec<String>
         let r = repair_registers(scorer, c, tracer);
         let rf = fit(&r);
         let better = match (&rf, &best_fit) {
-            (Some(x), Some(y)) => x.better_than(y),
+            (Some(x), Some(y)) => x.draft_better_than(y),
             (Some(_), None) => true,
             _ => false,
         };
@@ -500,6 +505,16 @@ pub fn specialization_drafts(alts: &[String], lifted: impl Iterator<Item = Strin
 }
 
 /// The best (by compile + compare) of several drafts, in order; the first exact one wins.
+/// [`Scorer::eval`] for draft-time decisions: a compile failure the fast path reported without
+/// its messages (a trusted failure, `mwdec_mwcc` fast path) is confirmed with a normal compile,
+/// so a draft is never dropped on an unconfirmed error.
+pub fn eval_draft(scorer: &Scorer, src: &str) -> mwdec_search::Eval {
+    match scorer.eval(src).0 {
+        mwdec_search::Eval::CompileError(m) if m.contains("messages not collected") => scorer.eval_normal(src).0,
+        e => e,
+    }
+}
+
 pub fn choose_among(scorer: &Scorer, cands: Vec<String>) -> Option<String> {
     let mut best: Option<(String, Option<mwdec_search::Fitness>)> = None;
     let mut seen = std::collections::HashSet::new();
@@ -507,7 +522,7 @@ pub fn choose_among(scorer: &Scorer, cands: Vec<String>) -> Option<String> {
         if !seen.insert(c.clone()) {
             continue;
         }
-        let (r, _) = scorer.eval(&c);
+        let r = eval_draft(scorer, &c);
         let fit = r.fitness().cloned();
         if std::env::var_os("MWDEC_SHOW_DRAFTS").is_some() {
             let what = match &fit {
@@ -524,7 +539,7 @@ pub fn choose_among(scorer: &Scorer, cands: Vec<String>) -> Option<String> {
         let better = match (&best, &fit) {
             (None, _) => true,
             (Some((_, None)), Some(_)) => true,
-            (Some((_, Some(b))), Some(x)) => x.better_than(b),
+            (Some((_, Some(b))), Some(x)) => x.draft_better_than(b),
             _ => false,
         };
         if better {
@@ -537,8 +552,8 @@ pub fn choose_among(scorer: &Scorer, cands: Vec<String>) -> Option<String> {
 /// The better (by compile + compare) of the draft with folded inlines and the one without.
 pub fn choose_between(scorer: &Scorer, with_inlines: String, plain: Option<String>) -> String {
     let Some(plain) = plain.filter(|p| *p != with_inlines) else { return with_inlines };
-    let (a, _) = scorer.eval(&with_inlines);
-    let (b, _) = scorer.eval(&plain);
+    let a = eval_draft(scorer, &with_inlines);
+    let b = eval_draft(scorer, &plain);
     if std::env::var_os("MWDEC_SHOW_VARIANTS").is_some() {
         eprintln!("--- with inlines ({:?}):
 {with_inlines}
@@ -546,7 +561,7 @@ pub fn choose_between(scorer: &Scorer, with_inlines: String, plain: Option<Strin
 {plain}", a.fitness().map(|f| f.score), b.fitness().map(|f| f.score));
     }
     match (a.fitness(), b.fitness()) {
-        (Some(x), Some(y)) if y.better_than(x) => plain,
+        (Some(x), Some(y)) if y.draft_better_than(x) => plain,
         (None, Some(_)) => plain,
         _ => with_inlines,
     }
@@ -598,7 +613,7 @@ fn draft_opts(ui: &UnitInputs, f: &Function, inlines: bool, include_implicit: bo
 
 /// Draft variant points tried per function (each costs one lift + emit and, when the source
 /// differs, one compile).
-pub const MAX_VARIANT_POINTS: usize = 4;
+pub const MAX_VARIANT_POINTS: usize = 16;
 
 /// The draft variants of `f` (`mwdec_lift::variants`): the default draft (with folded inlines)
 /// redrafted with each decision point it asked flipped, distinct sources other than the default.
@@ -609,8 +624,19 @@ pub fn variant_drafts(ui: &UnitInputs, f: &Function, include_implicit: bool) -> 
     }
     let Ok((base, points)) = draft_flipped(ui, f, true, include_implicit, false, false, 0, &[]) else { return vec![] };
     let mut out: Vec<String> = Vec::new();
-    for p in points.into_iter().take(MAX_VARIANT_POINTS) {
-        if let Ok((s, _)) = draft_flipped(ui, f, true, include_implicit, false, false, 0, &[p]) {
+    let points: Vec<&'static str> = points.into_iter().take(MAX_VARIANT_POINTS).collect();
+    // each point alone, then (few points) every pair: independent source properties often
+    // only match together
+    let mut sets: Vec<Vec<&'static str>> = points.iter().map(|p| vec![*p]).collect();
+    if (2..=4).contains(&points.len()) {
+        for i in 0..points.len() {
+            for j in i + 1..points.len() {
+                sets.push(vec![points[i], points[j]]);
+            }
+        }
+    }
+    for set in &sets {
+        if let Ok((s, _)) = draft_flipped(ui, f, true, include_implicit, false, false, 0, set) {
             if s != base && !out.contains(&s) {
                 out.push(s);
             }
@@ -950,6 +976,11 @@ struct Row {
     nat_final: Option<String>,
     /// `--drafts-only`: hash of the draft texts.
     draft_hash: Option<String>,
+    /// The draft carries the lifter's "loop condition never changes" warning: a wrong-meaning
+    /// structure (counted across lists).
+    wrong_meaning: bool,
+    /// Exact result whose object defines data the target unit lacks (`Scorer::extra_data`).
+    extra_data: Vec<String>,
 }
 
 impl Row {
@@ -962,7 +993,7 @@ impl Row {
             "evals": self.evals, "compiles": self.compiles, "seconds": self.seconds, "error": self.error,
             "winning_ops": self.winning_ops, "ops": self.ops, "polished": self.polished, "implicit": self.implicit,
             "first_profile": self.first_profile, "best_profile": self.best_profile, "traces": self.traces, "mem_mb": self.mem_mb,
-            "nat_draft": self.nat_draft, "nat_final": self.nat_final, "draft_hash": self.draft_hash,
+            "nat_draft": self.nat_draft, "nat_final": self.nat_final, "draft_hash": self.draft_hash, "wrong_meaning": self.wrong_meaning, "extra_data": self.extra_data,
         })
     }
 }
@@ -1074,6 +1105,7 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                     row.implicit = d.implicit.clone();
                     row.drafted = d.src.is_some() || !d.alts.is_empty();
                     row.draft_hash = Some(draft_hash(&d));
+                    row.wrong_meaning = d.src.as_deref().is_some_and(|s| s.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP));
                     row.seconds = t.elapsed().as_secs_f64();
                     let mut f = out_file.lock().unwrap();
                     let _ = writeln!(f, "{}", row.json());
@@ -1223,7 +1255,13 @@ fn run_one(
     let src = repair_or_variant(&scorer, src, d.variants.clone(), ui.tracer.as_deref());
     // Compile the draft before the search clock starts: a compiler crash with the unit's PCH is
     // repaired here (split PCH, once per unit context, cached on disk), not inside the budget.
-    let (first, _) = scorer.eval(&src);
+    let mut first = eval_draft(&scorer, &src);
+    // The verdict on the draft must not depend on which candidates of the unit ran before: a
+    // non-exact result is re-checked with a normal compile (a persistent compiler's state is
+    // shaped by earlier candidates; the normal object also replaces it in the memory cache).
+    if !first.fitness().is_some_and(|f| f.exact) {
+        first = scorer.eval_normal(&src).0;
+    }
     // a draft that doesn't compile (e.g. a private member) is replaced by the raw-offsets draft
     let src = match (first.fitness(), d.raw) {
         (None, Some(raw)) if scorer.eval(&raw).0.fitness().is_some() => raw,
@@ -1244,6 +1282,9 @@ fn run_one(
     row.compiled = r.initial.is_some();
     row.first_exact = r.initial.as_ref().is_some_and(|f| f.exact);
     row.final_exact = r.exact;
+    if r.exact {
+        row.extra_data = scorer.extra_data(&r.best_src);
+    }
     row.first_score = r.initial.as_ref().map(|f| f.score);
     row.first_penalty = r.initial.as_ref().map(|f| f.penalty);
     row.best_score = r.best.as_ref().map(|f| f.score);
@@ -1257,6 +1298,7 @@ fn run_one(
     row.best_profile = r.best.as_ref().map(|f| f.profile);
     row.traces = r.traces;
     row.nat_draft = Some(mwdec_emit::tidy::measure(&src).summary());
+    row.wrong_meaning = src.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP);
     let fin = if r.exact && std::env::var("MWDEC_EVAL_POLISH").is_ok() { polish_exact(ui, &scorer, &r.best_src) } else { r.best_src.clone() };
     row.nat_final = Some(mwdec_emit::tidy::measure(&fin).summary());
     for s in r.op_stats.iter().filter(|s| s.tries > 0) {
@@ -1335,6 +1377,13 @@ fn print_table(rows: &[Row]) {
         }
     }
     line("all", &tot);
+    let wrong: Vec<&Row> = rows.iter().filter(|r| r.wrong_meaning).collect();
+    if !wrong.is_empty() {
+        println!("wrong-meaning drafts (loop condition never changes): {}", wrong.len());
+        for r in wrong.iter().take(20) {
+            println!("  {} {}", r.unit, r.symbol);
+        }
+    }
     // functions emitted without a definition (evaluated with --include-implicit), by kind
     let mut kinds: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
     for r in rows.iter().filter(|r| r.status != "implicit" && r.status != "hdr-inline") {

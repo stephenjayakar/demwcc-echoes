@@ -73,13 +73,14 @@ pub struct RepairConfig {
     pub threads: usize,
     /// Enumeration seeds tried per operator (each picks a site at random; duplicates dropped).
     pub seeds: u64,
-    /// Wall-clock cap (a safety net for slow contexts; the compile cap normally ends first).
+    /// Wall-clock safety net against a hanging compiler only: the compile budget decides the
+    /// result (a tighter wall-clock cap made results depend on machine load).
     pub max_time: std::time::Duration,
 }
 
 impl Default for RepairConfig {
     fn default() -> Self {
-        RepairConfig { max_compiles: 320, cheap_max_compiles: 320, cheap_levels: 1, cheap_ms: f64::INFINITY, beam: 4, threads: 4, seeds: 48, max_time: std::time::Duration::from_secs(20) }
+        RepairConfig { max_compiles: 320, cheap_max_compiles: 320, cheap_levels: 1, cheap_ms: f64::INFINITY, beam: 4, threads: 4, seeds: 48, max_time: std::time::Duration::from_secs(120) }
     }
 }
 
@@ -97,7 +98,7 @@ pub struct Repair {
 pub fn register_only(f: &Fitness) -> bool {
     let p: &DiffProfile = &f.profile;
     // (instructions moved far are aligned as deleted + inserted ones: a few of those in pairs too)
-    !f.exact && f.size_delta == 0 && p.inserted == p.deleted && p.inserted + p.substituted <= 4 && p.stack == 0 && p.branch == 0 && p.reloc == 0 && p.reg + p.reorder + p.other + p.inserted > 0
+    !f.exact && f.size_delta == 0 && p.inserted == p.deleted && p.inserted + p.substituted <= 4 && p.stack == 0 && p.branch <= 2 && p.reloc == 0 && p.reg + p.reorder + p.other + p.inserted + p.branch > 0
 }
 
 /// Every distinct neighbour of `src` under [`REG_OPS`] (one operator application each), in
@@ -105,6 +106,37 @@ pub fn register_only(f: &Fitness) -> bool {
 pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64, seen: &mut HashSet<String>) -> Vec<(String, &'static str)> {
     let Some(p) = Parsed::new(src, symbol) else { return vec![] };
     let mut out = vec![];
+    for c in loop_bound_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "loop_bound"));
+        }
+    }
+    // every such value read in the loop at once
+    let mut cur = src.to_string();
+    for _ in 0..8 {
+        match loop_bound_variants(&cur, symbol).into_iter().next() {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    if cur != src && seen.insert(normalize(&cur)) {
+        out.push((cur, "loop_bound"));
+    }
+    for c in store_reuse_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "store_reuse"));
+        }
+    }
+    for c in volatile_poll_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "volatile_poll"));
+        }
+    }
+    for c in hoist_common_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "hoist_common"));
+        }
+    }
     for c in accumulate_variants(src, symbol) {
         if seen.insert(normalize(&c)) {
             out.push((c, "accumulate"));
@@ -570,7 +602,11 @@ pub fn inline_getter_variants(src: &str, symbol: &str) -> Vec<String> {
             let writes_obj = |s2: usize| -> bool {
                 c.descendants(s2).into_iter().any(|d| match c.kind(d) {
                     "assignment_expression" | "update_expression" => c.descendants(d).into_iter().take(3).any(|x| c.kind(x) == "identifier" && (c.text(x) == root || c.text(x) == name)),
-                    "call_expression" => c.child(d, "function").is_some_and(|ff| c.kind(ff) != "field_expression" || !c.child(ff, "field").is_some_and(|x| c.text(x).starts_with("Get"))),
+                    // (zero-argument methods other than setters are taken as reads)
+                    "call_expression" => {
+                        c.child(d, "function").is_some_and(|ff| c.kind(ff) != "field_expression" || c.child(ff, "field").is_some_and(|x| c.text(x).starts_with("Set")))
+                            || c.child(d, "arguments").is_some_and(|a| !c.named(a).is_empty())
+                    }
                     _ => false,
                 })
             };
@@ -1529,6 +1565,297 @@ pub fn accumulate_variants(src: &str, symbol: &str) -> Vec<String> {
     out
 }
 
+/// An expression both arms of an `if`/`else` compute (`a[(u8)x] = (u8)x;` / `b[..] = (u8)x;`)
+/// named once before the `if` (`__typeof__((u8)x) t = (u8)x;`): the value is then created ahead
+/// of the branch, as when the source kept it in a local.
+pub fn hoist_common_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    let candidate = |n: usize| -> bool {
+        matches!(c.kind(n), "cast_expression" | "binary_expression")
+            && c.descendants(n).into_iter().all(|d| !matches!(c.kind(d), "call_expression" | "assignment_expression" | "update_expression" | "pointer_expression" | "subscript_expression" | "field_expression"))
+            && c.descendants(n).into_iter().any(|d| c.kind(d) == "identifier")
+            && !c.parent(n).is_some_and(|p| c.kind(p) == "assignment_expression" && c.child(p, "left") == Some(n))
+    };
+    for st in c.descendants(info.body) {
+        if c.kind(st) != "if_statement" || !c.parent(st).is_some_and(|p| c.kind(p) == "compound_statement") {
+            continue;
+        }
+        let (Some(cons), Some(alt)) = (c.child(st, "consequence"), c.child(st, "alternative")) else { continue };
+        let in_cons: Vec<usize> = c.descendants(cons).into_iter().filter(|&n| candidate(n)).collect();
+        let in_alt: Vec<usize> = c.descendants(alt).into_iter().filter(|&n| candidate(n)).collect();
+        let mut done: Vec<String> = vec![];
+        for &a in &in_cons {
+            let t = c.text(a).to_string();
+            if done.contains(&t) || !in_alt.iter().any(|&b| c.text(b) == t) {
+                continue;
+            }
+            // no identifier of it written inside the if
+            let ids: Vec<String> = c.descendants(a).into_iter().filter(|&d| c.kind(d) == "identifier").map(|d| c.text(d).to_string()).collect();
+            let written = c.descendants(st).into_iter().any(|d| {
+                matches!(c.kind(d), "assignment_expression" | "update_expression") && c.child(d, "left").or(c.child(d, "argument")).is_some_and(|l| ids.contains(&c.text(l).to_string()))
+            });
+            if written {
+                continue;
+            }
+            done.push(t.clone());
+            // outermost occurrences only (inside the if)
+            let occ: Vec<usize> = c.descendants(st).into_iter().filter(|&n| c.text(n) == t && candidate(n)).collect();
+            let occ: Vec<usize> = occ.iter().copied().filter(|&n| !occ.iter().any(|&m| m != n && c.contains(m, n))).collect();
+            let name = info.fresh_name(&c, "common");
+            let at = c.nodes[st].start;
+            let line_start = src[..at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+            let ind = &src[line_start..at];
+            let mut edits = vec![Edit::insert(at, format!("__typeof__({t}) {name} = {t};\n{ind}"))];
+            for n in occ {
+                edits.push(Edit::replace(&c, n, name.clone()));
+            }
+            if let Some(s) = apply(src, &edits) {
+                if Cst::parse(&s).errors <= c.errors {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// C89 form of a candidate: declarations after the first statement of a block move to the
+/// block's start (`T x = v;` becomes `T x;` there and `x = v;` in place), as C units require.
+pub fn c89_decls(src: &str, symbol: &str) -> Option<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let def = crate::func::find_target(&c, symbol)?;
+    let body = c.child(def, "body")?;
+    let mut edits = vec![];
+    let mut blocks = c.descendants(body);
+    if !blocks.contains(&body) {
+        blocks.insert(0, body);
+    }
+    for blk in blocks {
+        if c.kind(blk) != "compound_statement" {
+            continue;
+        }
+        let sibs: Vec<usize> = c.named(blk).into_iter().filter(|&n| c.kind(n) != "comment").collect();
+        let Some(first_stmt) = sibs.iter().position(|&n| c.kind(n) != "declaration") else { continue };
+        let insert_at = c.nodes[sibs[first_stmt]].start;
+        let line_start = src[..insert_at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+        let ind = &src[line_start..insert_at];
+        let mut hoisted = String::new();
+        for &d in &sibs[first_stmt + 1..] {
+            if c.kind(d) != "declaration" {
+                continue;
+            }
+            let ds: Vec<usize> = c.children_by_field(d, "declarator").collect();
+            if ds.len() != 1 {
+                return None;
+            }
+            let prefix = &src[c.nodes[d].start..c.nodes[ds[0]].start];
+            if c.kind(ds[0]) == "init_declarator" {
+                let (Some(dd), Some(v)) = (c.child(ds[0], "declarator"), c.child(ds[0], "value")) else { return None };
+                if c.kind(dd) == "reference_declarator" || matches!(c.kind(v), "initializer_list" | "argument_list") {
+                    return None;
+                }
+                let (name, _) = crate::func::declarator_name(&c, ds[0])?;
+                hoisted.push_str(&format!("{prefix}{};\n{ind}", c.text(dd)));
+                edits.push(Edit::replace(&c, d, format!("{name} = {};", c.text(v))));
+            } else {
+                hoisted.push_str(&format!("{}\n{ind}", c.text(d)));
+                edits.push(Edit::replace(&c, d, String::new()));
+            }
+        }
+        if !hoisted.is_empty() {
+            edits.push(Edit::insert(insert_at, hoisted));
+        }
+    }
+    if edits.is_empty() {
+        return Some(src.to_string());
+    }
+    let s = apply(src, &edits)?;
+    (Cst::parse(&s).errors <= c.errors).then_some(s)
+}
+
+/// A loop that only polls memory (`while (g.flag != 0) {}`) reading it through a volatile lvalue
+/// (`*(volatile __typeof__(g.flag)*)&g.flag`): the target re-reads it every iteration.
+pub fn volatile_poll_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut edits = vec![];
+    for l in c.descendants(info.body) {
+        if !matches!(c.kind(l), "while_statement" | "do_statement") {
+            continue;
+        }
+        let Some(b) = c.child(l, "body") else { continue };
+        let empty = c.kind(b) == "compound_statement" && c.named(b).iter().all(|&n| c.kind(n) == "comment") || c.kind(b) == "expression_statement" && c.named(b).is_empty();
+        let Some(cond) = c.child(l, "condition") else { continue };
+        if !empty {
+            continue;
+        }
+        let reads: Vec<usize> = c.descendants(cond).into_iter().filter(|&n| matches!(c.kind(n), "field_expression" | "subscript_expression" | "pointer_expression") && !c.text(n).contains("volatile")).collect();
+        let outer: Vec<usize> = reads.iter().copied().filter(|&n| !reads.iter().any(|&m| m != n && c.contains(m, n))).collect();
+        for n in outer {
+            if c.kind(n) == "pointer_expression" && c.op(n) != Some("*") {
+                continue;
+            }
+            let t = c.text(n);
+            edits.push(Edit::replace(&c, n, format!("(*(volatile __typeof__({t})*)&{t})")));
+        }
+    }
+    if edits.is_empty() {
+        return vec![];
+    }
+    match apply(src, &edits) {
+        Some(s) if Cst::parse(&s).errors <= c.errors => vec![s],
+        _ => vec![],
+    }
+}
+
+/// A value stored to memory right after it is computed and used again later (`t = f(); g = t;
+/// h(t);`) read back from where it was stored instead (`g = f(); h(g);`): the compiler forwards
+/// the stored value, so the call result stays where the store put it.
+pub fn store_reuse_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    let assign = |t: usize| -> Option<(usize, usize)> {
+        if c.kind(t) != "expression_statement" {
+            return None;
+        }
+        let a = c.named(t).first().copied().filter(|&a| c.kind(a) == "assignment_expression" && c.op(a) == Some("="))?;
+        Some((c.child(a, "left")?, c.child(a, "right")?))
+    };
+    for blk in c.descendants(info.body) {
+        if c.kind(blk) != "compound_statement" {
+            continue;
+        }
+        let sibs: Vec<usize> = c.named(blk).into_iter().filter(|&n| crate::func::is_stmt(c.kind(n))).collect();
+        for i in 0..sibs.len().saturating_sub(2) {
+            // `x = E;` (or `T x = E;`) then `L = x;`
+            let (name, e, decl) = match c.kind(sibs[i]) {
+                "declaration" => {
+                    let ds: Vec<usize> = c.children_by_field(sibs[i], "declarator").collect();
+                    if ds.len() != 1 || c.kind(ds[0]) != "init_declarator" {
+                        continue;
+                    }
+                    let (Some((n, _)), Some(v)) = (crate::func::declarator_name(&c, ds[0]), c.child(ds[0], "value")) else { continue };
+                    (n, v, true)
+                }
+                _ => {
+                    let Some((l, r)) = assign(sibs[i]) else { continue };
+                    if c.kind(l) != "identifier" {
+                        continue;
+                    }
+                    (c.text(l).to_string(), r, false)
+                }
+            };
+            let Some((l2, r2)) = assign(sibs[i + 1]) else { continue };
+            let r2 = if c.kind(r2) == "parenthesized_expression" { c.named(r2).first().copied().unwrap_or(r2) } else { r2 };
+            if c.text(r2) != name || (c.kind(l2) == "identifier" && info.vars.contains_key(c.text(l2))) || c.descendants(l2).into_iter().any(|d| matches!(c.kind(d), "call_expression")) {
+                continue;
+            }
+            if !info.vars.get(&name).is_some_and(|v| !v.is_param) {
+                continue;
+            }
+            // later uses (all in one later statement, nothing in between writing memory or calling)
+            let uses: Vec<usize> = c.descendants(info.body).into_iter().filter(|&d| c.kind(d) == "identifier" && c.text(d) == name && c.nodes[d].start > c.nodes[sibs[i + 1]].end).collect();
+            if uses.is_empty() {
+                continue;
+            }
+            let Some(j) = sibs.iter().position(|&x| c.contains(x, uses[uses.len() - 1])) else { continue };
+            if uses.iter().any(|&u| !c.contains(sibs[j], u)) {
+                continue;
+            }
+            let between = &sibs[i + 2..j];
+            if between.iter().any(|&s2| c.descendants(s2).into_iter().any(|d| matches!(c.kind(d), "call_expression" | "assignment_expression" | "update_expression"))) {
+                continue;
+            }
+            let lt = c.text(l2).to_string();
+            let mut edits = vec![Edit::replace(&c, sibs[i], String::new()), Edit::replace(&c, sibs[i + 1], format!("{lt} = {};", c.text(e)))];
+            for &u in &uses {
+                edits.push(Edit::replace(&c, u, lt.clone()));
+            }
+            let _ = decl;
+            if let Some(s) = apply(src, &edits) {
+                if Cst::parse(&s).errors <= c.errors {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A loop bound read into a local before the loop and used only in the loop condition
+/// (`n = v.size(); for (i = 0; i < n; i++)`) read in the condition itself (`i < v.size()`): the
+/// compiler hoists it anyway, but creates the value at another point.
+pub fn loop_bound_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    for t in c.descendants(info.body) {
+        let (name, val) = match c.kind(t) {
+            "declaration" => {
+                let ds: Vec<usize> = c.children_by_field(t, "declarator").collect();
+                if ds.len() != 1 || c.kind(ds[0]) != "init_declarator" {
+                    continue;
+                }
+                let (Some((n, _)), Some(v)) = (crate::func::declarator_name(&c, ds[0]), c.child(ds[0], "value")) else { continue };
+                (n, v)
+            }
+            "expression_statement" => {
+                let Some(a) = c.named(t).first().copied().filter(|&a| c.kind(a) == "assignment_expression" && c.op(a) == Some("=")) else { continue };
+                let (Some(l), Some(r)) = (c.child(a, "left"), c.child(a, "right")) else { continue };
+                if c.kind(l) != "identifier" {
+                    continue;
+                }
+                (c.text(l).to_string(), r)
+            }
+            _ => continue,
+        };
+        if !info.vars.get(&name).is_some_and(|v| !v.is_param) || c.descendants(val).into_iter().any(|d| matches!(c.kind(d), "assignment_expression" | "update_expression")) {
+            continue;
+        }
+        // all reads inside one loop that writes no memory and calls nothing but accessors (the
+        // value is loop-invariant), or a single read in its condition
+        let reads: Vec<usize> = c.descendants(info.body).into_iter().filter(|&d| c.kind(d) == "identifier" && c.text(d) == name && c.nodes[d].start > c.nodes[val].end).collect();
+        let Some(&u0) = reads.first() else { continue };
+        let Some(lp) = c.ancestors(u0).into_iter().find(|&a| matches!(c.kind(a), "for_statement" | "while_statement" | "do_statement")) else { continue };
+        if reads.iter().any(|&u| !c.contains(lp, u)) || c.nodes[t].end > c.nodes[lp].start {
+            continue;
+        }
+        let in_cond = reads.len() == 1 && c.child(lp, "condition").is_some_and(|cd| c.contains(cd, u0));
+        let pure_loop = c.descendants(lp).into_iter().all(|d| match c.kind(d) {
+            "assignment_expression" | "update_expression" => c.descendants(d).into_iter().nth(1).is_some_and(|x| c.kind(x) == "identifier" && info.vars.contains_key(c.text(x)) && c.text(x) != name),
+            "call_expression" => c.child(d, "function").is_some_and(|f| c.kind(f) == "field_expression" && c.child(f, "arguments").is_none() && c.child(d, "arguments").is_some_and(|a| c.named(a).is_empty())),
+            _ => true,
+        });
+        let val_ids: Vec<String> = c.descendants(val).into_iter().filter(|&d| c.kind(d) == "identifier").map(|d| c.text(d).to_string()).collect();
+        let ids_written = c.descendants(lp).into_iter().any(|d| matches!(c.kind(d), "assignment_expression" | "update_expression") && c.descendants(d).into_iter().nth(1).is_some_and(|x| val_ids.contains(&c.text(x).to_string())));
+        if !(in_cond || pure_loop) || ids_written {
+            continue;
+        }
+        let mut edits = vec![Edit::replace(&c, t, String::new())];
+        for &u in &reads {
+            edits.push(Edit::replace(&c, u, c.text(val).to_string()));
+        }
+        if let Some(s) = apply(src, &edits) {
+            if Cst::parse(&s).errors <= c.errors {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 struct Scored {
     src: String,
     fit: Fitness,
@@ -1587,6 +1914,14 @@ pub fn repair(scorer: &Scorer, src: &str, fit: &Fitness, tracer: Option<&crate::
         return None;
     }
     let symbol = scorer.symbol.clone();
+    // C units: generated declarations go to the start of their block
+    let c_mode = scorer.ctx.cflags.iter().any(|f| f == "-lang=c" || f == "-lang=c99") || scorer.ctx.tu_name.as_deref().is_some_and(|n| n.ends_with(".c"));
+    let c89 = |v: Vec<(String, &'static str)>| -> Vec<(String, &'static str)> {
+        if !c_mode {
+            return v;
+        }
+        v.into_iter().filter_map(|(c, o)| c89_decls(&c, &scorer.symbol).map(|x| (x, o))).collect()
+    };
     let hints = crate::hints::target_hints(scorer.tf);
     let hints = (!hints.is_empty()).then_some(&hints);
     let compiles = AtomicUsize::new(0);
@@ -1619,9 +1954,9 @@ pub fn repair(scorer: &Scorer, src: &str, fit: &Fitness, tracer: Option<&crate::
     if let (Some(m), false) = (&merged, merged_same) {
         cands.push((m.clone(), vec!["merge_decl"]));
     }
-    let a: Vec<(String, Vec<&'static str>)> = if merged_same { vec![] } else { neighbours(src, &symbol, hints, cfg.seeds, &mut seen).into_iter().map(|(c, o)| (c, vec![o])).collect() };
+    let a: Vec<(String, Vec<&'static str>)> = if merged_same { vec![] } else { c89(neighbours(src, &symbol, hints, cfg.seeds, &mut seen)).into_iter().map(|(c, o)| (c, vec![o])).collect() };
     let b: Vec<(String, Vec<&'static str>)> = match &merged {
-        Some(m) => neighbours(m, &symbol, hints, cfg.seeds, &mut seen).into_iter().map(|(c, o)| (c, vec!["merge_decl", o])).collect(),
+        Some(m) => c89(neighbours(m, &symbol, hints, cfg.seeds, &mut seen)).into_iter().map(|(c, o)| (c, vec!["merge_decl", o])).collect(),
         None => vec![],
     };
     cands.extend(interleave(vec![a, b]));
@@ -1690,7 +2025,7 @@ pub fn repair(scorer: &Scorer, src: &str, fit: &Fitness, tracer: Option<&crate::
         let lists: Vec<Vec<(String, Vec<&'static str>)>> = parents
             .iter()
             .map(|p| {
-                neighbours(&p.src, &symbol, hints, cfg.seeds, &mut seen)
+                c89(neighbours(&p.src, &symbol, hints, cfg.seeds, &mut seen))
                     .into_iter()
                     .map(|(c, o)| {
                         let mut ops = p.ops.clone();

@@ -573,7 +573,14 @@ pub fn search(scorer: &Scorer, init: &str, cfg: &SearchConfig) -> SearchResult {
         let _ = std::fs::create_dir_all(d);
         let _ = std::fs::write(d.join("init.cpp"), init);
     }
-    let (e0, ran) = scorer.eval(init);
+    let (mut e0, mut ran) = scorer.eval(init);
+    // the starting point's verdict: never an unconfirmed fast-path failure, never a fast-path
+    // object that a normal compile would judge differently
+    if !e0.fitness().is_some_and(|f| f.exact) {
+        let (e, r) = scorer.eval_normal(init);
+        e0 = e;
+        ran |= r;
+    }
     st.evals += 1;
     st.compiles += ran as u64;
     let init_src = Arc::new(init.to_string());
