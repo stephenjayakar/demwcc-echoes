@@ -267,14 +267,25 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             if needs_dead && !(d.params.iter().any(|p| by_value_class(&p.ty)) || by_value_class(&d.ret)) {
                 continue;
             }
-            // loops never fold into one value, and their instantiations are the ones that fail
-            // (a constructor's loop is a statement template building its object in place:
-            // `basic_string(literal_t, const char*)` counting the length)
+            // inlines with loops: probed by family (switches `MWDI_NO_LOOP_CTORS`, `_VALUES`,
+            // `_METHODS`); MWCC inlines the small ones (a constructor counting its input, a
+            // container's `clear()` destroying its elements), the probe says which
             let ctor_like = class.as_deref().is_some_and(|c| {
                 let own = mwdec_lift::sig::split_scope(c).1;
                 own == last || own.split('<').next() == Some(last)
             });
-            let loop_ok = ctor_like && std::env::var_os("MWDI_NO_LOOP_CTORS").is_none();
+            let scalar_ret = matches!(strip_cv(&d.ret), Type::Int { .. } | Type::Long { .. } | Type::Float { .. } | Type::Bool | Type::Char);
+            let off = |n: &str| std::env::var_os(n).is_some();
+            let loop_ok = if ctor_like {
+                !off("MWDI_NO_LOOP_CTORS")
+            } else if scalar_ret {
+                !off("MWDI_NO_LOOP_VALUES")
+            } else {
+                class.is_some() && !off("MWDI_NO_LOOP_METHODS")
+            };
+            if std::env::var_os("MWDI_TRACE_LOOPS").is_some() && d.inline_body.as_deref().is_some_and(|b| b.split_whitespace().any(|t| matches!(t, "for" | "while" | "do"))) {
+                eprintln!("LOOPINL {qname} ret {:?} params {:?} body {:?}", d.ret, d.params.iter().map(|p| &p.ty).collect::<Vec<_>>(), d.inline_body);
+            }
             if d.inline_body.as_deref().map_or(false, |b| b.split_whitespace().any(|t| matches!(t, "for" | "while" | "do" | "goto") && !(loop_ok && t != "goto"))) {
                 continue;
             }
@@ -291,7 +302,9 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                     continue;
                 }
             }
-            if d.access != mwdec_core::Access::Public {
+            // (protected methods through a derived helper, see `protected_wrap`)
+            let protected = d.access == mwdec_core::Access::Protected && class.is_some() && !d.is_static && std::env::var_os("MWDI_NO_PROTECTED").is_none();
+            if d.access != mwdec_core::Access::Public && !protected {
                 continue;
             }
             if last.starts_with('~') || last.starts_with("operator new") || last.starts_with("operator delete") {
@@ -306,6 +319,9 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                 let own = mwdec_lift::sig::split_scope(c).1;
                 own == last || own.split('<').next() == Some(last)
             });
+            if protected && is_ctor {
+                continue;
+            }
             let tp: &[String] = &[];
             let skips = std::env::var("MWDI_SKIPS").is_ok();
             let Some(pspell) = d.params.iter().map(|p| spell(&p.ty, db, tp)).collect::<Option<Vec<_>>>() else {
@@ -382,8 +398,16 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                 all_params.push(format!("{st} self"));
             }
             all_params.extend(decl_params);
-            let text = format!("{rspell} {name}({}) {{ {body} }}", all_params.join(", "));
-            if !seen.insert(text.replace(&name, "")) {
+            let cls_spell = class.as_ref().and_then(|c| spell(&Type::Named(c.clone()), db, tp)).unwrap_or_default();
+            let mk = |name: &str, rs: &str, body: &str| -> String {
+                if protected {
+                    protected_wrap(name, rs, body, &all_params, &call_args, &cls_spell)
+                } else {
+                    format!("{rs} {name}({}) {{ {body} }}", all_params.join(", "))
+                }
+            };
+            let text = mk(&name, &rspell, &body);
+            if !seen.insert(text.replace(&name, "").replace(&name.replace("__mwdi_p", "__mwdi_h"), "")) {
                 continue;
             }
             let sig = sig_of_decl(d, class.as_deref(), &qname);
@@ -407,8 +431,8 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                     let callee = if matches!(kind, CallKind::Method) { format!("self->{last}") } else if matches!(kind, CallKind::Ctor) { class.clone().unwrap_or_default() } else { qname.clone() };
                     let call = format!("{callee}({})", args.join(", "));
                     let body = if matches!(kind, CallKind::Ctor) { format!("return {call};") } else if ret_ref { format!("return &{call};") } else if matches!(strip_cv(&d.ret), Type::Void) { format!("{call};") } else { format!("return {call};") };
-                    let text = format!("{rspell} {name}({}) {{ {body} }}", all_params.join(", "));
-                    if !seen.insert(text.replace(&name, "")) {
+                    let text = mk(&name, &rspell, &body);
+                    if !seen.insert(text.replace(&name, "").replace(&name.replace("__mwdi_p", "__mwdi_h"), "")) {
                         continue;
                     }
                     out.push(Probe { name, decl: d.clone(), class: class.clone(), kind: kind.clone(), params: params.clone(), ret: ret.clone(), ret_ref, sig: sig.clone(), line: 0, fn_template, needs_dead, fixed });
@@ -417,8 +441,8 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             }
             if let Some(call) = discard {
                 let name = format!("__mwdi_p{}", out.len());
-                let text = format!("void {name}({}) {{ {call}; }}", all_params.join(", "));
-                if seen.insert(text.replace(&name, "")) {
+                let text = mk(&name, "void", &format!("{call};"));
+                if seen.insert(text.replace(&name, "").replace(&name.replace("__mwdi_p", "__mwdi_h"), "")) {
                     out.push(Probe { name, decl: d.clone(), class: class.clone(), kind, params, ret: Type::Void, ret_ref: false, sig, line: 0, fn_template, needs_dead: false, fixed: vec![] });
                     out.last_mut().unwrap().decl.inline_body = Some(text);
                 }
@@ -426,6 +450,18 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
         }
     }
     out
+}
+
+/// A probe of a protected method (one line): the body runs in a static member of a helper class
+/// derived from the method's class (`self` cast to it: protected access needs the derived type),
+/// called from the probe function, which the inliner expands to the same body.
+fn protected_wrap(name: &str, rs: &str, body: &str, all_params: &[String], call_args: &[String], cls: &str) -> String {
+    let h = name.replace("__mwdi_p", "__mwdi_h");
+    let params = all_params.join(", ");
+    let body = body.replace("self->", &format!("(({h}*)self)->"));
+    let fwd: Vec<String> = std::iter::once("self".to_string()).chain(call_args.iter().cloned()).collect();
+    let ret = if rs == "void" { "" } else { "return " };
+    format!("struct {h} : {cls} {{ static {rs} c({params}) {{ {body} }} }}; {rs} {name}({params}) {{ {ret}{h}::c({}); }}", fwd.join(", "))
 }
 
 /// Constant-argument specialisations worth probing for one inline: each is a list of

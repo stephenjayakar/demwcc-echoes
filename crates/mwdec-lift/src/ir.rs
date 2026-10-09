@@ -324,6 +324,22 @@ pub struct DeadStackStore {
     pub order: usize,
 }
 
+/// Dead frame stores tiling a whole object of `size` bytes above a frame object at `offset`
+/// (within 64 bytes): the slot of a named local whose value the code took from registers.
+pub fn dead_object_above(dead: &[DeadStackStore], offset: i32, size: u32) -> bool {
+    dead.iter().filter(|d| d.offset > offset && d.offset <= offset + 64).any(|d0| {
+        let start = d0.offset;
+        let mut at = start;
+        while at < start + size as i32 {
+            match dead.iter().find(|d| d.offset == at && d.size > 0) {
+                Some(d) => at += d.size as i32,
+                None => return false,
+            }
+        }
+        at == start + size as i32
+    })
+}
+
 impl IrFunction {
     pub fn var(&self, v: VarId) -> &Var {
         &self.vars[v]

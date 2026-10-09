@@ -111,6 +111,11 @@ pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64,
             out.push((c, "const_param"));
         }
     }
+    for c in cond_local_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "cond_local"));
+        }
+    }
     for c in param_copy_variants(src, symbol) {
         if seen.insert(normalize(&c)) {
             out.push((c, "param_copy"));
@@ -2080,6 +2085,65 @@ pub fn param_copy_variants(src: &str, symbol: &str) -> Vec<String> {
         edits.push(Edit::insert(c.nodes[info.body].start + 1, format!("\n    {} {local} = {name};", v.ty)));
         if let Some(s) = apply(src, &edits).filter(|s| Cst::parse(s).errors <= c.errors) {
             out.push(s);
+        }
+    }
+    out
+}
+
+/// A pointer tested by an `if` and used again in its branch (`if (!p.null()) f(p.get());`,
+/// `if (o->m) o->m->g();`) held in a named local (`__typeof__(p.get()) t = p.get(); if (t)
+/// f(t);`): the named value is coloured with the locals instead of as a common-subexpression
+/// temporary. C++ only (a declaration before the statement).
+pub fn cond_local_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut out = vec![];
+    for st in c.descendants(info.body) {
+        if c.kind(st) != "if_statement" {
+            continue;
+        }
+        let (Some(cond), Some(cons)) = (c.child(st, "condition"), c.child(st, "consequence")) else { continue };
+        let ct = crate::cst::strip_parens(c.text(cond).trim()).trim().to_string();
+        // the pointer the condition tests
+        let key = if let Some(x) = ct.strip_prefix('!').and_then(|x| x.trim().strip_suffix(".null()")) {
+            format!("{x}.get()")
+        } else {
+            let p = ct.strip_suffix(" != 0").or_else(|| ct.strip_suffix(" != nullptr")).unwrap_or(&ct).trim().to_string();
+            let simple = p.ends_with(".get()") || p.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | '-' | '>'));
+            if !simple || !(p.contains("->") || p.contains('.')) {
+                continue;
+            }
+            p
+        };
+        if key.contains('(') && !key.ends_with(".get()") || key.matches('(').count() > 1 {
+            continue;
+        }
+        let body = c.text(cons);
+        if !body.contains(&key) {
+            continue;
+        }
+        let name = info.fresh_name(&c, "ptr");
+        let at = c.nodes[st].start;
+        let line_start = src[..at].rfind('\n').map(|q| q + 1).unwrap_or(0);
+        let ind = &src[line_start..at];
+        // (its own type, or `const void*` when the branch reads through it with casts only: the
+        // pointee type changes how the reads are scheduled)
+        let cast_only = body.matches(key.as_str()).count() == body.matches(format!("*){key}").as_str()).count();
+        let mut types = vec![format!("__typeof__({key})")];
+        if cast_only {
+            types.push("const void*".to_string());
+        }
+        for ty in types {
+            let edits = vec![
+                Edit { start: at, end: at, text: format!("{ty} {name} = {key};\n{ind}") },
+                Edit::replace(&c, cond, format!("({name})")),
+                Edit::replace(&c, cons, body.replace(&key, &name)),
+            ];
+            if let Some(s) = apply(src, &edits).filter(|s| Cst::parse(s).errors <= c.errors) {
+                out.push(s);
+            }
         }
     }
     out

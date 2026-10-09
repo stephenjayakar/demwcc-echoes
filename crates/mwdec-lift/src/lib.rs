@@ -300,6 +300,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         bitfields::recover(&mut body, &l.vars, db);
         byval::forward(&mut body, &mut l.vars, db, &dead_stores);
         byval::copy_temporaries(&mut body, &mut dead_stores, db);
+        byval::named_result_copies(&mut body, &mut l.vars, &mut dead_stores, db);
         byval::member_built_args(&mut body, &l.vars, db);
         aggregates::literal_inits(&mut body, &l.vars, db, obj);
         byval::forward_ptmf_args(&mut body, &l.vars, db);

@@ -2442,6 +2442,10 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         // temporaries whose construction only folding made one expression (`f(T(a, b))`)
         let vars = ir.vars.clone();
         mwdec_lift::idioms::constructed_arg_temporaries(&mut ir.body, &vars);
+        // call results held in a frame object the folding made used once (`v = a + b; *this = v;`;
+        // not into other frame objects or arguments: `rc_ptr<T> p = x.GetObj();` stays named)
+        let vars = ir.vars.clone();
+        mwdec_lift::idioms::forward_results_into_assignments(&mut ir.body, &vars);
         crate::post::fold_flag_chains(&mut ir.body, &ir.vars);
     }
     // reference locals bound only to pass the accessor's result on once

@@ -475,6 +475,24 @@ pub fn is_class_scope(scope: &str, db: &TypeDb) -> bool {
 /// mangling (exact), return type / static / virtual / parameter names from the scanned header
 /// declaration when one matches. Unknown return type = `Type::Unknown { size: 0 }`.
 /// Unmangled (C) names are looked up in the declarations.
+/// Whether a declared parameter type and a mangled one are the same kind of parameter
+/// (reference, pointer, object, scalar; an unknown type agrees with any).
+fn param_kinds_agree(a: &Type, b: &Type) -> bool {
+    fn kind(t: &Type) -> u8 {
+        match t {
+            Type::Const(t) | Type::Volatile(t) => kind(t),
+            Type::Unknown { .. } => 0,
+            Type::Ref(_) => 1,
+            Type::Ptr(_) | Type::FuncPtr(_) | Type::Array(..) => 2,
+            Type::Named(_) => 3,
+            Type::MemberPtr { .. } => 5,
+            _ => 4,
+        }
+    }
+    let (ka, kb) = (kind(a), kind(b));
+    ka == 0 || kb == 0 || ka == kb
+}
+
 pub fn sig_from_mangled(mangled: &str, db: &TypeDb) -> Option<FuncSig> {
     let Some(m) = mangle::parse_mangled_fn(mangled) else {
         if let Some(d) = db.decls.get(mangled).and_then(|v| v.first()) {
@@ -487,15 +505,26 @@ pub fn sig_from_mangled(mangled: &str, db: &TypeDb) -> Option<FuncSig> {
         None => m.name.clone(),
     };
     let keys: Vec<Type> = m.params.iter().map(|p| resolve::param_key(db, &p.ty)).collect();
+    let scope_cls = m.scope.as_deref().filter(|s| is_class_scope(s, db));
+    // (member types a declaration names unqualified, `erase(iterator)`, are the class's)
+    let decl_key = |t: &Type| resolve::param_key(db, &scope_cls.map_or_else(|| t.clone(), |c| qualify_nested(db, t, c)));
     let pick = |list: &[DeclInfo]| -> Option<DeclInfo> {
         let same_shape = |d: &&DeclInfo| d.params.len() == m.params.len() && d.is_const == m.is_const && d.variadic == m.variadic;
         list.iter()
             .filter(same_shape)
             .find(|d| d.params.iter().map(|p| resolve::param_key(db, &p.ty)).collect::<Vec<_>>() == keys)
+            .or_else(|| list.iter().filter(same_shape).find(|d| d.params.iter().map(|p| decl_key(&p.ty)).collect::<Vec<_>>() == keys))
             .or_else(|| {
                 let cands: Vec<&DeclInfo> = list.iter().filter(same_shape).collect();
                 if cands.len() == 1 {
-                    Some(cands[0])
+                    return Some(cands[0]);
+                }
+                // overloads told apart by the kind of each parameter (reference, pointer,
+                // object, scalar) where the spelled types don't compare (a nested typedef of a
+                // class template: `iterator erase(iterator)` beside `int erase(const T&)`)
+                let kinds: Vec<&DeclInfo> = cands.into_iter().filter(|d| d.params.iter().zip(&keys).all(|(p, k)| param_kinds_agree(&resolve::param_key(db, &p.ty), k))).collect();
+                if kinds.len() == 1 {
+                    Some(kinds[0])
                 } else {
                     None
                 }

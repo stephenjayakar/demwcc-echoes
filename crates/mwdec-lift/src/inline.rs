@@ -322,6 +322,32 @@ fn sibling_calls(e: &Expr, t: VarId) -> usize {
 
 /// Same, but memory reads that don't contain t (for moving a call into an expression that reads memory).
 fn sibling_reads(e: &Expr, t: VarId) -> bool {
+    // (an address taken, `&p->m`, reads only what computing `p` reads)
+    fn addr_part(lv: &Expr) -> Expr {
+        match lv {
+            Expr::Load { base, .. } => (**base).clone(),
+            Expr::Member { base, .. } => addr_part(base),
+            Expr::Index { base, index, .. } => Expr::bin(BinOp::Add, addr_part(base), (**index).clone(), mwdec_core::Type::Int { size: 4, signed: true }),
+            _ => Expr::int(0),
+        }
+    }
+    let mut e = e.clone();
+    e.rewrite(&mut |x| {
+        if let Expr::AddrOf(inner) = x {
+            *x = addr_part(inner);
+        }
+    });
+    // (arguments to the left of the one reading `t` are evaluated after it: MWCC evaluates a
+    // call's arguments right to left)
+    e.rewrite(&mut |x| {
+        if let Expr::Call { args, .. } = x {
+            if let Some(k) = args.iter().position(|a| a.uses_var(t)) {
+                for a in args.iter_mut().take(k) {
+                    *a = Expr::int(0);
+                }
+            }
+        }
+    });
     let mut r = false;
     e.walk(&mut |x| {
         if matches!(x, Expr::Load { .. } | Expr::Index { .. } | Expr::Global { .. }) && !x.uses_var(t) {

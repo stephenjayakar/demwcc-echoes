@@ -291,6 +291,119 @@ pub fn copy_temporaries(body: &mut Vec<Stmt>, dead: &mut Vec<DeadStackStore>, db
     });
 }
 
+/// A call's by-value class result passed on by value after a whole copy into a frame object
+/// nothing reads: `T v = f(); g(v);` (MWCC copies the result into `v`, then makes the argument
+/// copy from the result itself). `w = f(); ... g(w)` becomes `w = f(); v = w; ... g(v)` with
+/// `v` the frame object of the dead copy. Consumed dead stores are removed from `dead`.
+pub fn named_result_copies(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, dead: &mut Vec<DeadStackStore>, db: &TypeDb) {
+    if dead.is_empty() {
+        return;
+    }
+    // stack objects holding a call's result
+    let mut results: HashMap<VarId, usize> = HashMap::new();
+    Stmt::for_each_block_mut(&mut body.clone(), &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(w), src: Expr::Call { .. } } = s {
+                if matches!(vars[*w].kind, VarKind::Stack { .. }) {
+                    *results.entry(*w).or_default() += 1;
+                }
+            }
+        }
+    });
+    results.retain(|_, n| *n == 1);
+    if results.is_empty() {
+        return;
+    }
+    // the dead stores copying all of `w` (word by word, in order) to one frame object
+    let whole_copy = |w: VarId, size: u32, dead: &[DeadStackStore]| -> Option<(i32, Vec<usize>)> {
+        let parts: Vec<(usize, i32, i32)> = dead
+            .iter()
+            .enumerate()
+            .filter_map(|(k, d)| match strip_casts(&d.value) {
+                Expr::Member { base, offset, ty } if matches!(**base, Expr::Var(x) if x == w) && scalar_size(ty) == Some(d.size) => Some((k, d.offset, *offset)),
+                Expr::Var(x) if *x == w && d.size == size => Some((k, d.offset, 0)),
+                _ => None,
+            })
+            .collect();
+        let origin = parts.first().map(|p| p.1 - p.2)?;
+        let mut covered = 0u32;
+        let mut ks = vec![];
+        for &(k, off, member) in &parts {
+            if off - member != origin || member as u32 != covered {
+                return None;
+            }
+            covered += dead[k].size;
+            ks.push(k);
+        }
+        (covered == size).then_some((origin, ks))
+    };
+    let mut changes: Vec<(VarId, VarId, Type)> = vec![];
+    Stmt::walk_exprs(body, &mut |e| {
+        let Expr::Call { callee, args, .. } = e else { return };
+        let Some(sig) = call_params(callee) else { return };
+        for (n, a) in args.iter().enumerate() {
+            let (Some(p), Expr::Var(w)) = (sig.params.get(n), a) else { continue };
+            if !results.contains_key(w) || !is_byval(db, &p.ty) || changes.iter().any(|c| c.0 == *w) {
+                continue;
+            }
+            let t = strip_cv(&p.ty).clone();
+            let Some(size) = types::size_of(Some(db), &t).filter(|n| *n > 0) else { continue };
+            if !matches!(vars[*w].kind, VarKind::Stack { size: s, .. } if s == size) {
+                continue;
+            }
+            let Some((origin, ks)) = whole_copy(*w, size, dead) else { continue };
+            // the frame object at the copy's offset (a var the lifter made for one of its words)
+            let Some(v) = vars.iter().position(|x| matches!(x.kind, VarKind::Stack { offset, .. } if offset == origin)) else { continue };
+            if v == *w {
+                continue;
+            }
+            changes.push((*w, v, t));
+            let mut ks = ks;
+            ks.sort_unstable();
+            for k in ks.into_iter().rev() {
+                dead.remove(k);
+            }
+        }
+    });
+    for (w, v, t) in changes {
+        // (a frame object mentioned elsewhere is not just the copy)
+        if body.iter().any(|s| crate::idioms::stmt_mentions(s, v)) {
+            continue;
+        }
+        if let VarKind::Stack { size, .. } = &mut vars[v].kind {
+            *size = types::size_of(Some(db), &t).unwrap_or(*size);
+        }
+        vars[v].ty = t;
+        Stmt::for_each_block_mut(body, &mut |b| {
+            let mut i = 0;
+            while i < b.len() {
+                let mut uses = false;
+                if !matches!(&b[i], Stmt::Assign { dst: Expr::Var(x), .. } if *x == w) {
+                    Stmt::walk_exprs(std::slice::from_ref(&b[i]), &mut |e| {
+                        if let Expr::Call { args, .. } = e {
+                            uses |= args.iter().any(|a| matches!(a, Expr::Var(x) if *x == w));
+                        }
+                    });
+                }
+                if uses {
+                    Stmt::rewrite_exprs(std::slice::from_mut(&mut b[i]), &mut |e| {
+                        if let Expr::Call { args, .. } = e {
+                            for a in args.iter_mut() {
+                                if matches!(a, Expr::Var(x) if *x == w) {
+                                    *a = Expr::Var(v);
+                                }
+                            }
+                        }
+                    });
+                    b.insert(i, Stmt::Assign { dst: Expr::Var(v), src: Expr::Var(w) });
+                    return;
+                }
+                i += 1;
+            }
+        });
+    }
+}
+
 /// Forward by-value argument copies through stack temporaries.
 /// An object lvalue whose value can't have changed between a read and a later copy: a
 /// parameter (or reference parameter) or `this`'s member, or a global.
@@ -411,7 +524,7 @@ pub fn forward(body: &mut Vec<Stmt>, vars: &mut [Var], db: &TypeDb, dead: &[Dead
             // source declared before the call (`T id = x; f(id);`: the local's slot comes first),
             // kept as the object it is copied from
             if let VarKind::Stack { offset, size } = vars[v].kind {
-                if dead.iter().any(|d| d.offset > offset && d.offset <= offset + 16 && d.size == size && same_place(&d.value, &l)) {
+                if dead_object_above(dead, offset, size) {
                     drop_src.push(v);
                     continue;
                 }

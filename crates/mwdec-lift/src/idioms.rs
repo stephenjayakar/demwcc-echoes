@@ -411,11 +411,19 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
     // local's slot first, the argument copy below), or a method's receiver with a dead store
     // just below (`T d = GetX(); d.F();`, the inline's returned temporary below the local)
     let mut receivers: HashSet<VarId> = HashSet::new();
+    let mut byval_args: HashSet<VarId> = HashSet::new();
     Stmt::walk_exprs(&ir.body, &mut |e| {
-        if let Expr::Call { callee: Callee::Method { this, .. }, .. } = e {
-            if let Expr::AddrOf(x) = &**this {
-                if let Expr::Var(v) = **x {
-                    receivers.insert(v);
+        if let Expr::Call { callee, args, .. } = e {
+            if let Callee::Method { this, .. } = callee {
+                if let Expr::AddrOf(x) = &**this {
+                    if let Expr::Var(v) = **x {
+                        receivers.insert(v);
+                    }
+                }
+            }
+            for a in args {
+                if let Expr::Var(v) = a {
+                    byval_args.insert(*v);
                 }
             }
         }
@@ -425,9 +433,9 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
         .enumerate()
         .map(|(n, v)| match v.kind {
             VarKind::Stack { offset, size } if named(&v.ty).is_some() => {
-                let above = ir.dead_stores.iter().any(|d| d.offset > offset && d.offset <= offset + 16 && d.size == size);
+                let above = dead_object_above(&ir.dead_stores, offset, size);
                 let below = ir.dead_stores.iter().any(|d| d.offset < offset && d.offset >= offset - size as i32 && d.offset + d.size as i32 <= offset);
-                if (above && !receivers.contains(&n)) || (below && receivers.contains(&n)) {
+                if (above && byval_args.contains(&n) && !receivers.contains(&n)) || (below && receivers.contains(&n)) {
                     Var { kind: VarKind::Local, ..v.clone() }
                 } else {
                     v.clone()
@@ -490,6 +498,20 @@ pub fn narrow_float_stores(ir: &mut IrFunction, db: Option<&TypeDb>) {
             }
         }
     }
+    // the same for a char/short parameter: the argument converts by the parameter's type
+    Stmt::rewrite_exprs(&mut ir.body, &mut |e| {
+        let Expr::Call { callee, args, .. } = e else { return };
+        let (params, skip) = match callee {
+            Callee::Direct { sig, .. } => (sig.params.clone(), usize::from(sig.this_class.is_some() && !sig.is_static)),
+            Callee::Method { sig, .. } => (sig.params.clone(), 0),
+            _ => return,
+        };
+        for (k, a) in args.iter_mut().enumerate() {
+            if k >= skip && params.get(k - skip).is_some_and(|p| narrow(&p.ty)) {
+                unwrap(a);
+            }
+        }
+    });
 }
 
 /// Scalar leaf members of a class in layout order: (offset, type).
@@ -2220,6 +2242,33 @@ fn forward_breaks_layout(v: VarId, s: &Stmt, vars: &[Var], folded: &[(Type, i32,
     breaks
 }
 
+/// `v = f(); *p = v;` with `v` a frame object mentioned nowhere else -> `*p = f();` (the result
+/// assigned to an object outside the frame: an operator's result folding left in a temporary).
+/// Copies into other frame objects stay (`T w = f();` keeps its own copy).
+pub fn forward_results_into_assignments(body: &mut Vec<Stmt>, vars: &[Var]) {
+    let mut counts: HashMap<VarId, usize> = HashMap::new();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *counts.entry(*v).or_default() += 1;
+        }
+    });
+    let frame = |e: &Expr| matches!(e, Expr::Var(w) if matches!(vars[*w].kind, VarKind::Stack { .. }));
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            if let (Stmt::Assign { dst: Expr::Var(v), src }, Stmt::Assign { dst, src: Expr::Var(v2) }) = (&b[i], &b[i + 1]) {
+                if v == v2 && matches!(vars[*v].kind, VarKind::Stack { .. }) && !matches!(vars[*v].ty, Type::Ref(_)) && counts.get(v) == Some(&2) && src.has_call() && !src.uses_var(*v) && !dst.uses_var(*v) && !frame(dst) && !matches!(dst, Expr::Member { base, .. } if frame(base)) {
+                    let (dst, src) = (dst.clone(), src.clone());
+                    b[i + 1] = Stmt::Assign { dst, src };
+                    b.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    });
+}
+
 /// `T v = f(); g(v);` (v a stack object used once) -> `g(f());`: MWCC copies a returned object
 /// into a named local but builds a temporary in place. Returns the call results kept apart
 /// because forwarding them would change the frame layout ([`forward_breaks_layout`]).
@@ -2329,7 +2378,8 @@ pub fn forward_stack_objects(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&Typ
                 }
             }
             let cand = match &b[i] {
-                Stmt::Assign { dst: Expr::Var(v), src } if counts.get(v) == Some(&2) && !src.uses_var(*v) && !matches!(src, Expr::Var(w) if matches!(vars[*w].kind, VarKind::Stack { .. })) => Some((*v, src.clone())),
+                // (a frame temporary already bound to a reference stays: see the `kept` below)
+                Stmt::Assign { dst: Expr::Var(v), src } if counts.get(v) == Some(&2) && !src.uses_var(*v) && !matches!(vars[*v].ty, Type::Ref(_)) && !matches!(src, Expr::Var(w) if matches!(vars[*w].kind, VarKind::Stack { .. })) => Some((*v, src.clone())),
                 _ => None,
             };
             // a narrower value stored than read back (`u8` written, the word read): no forwarding

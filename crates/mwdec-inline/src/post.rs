@@ -118,8 +118,19 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var], dead: &[mwdec_lif
     let counts = mentions_body(body);
     // a by-value argument copy with the same value stored, dead, just above it: the copy of a
     // named local the source declared before the call (`T id = f(); g(id);`), not a temporary
+    // (only objects passed by value: a bare variable argument)
+    let mut byval_args: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Call { args, .. } = e {
+            for a in args {
+                if let Expr::Var(v) = a {
+                    byval_args.insert(*v);
+                }
+            }
+        }
+    });
     let named_copy = |v: VarId| match vars[v].kind {
-        VarKind::Stack { offset, size } => dead.iter().any(|d| d.offset > offset && d.offset <= offset + 16 && d.size == size),
+        VarKind::Stack { offset, size } => byval_args.contains(&v) && mwdec_lift::dead_object_above(dead, offset, size),
         _ => false,
     };
     let mut n = 0;
