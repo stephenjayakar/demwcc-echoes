@@ -439,6 +439,15 @@ impl<'a, 'e> M<'a, 'e> {
                     return self.m(inner, t);
                 }
             }
+            // a pointer stepped by a constant (`p + 1` for a byte pointer): `&p[k]` one way, a sum
+            // the other
+            if let Some((pb, pk)) = ptr_step(p) {
+                if let Some((tb, tk)) = ptr_step(t) {
+                    if pk == tk && !matches!((p, t), (Expr::Binary { .. }, Expr::Binary { .. })) {
+                        return self.m(pb, tb);
+                    }
+                }
+            }
             // a pointer read as a word (`(unsigned int)p == 0`: the lifter's view of `cmplwi`)
             if let Expr::Cast { ty, e: inner } = t {
                 if matches!(strip(ty), Type::Int { size: 4, .. }) && !matches!(p, Expr::Cast { .. }) && vclass(&ty_of(res(inner, defs), self.env.vars), self.env.db) == 2 {
@@ -726,6 +735,16 @@ impl<'a, 'e> M<'a, 'e> {
                     };
                     if let Some(z) = zero {
                         out.push(z);
+                        continue;
+                    }
+                }
+            }
+            // a tag object the expansion never reads (`basic_string(literal_t(), s)`): an empty
+            // class's temporary
+            if self.b[h].is_none() {
+                if let HoleKind::Obj { class, ptr: false, temp_ok: true } = k {
+                    if crate::template::flat_fields(self.env.db, class).is_some_and(|f| f.is_empty()) {
+                        out.push(Expr::Construct { class: Type::Named(class.clone()), ctor: None, args: vec![] });
                         continue;
                     }
                 }
@@ -2961,6 +2980,27 @@ fn linear_index(e: &Expr, scale: i64, terms: &mut Vec<(Expr, i64)>, c: &mut i64,
         _ => terms.push((e.clone(), scale)),
     }
     true
+}
+
+/// `p` stepped by `k` bytes: `&p->(k)` of an untyped member, `(T*)(p + k)` with a byte step.
+fn ptr_step(e: &Expr) -> Option<(&Expr, i64)> {
+    let e = match e {
+        Expr::Cast { ty, e } if matches!(strip(ty), Type::Ptr(_)) => &**e,
+        e => e,
+    };
+    match e {
+        Expr::AddrOf(x) => match &**x {
+            Expr::Load { base, offset, ty: Type::Unknown { size: 0 } } => Some((&**base, *offset as i64)),
+            Expr::Index { base, index, ty: Type::Int { size: 1, .. } } => match (&**base, index.as_int()) {
+                (Expr::Cast { e: b, .. }, Some(k)) => Some((&**b, k)),
+                (b, Some(k)) => Some((b, k)),
+                _ => None,
+            },
+            _ => None,
+        },
+        Expr::Binary { op: BinOp::Add, l, r, .. } => r.as_int().map(|k| (&**l, k)),
+        _ => None,
+    }
 }
 
 fn ok_lvalue(e: &Expr) -> bool {

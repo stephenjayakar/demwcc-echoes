@@ -1234,6 +1234,70 @@ impl<'a> Em<'a> {
 
     /// Globals the context lacks that are only read and written as scalar members (not just the
     /// one at offset 0; never by address): a stand-in struct with one member per offset.
+    /// `m = __rlwimi(m, v, sh, mb, me)` on a byte / halfword `m` in memory inserting one field
+    /// (C++ units):
+    /// the low bits of `v`, or (one bit taken from the sign of `-x | x`) `x != 0`. Returns the
+    /// stand-in bitfield type (declared in the preamble) and the assigned value.
+    fn bitfield_insert(&mut self, dst: &Expr, src: &Expr) -> Option<(String, Expr)> {
+        // (C units: the SDK writes register fields with the intrinsic itself)
+        if self.opts.c_mode {
+            return None;
+        }
+        if !matches!(dst, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. }) {
+            return None;
+        }
+        let strip = |e: &Expr| -> Expr {
+            match e {
+                Expr::Cast { e, .. } => (**e).clone(),
+                e => e.clone(),
+            }
+        };
+        let Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } = strip(src) else { return None };
+        if symbol != "__rlwimi" || args.len() != 5 || strip(&args[0]) != *dst {
+            return None;
+        }
+        let (sh, mb, me) = (args[2].as_int()?, args[3].as_int()?, args[4].as_int()?);
+        let size = match strip_cv(&ty_of(dst, self.vars())) {
+            Type::Int { size, .. } if *size <= 2 => *size as i64,
+            Type::Bool | Type::Char => 1,
+            _ => return None,
+        };
+        let lo = 32 - 8 * size;
+        if mb > me || mb < lo {
+            return None;
+        }
+        let w = me - mb + 1;
+        let v = strip(&args[1]);
+        let value = if sh == 31 - me {
+            v
+        } else if w == 1 && sh == (32 - me) % 32 {
+            // `-x | x`: its sign bit is `x != 0`
+            let Expr::Binary { op: BinOp::Or, l, r, .. } = &v else { return None };
+            let neg_of = |n: &Expr, x: &Expr| matches!(strip(n), Expr::Unary { op: UnOp::Neg, e, .. } if strip(&e) == strip(x));
+            let x = if neg_of(l, r) { strip(r) } else if neg_of(r, l) { strip(l) } else { return None };
+            Expr::cmp(BinOp::Ne, x, Expr::int(0))
+        } else {
+            return None;
+        };
+        let off = mb - lo;
+        let after = 8 * size - off - w;
+        let ct = if size == 1 { "unsigned char" } else { "unsigned short" };
+        let name = format!("mwdec_bf{size}_{off}_{w}");
+        let mut fields = vec![];
+        if off > 0 {
+            fields.push(format!("{ct} a : {off};"));
+        }
+        fields.push(format!("{ct} f : {w};"));
+        if after > 0 {
+            fields.push(format!("{ct} b : {after};"));
+        }
+        let def = format!("typedef struct {{ {} }} {name};", fields.join(" "));
+        if !self.type_defs.contains(&def) {
+            self.type_defs.push(def);
+        }
+        Some((name, value))
+    }
+
     fn collect_global_structs(&mut self) {
         // (ordered: the stand-ins are emitted in this order, and drafts must be deterministic)
         let mut fields: std::collections::BTreeMap<String, std::collections::BTreeMap<i32, Vec<Type>>> = Default::default();
@@ -1594,6 +1658,15 @@ impl<'a> Em<'a> {
                 }
                 let dt = if matches!(dst, Expr::Var(_)) { local_type(&self.decl_type_rw(dst, false)) } else { self.decl_type_rw(dst, false) };
                 let d = self.lvalue(dst);
+                // a field of a byte / halfword inserted with `__rlwimi` (no bitfield declared for
+                // it): assigned through a bitfield of the same layout, which the compiler builds
+                // like the source did (the containing byte loaded into r0, the value inserted
+                // into it), where the intrinsic call allocates its own registers
+                if let Some((tname, value)) = self.bitfield_insert(dst, src) {
+                    let v = self.expr(&value, 0);
+                    let _ = writeln!(self.out, "{ind}(({tname}*)&{d})->f = {v};");
+                    return;
+                }
                 // `m = (e + m) + k` (`add t, e, m; addi t, t, k`): the compiler builds that from
                 // `m += e + k` (it computes `m + (e + k)` as `(e + m) + k`, while `e + m + k`
                 // becomes `e + (m + k)`, the constant added first)

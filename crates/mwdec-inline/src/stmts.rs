@@ -32,6 +32,8 @@ fn rename_stmts(b: &[Stmt], map: &HashMap<VarId, usize>) -> Option<Vec<Stmt>> {
             Stmt::Assign { dst, src } => Stmt::Assign { dst: rename(dst, map)?, src: rename(src, map)? },
             Stmt::Expr(e) => Stmt::Expr(rename(e, map)?),
             Stmt::If { cond, then, els } => Stmt::If { cond: rename(cond, map)?, then: rename_stmts(then, map)?, els: rename_stmts(els, map)? },
+            Stmt::While { cond, body } => Stmt::While { cond: rename(cond, map)?, body: rename_stmts(body, map)? },
+            Stmt::DoWhile { body, cond } => Stmt::DoWhile { body: rename_stmts(body, map)?, cond: rename(cond, map)? },
             Stmt::Comment(_) => continue,
             _ => return None,
         });
@@ -44,6 +46,7 @@ fn has_effect(b: &[Stmt]) -> bool {
         Stmt::Assign { dst, src } => !matches!(dst, Expr::Var(_)) || src.has_call(),
         Stmt::Expr(_) => true,
         Stmt::If { then, els, .. } => has_effect(then) || has_effect(els),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => has_effect(body),
         _ => false,
     })
 }
@@ -299,6 +302,15 @@ fn match_stmt(m: &mut M, p: &Stmt, t: &Stmt) -> bool {
                 m.b = snap;
                 m.m(p, &Expr::AddrOf(Box::new(t.clone())))
             })
+        }
+        // a loop of the inline (a constructor counting its input): the same loop
+        (Stmt::While { cond, body }, Stmt::While { cond: c2, body: b2 }) | (Stmt::DoWhile { body, cond }, Stmt::DoWhile { body: b2, cond: c2 }) if std::mem::discriminant(p) == std::mem::discriminant(t) => {
+            let snap = m.b.clone();
+            if match_seq(m, body, b2, 0) == Some(b2.len()) && m.m(cond, c2) {
+                return true;
+            }
+            m.b = snap;
+            false
         }
         (Stmt::If { cond, then, els }, Stmt::If { cond: c2, .. }) => {
             let mut tt = vec![t.clone()];
@@ -672,6 +684,15 @@ fn try_ctor_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, t: &Templ
         }
     }
     let mut m = M::new(env, t);
+    if std::env::var("MWDI_TRACE_CTOR").is_ok_and(|f| t.name.contains(f.as_str())) && b.len() > i {
+        let mut m2 = M::new(env, t);
+        let mut k = 0;
+        while k < stmts.len() && i + k < b.len() && match_stmt(&mut m2, &stmts[k], &b[i + k]) {
+            k += 1;
+        }
+        eprintln!("CTOR {} at {i}: {k} of {}; next {:?}
+  vs {:?}", t.name, stmts.len(), stmts.get(k), b.get(i + k));
+    }
     // as is first, then with the copy split
     let (exp, back, end) = match match_seq(&mut m, stmts, b, i) {
         Some(e) => (b.clone(), (0..b.len()).collect::<Vec<_>>(), e),

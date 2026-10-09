@@ -143,6 +143,8 @@ enum SStmt {
     Assign(SExpr, SExpr),
     Expr(SExpr),
     If(SExpr, Vec<SStmt>, Vec<SStmt>),
+    While(SExpr, Vec<SStmt>),
+    DoWhile(Vec<SStmt>, SExpr),
 }
 
 fn ss(s: &Stmt) -> Option<SStmt> {
@@ -150,6 +152,8 @@ fn ss(s: &Stmt) -> Option<SStmt> {
         Stmt::Assign { dst, src } => SStmt::Assign(se(dst), se(src)),
         Stmt::Expr(e) => SStmt::Expr(se(e)),
         Stmt::If { cond, then, els } => SStmt::If(se(cond), then.iter().map(ss).collect::<Option<_>>()?, els.iter().map(ss).collect::<Option<_>>()?),
+        Stmt::While { cond, body } => SStmt::While(se(cond), body.iter().map(ss).collect::<Option<_>>()?),
+        Stmt::DoWhile { body, cond } => SStmt::DoWhile(body.iter().map(ss).collect::<Option<_>>()?, se(cond)),
         _ => return None,
     })
 }
@@ -159,6 +163,8 @@ fn ds(s: &SStmt) -> Stmt {
         SStmt::Assign(d, s) => Stmt::Assign { dst: de(d), src: de(s) },
         SStmt::Expr(e) => Stmt::Expr(de(e)),
         SStmt::If(c, t, e) => Stmt::If { cond: de(c), then: t.iter().map(ds).collect(), els: e.iter().map(ds).collect() },
+        SStmt::While(c, b) => Stmt::While { cond: de(c), body: b.iter().map(ds).collect() },
+        SStmt::DoWhile(b, c) => Stmt::DoWhile { body: b.iter().map(ds).collect(), cond: de(c) },
     }
 }
 

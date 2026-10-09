@@ -253,6 +253,9 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
     for (qname, class, last, d, fn_template) in work_list(db) {
         let last = last.as_str();
         let d = &d;
+        if std::env::var("MWDI_TRACE_PROBE").is_ok_and(|f| qname.contains(f.as_str())) {
+            eprintln!("PROBE {qname} class {class:?} params {:?} inline {} body {:?}", d.params.iter().map(|p| &p.ty).collect::<Vec<_>>(), d.is_inline_defined, d.inline_body);
+        }
         {
             if !d.is_inline_defined || d.variadic || d.is_virtual {
                 continue;
@@ -265,7 +268,14 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
                 continue;
             }
             // loops never fold into one value, and their instantiations are the ones that fail
-            if d.inline_body.as_deref().map_or(false, |b| b.split_whitespace().any(|t| matches!(t, "for" | "while" | "do" | "goto"))) {
+            // (a constructor's loop is a statement template building its object in place:
+            // `basic_string(literal_t, const char*)` counting the length)
+            let ctor_like = class.as_deref().is_some_and(|c| {
+                let own = mwdec_lift::sig::split_scope(c).1;
+                own == last || own.split('<').next() == Some(last)
+            });
+            let loop_ok = ctor_like && std::env::var_os("MWDI_NO_LOOP_CTORS").is_none();
+            if d.inline_body.as_deref().map_or(false, |b| b.split_whitespace().any(|t| matches!(t, "for" | "while" | "do" | "goto") && !(loop_ok && t != "goto"))) {
                 continue;
             }
             // constructors of class template instances with stream or count parameters
