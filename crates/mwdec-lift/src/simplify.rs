@@ -1069,12 +1069,13 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                     Stmt::Assign { dst: Expr::Var(c), src } => (*c, src.clone()),
                     _ => unreachable!(),
                 };
+                // (a signed `n == 0` guard may be the test of `i != n` (variant); else `i < n` unsigned)
                 let signed = match &g {
-                    Expr::Binary { op: BinOp::Le, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(!unsigned_cast(l)),
-                    Expr::Binary { op: BinOp::Eq, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(false),
+                    Expr::Binary { op: BinOp::Le, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some((!unsigned_cast(l), false)),
+                    Expr::Binary { op: BinOp::Eq, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(if !unsigned_cast(l) && crate::variants::alt(crate::variants::LOOP_NE_COUNT) { (true, true) } else { (false, false) }),
                     _ => None,
                 };
-                let Some(signed) = signed else {
+                let Some((signed, ne)) = signed else {
                     j += 1;
                     continue;
                 };
@@ -1130,7 +1131,7 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                 let cmp_n = if signed { n.clone() } else { Expr::cast(ty.clone(), n.clone()) };
                 b[j] = Stmt::For {
                     init: vec![Stmt::Assign { dst: Expr::Var(i), src: Expr::Int { value: 0, ty: ty.clone() } }],
-                    cond: Expr::cmp(BinOp::Lt, Expr::Var(i), cmp_n),
+                    cond: Expr::cmp(if ne { BinOp::Ne } else { BinOp::Lt }, Expr::Var(i), cmp_n),
                     step: vec![Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(i)), delta: 1, post: true })],
                     body: lb2,
                 };
@@ -1153,7 +1154,7 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
     }
     let mut uses: HashMap<VarId, usize> = HashMap::new();
     crate::inline::count_uses(body, &mut uses);
-    let mut todo: Vec<(VarId, Expr, bool, i64)> = vec![];
+    let mut todo: Vec<(VarId, Expr, bool, i64, bool)> = vec![];
     // find candidates first (immutable walk), then rewrite with fresh vars
     // temps holding `n - k`
     let mut minus: HashMap<VarId, i64> = HashMap::new();
@@ -1169,7 +1170,7 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
             }
         }
     });
-    fn scan(b: &[Stmt], vars: &[Var], uses: &HashMap<VarId, usize>, minus: &HashMap<VarId, i64>, out: &mut Vec<(VarId, Expr, bool, i64)>) {
+    fn scan(b: &[Stmt], vars: &[Var], uses: &HashMap<VarId, usize>, minus: &HashMap<VarId, i64>, out: &mut Vec<(VarId, Expr, bool, i64, bool)>) {
         for (k, s) in b.iter().enumerate() {
             if let Stmt::If { cond, then, els } = s {
                 if els.is_empty() && then.len() == 1 {
@@ -1189,12 +1190,12 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                                         _ => (n, 1),
                                     };
                                     let signed = match cond {
-                                        Expr::Binary { op: BinOp::Gt, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(!unsigned_cast(l)),
-                                        Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(false),
+                                        Expr::Binary { op: BinOp::Gt, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some((!unsigned_cast(l), false)),
+                                        Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) && uncast(l) == uncast(&n) => Some(if !unsigned_cast(l) && step == 1 && crate::variants::alt(crate::variants::LOOP_NE_COUNT) { (true, true) } else { (false, false) }),
                                         _ => None,
                                     };
-                                    if let Some(sg) = signed {
-                                        out.push((c, n, sg, step));
+                                    if let Some((sg, ne)) = signed {
+                                        out.push((c, n, sg, step, ne));
                                     }
                                 }
                             }
@@ -1216,7 +1217,7 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
         }
     }
     scan(body, vars, &uses, &minus, &mut todo);
-    for (c, n, signed, step) in todo {
+    for (c, n, signed, step, ne) in todo {
         let i = vars.len();
         vars.push(Var { name: "i".into(), ty: Type::Int { size: 4, signed }, kind: VarKind::Local });
         is_temp.push(false);
@@ -1232,7 +1233,7 @@ fn recover_counted_ctr_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp:
                     let cmp_n = if signed { n.clone() } else { Expr::cast(ty.clone(), n.clone()) };
                     let f = Stmt::For {
                         init: vec![Stmt::Assign { dst: Expr::Var(i), src: Expr::Int { value: 0, ty: ty.clone() } }],
-                        cond: Expr::cmp(BinOp::Lt, Expr::Var(i), cmp_n),
+                        cond: Expr::cmp(if ne { BinOp::Ne } else { BinOp::Lt }, Expr::Var(i), cmp_n),
                         step: vec![if step == 1 {
                             Stmt::Expr(Expr::IncDec { e: Box::new(Expr::Var(i)), delta: 1, post: true })
                         } else {

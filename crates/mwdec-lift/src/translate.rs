@@ -3848,6 +3848,11 @@ impl<'a> Lifter<'a> {
                 let (a, v) = if i.ra() == 1 {
                     let v = self.stack_addr(imm as i32);
                     (v.clone(), v)
+                } else if let Some(r) = i.reloc.clone().filter(|r| matches!(r.kind, RelocKind::Addr16Lo | RelocKind::EmbSda21)) {
+                    // `lis rX, s@ha; addic. rD, rX, s@l`: a global's address, tested (inlined
+                    // placement new into static storage)
+                    let v = self.sym_addr(&r.target, r.addend);
+                    (v.clone(), v)
                 } else {
                     let a = self.get(st, gpr(i.ra()));
                     let v = arith(BinOp::Add, a.clone(), Expr::int(imm), &self.vars);

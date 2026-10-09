@@ -1654,12 +1654,13 @@ impl<'a> Structurer<'a> {
                     split(&*pred, &mut ts, &mut fs);
                 }
             }
-            if !ts.is_empty() {
-                work.push((taken, ts));
+            // a test that doesn't split its values (the same compare again, as a destructor's own
+            // `if (this)` after the caller's test) is no tree node of MWCC's
+            if ts.is_empty() || fs.is_empty() {
+                return None;
             }
-            if !fs.is_empty() {
-                work.push((fall, fs));
-            }
+            work.push((taken, ts));
+            work.push((fall, fs));
         }
         let tree_nodes = nodes.iter().filter(|&&n| self.cond_edges(n).is_some() || matches!(self.cfg.blocks[n].term, Term::CondReturn { .. })).count();
         if tree_nodes < 2 && self.insns.is_empty() {
@@ -2262,7 +2263,8 @@ pub fn offset_ctr_loops(body: &mut Vec<Stmt>, vars: &[Var]) {
 }
 
 /// A CTR loop whose body breaks out: `ctr = n; if (n > 0) { while (1) { if (c) { B; ctr--; if
-/// (ctr != 0) continue; } break; } }` is `for (i = 0; i < n; i++) { if (!c) break; B }`.
+/// (ctr != 0) continue; } else { X } break; } }` is `for (i = 0; i < n; i++) { if (!c) { X;
+/// break; } B }` (likewise with the arms the other way round).
 pub fn ctr_break_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) {
     let mut new_vars: Vec<Var> = vec![];
     let base = vars.len();
@@ -2282,10 +2284,17 @@ pub fn ctr_break_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut 
                     return None;
                 }
                 let [Stmt::While { cond: Expr::Int { value: 1, .. }, body: lb }] = then.as_slice() else { return None };
-                let [Stmt::If { cond: c, then: t, els: e }, Stmt::Break] = lb.as_slice() else { return None };
-                if !e.is_empty() || t.len() < 2 {
+                let [Stmt::If { cond: c, then: t0, els: e0 }, Stmt::Break] = lb.as_slice() else { return None };
+                // the arm that stays in the loop ends `ctr--; if (ctr != 0) continue;`; the other
+                // arm (`X`, maybe empty) leaves it: `if (exit) { X; break; }`
+                let stays = |a: &[Stmt]| a.len() >= 2 && matches!(a.last(), Some(Stmt::If { then, els, .. }) if then.as_slice() == [Stmt::Continue] && els.is_empty());
+                let (t, x, exit) = if stays(t0) {
+                    (t0, e0, c.clone().negate(vars_ro))
+                } else if stays(e0) {
+                    (e0, t0, c.clone())
+                } else {
                     return None;
-                }
+                };
                 let n = t.len();
                 let Stmt::If { cond: lc, then: lt, els: le } = &t[n - 1] else { return None };
                 if lt.as_slice() != [Stmt::Continue] || !le.is_empty() {
@@ -2310,7 +2319,9 @@ pub fn ctr_break_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut 
                     Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) && strip_casts((**l).clone()) == strip_casts(count.clone()) => false,
                     _ => return None,
                 };
-                let mut inner = vec![Stmt::If { cond: c.clone().negate(vars_ro), then: vec![Stmt::Break], els: vec![] }];
+                let mut leave = x.clone();
+                leave.push(Stmt::Break);
+                let mut inner = vec![Stmt::If { cond: exit, then: leave, els: vec![] }];
                 inner.extend(t[..n - 2].iter().cloned());
                 Some((ip, count.clone(), signed, inner))
             })();

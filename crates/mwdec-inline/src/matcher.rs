@@ -1147,6 +1147,9 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         crate::defctor::inline_destructor_tests(&mut ir.body);
         // (a destructor folded only now anchors a default-constructed local)
         crate::defctor::default_locals(ir, db, &lib.default_ctors);
+        // temporaries whose construction only folding made one expression (`f(T(a, b))`)
+        let vars = ir.vars.clone();
+        mwdec_lift::idioms::constructed_arg_temporaries(&mut ir.body, &vars);
         crate::post::fold_flag_chains(&mut ir.body, &ir.vars);
     }
     crate::stmtinl::finish(ir);

@@ -44,6 +44,11 @@ pub fn constructs_into_param0(ir: &IrFunction) -> bool {
         return false;
     }
     let Some(&p0) = ir.params.first() else { return false };
+    // a declared `void*` first parameter constructed into is a placement destination
+    // (`new (p) T(src)`), not a hidden return pointer
+    if ir.sig.params.first().is_some_and(|p| matches!(strip_cv(&p.ty), Type::Ptr(x) if matches!(strip_cv(x), Type::Void))) {
+        return false;
+    }
     let p0_class = named(&ir.vars[p0].ty).map(sig::norm_name).or_else(|| pointee(&ir.vars[p0].ty).and_then(named).map(sig::norm_name));
     let mut found = false;
     // a store through a pointer/reference-to-const first parameter: C++ can't write there, so
@@ -739,6 +744,11 @@ fn fold_new(body: &mut Vec<Stmt>, _vars: &[Var]) {
                 {
                     Some((*t, args.iter().skip(1).cloned().collect::<Vec<_>>()))
                 }
+                // the inline placement `operator new(size_t, void*)`: the address itself, then
+                // the constructor behind its null test (`new (&storage) T(args)`)
+                Stmt::Assign { dst: Expr::Var(t), src: a @ (Expr::AddrOf(_) | Expr::Cast { .. } | Expr::Binary { .. }) } if !a.has_call() && matches!(_vars[*t].kind, VarKind::Local) && matches!(b.get(i + 1), Some(Stmt::If { .. })) => {
+                    Some((*t, vec![a.clone()]))
+                }
                 _ => None,
             }) else {
                 i += 1;
@@ -764,7 +774,7 @@ fn fold_new(body: &mut Vec<Stmt>, _vars: &[Var]) {
                     };
                     let ctor = match then.first() {
                         Some(Stmt::Expr(Expr::Call { callee: Callee::Method { sig: s, this, .. }, args, .. }))
-                            if sig::is_ctor(s) && matches!(&**this, Expr::Var(x) if *x == t || *x == v) =>
+                            if sig::is_ctor(s) && matches!(match &**this { Expr::Cast { e, .. } => &**e, x => x }, Expr::Var(x) if *x == t || *x == v) =>
                         {
                             Some((s.clone(), args.clone()))
                         }
@@ -1888,7 +1898,7 @@ fn base_destructor_calls(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
 /// `T::T(&t, args); f(..., &t, ...); T::~T(&t, -1);` with `t` a frame object passed by
 /// reference and mentioned nowhere else: the temporary `f(..., T(args), ...)` (destroyed at the
 /// end of the full expression, right after the call).
-fn constructed_arg_temporaries(body: &mut Vec<Stmt>, vars: &[Var]) {
+pub fn constructed_arg_temporaries(body: &mut Vec<Stmt>, vars: &[Var]) {
     let snapshot = body.clone();
     let total = |v: VarId| -> usize { snapshot.iter().map(|s| mentions(s, v)).sum() };
     let on = |e: &Expr| -> Option<VarId> {

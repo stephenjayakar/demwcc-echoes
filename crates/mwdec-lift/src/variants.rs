@@ -42,6 +42,9 @@ pub const REREAD_TEMPS: &str = "temps.reread";
 /// An address computed before a branch and used only in its arms spelled again at each use
 /// (by default it is a local assigned before the branch).
 pub const ARMS_ADDRESS_INLINE: &str = "temps.arms_address_inline";
+/// A counted loop entered under a signed `n != 0` guard counts `for (i = 0; i != n; i++)`
+/// (by default `for (i = 0; i < (unsigned)n; i++)`).
+pub const LOOP_NE_COUNT: &str = "loops.ne_count";
 /// Runs of one constant stored to consecutive array elements (`a[0] = 1; a[1] = 1;`, MWCC's full
 /// unroll of a small constant loop) rerolled into `for (i = 0; i < n; i++) a[i] = 1;`.
 pub const REROLL_CONST_STORES: &str = "unroll.const_stores";
@@ -149,6 +152,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (REROLL_CONST_STORES, "runs of one constant stored to consecutive array elements become a for loop"),
     (REROLL_CONST_STORES_EARLY, "the same, the loop moved before the constant stores right before it"),
     (REREAD_TEMPS, "single-assignment locals of pure memory reads are re-read where they are used"),
+    (LOOP_NE_COUNT, "a counted loop under a signed `n != 0` guard tests `i != n`"),
     (ARMS_ADDRESS_INLINE, "an address computed before a branch and read only in its arms is spelled at each use"),
     (STRUCTCOPY_WORDS_LL, "a run of word copies between two objects becomes 64-bit copies (one per word pair)"),
     (STRUCTCOPY_WORDS_BLOCK, "a run of word copies between two objects becomes one block copy (helper struct)"),
