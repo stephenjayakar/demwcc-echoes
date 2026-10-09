@@ -532,6 +532,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     frameobj::conditional_temporaries(&mut ir);
     frameobj::derived_temporary_args(&mut ir, db);
     frameobj::scope_guards(&mut ir, db);
+    frameobj::returned_frame_object(&mut ir, db);
     frameobj::frame_object_copied_back(&mut ir, db);
     frameobj::fold_block_copies(&mut ir, db);
     frameobj::whole_object_copies(&mut ir, db);

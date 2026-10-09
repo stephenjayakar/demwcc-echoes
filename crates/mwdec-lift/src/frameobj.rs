@@ -1553,3 +1553,164 @@ pub fn scope_guards(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
         d.order = n;
     }
 }
+
+/// The struct return filled member by member at the end, each member read from a frame slot
+/// of one frame object (`&result.mCardSize` passed to a call) or taken from a register whose
+/// value a dead store into that object's slot holds: a named local of the returned class,
+/// `R result; result.m = f(&result.n); return result;` (no return-value optimization).
+pub fn returned_frame_object(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return };
+    let Some(cls) = pointee(&ir.vars[sret].ty).and_then(|t| named(&crate::types::resolve(Some(db), t)).map(|s| s.to_string())) else { return };
+    let mut fields = vec![];
+    if !crate::idioms::flat_fields(db, &cls, 0, &mut fields, 0) || fields.len() < 2 || fields.len() > 8 {
+        return;
+    }
+    let Some(size) = crate::types::size_of(Some(db), &Type::Named(cls.clone())) else { return };
+    let body = &ir.body;
+    let mut end = body.len();
+    if matches!(body.last(), Some(Stmt::Return(None))) {
+        end -= 1;
+    }
+    // the trailing member stores
+    let mut stores: Vec<(usize, i32, Type, Expr)> = vec![];
+    let mut k = end;
+    while k > 0 {
+        match &body[k - 1] {
+            Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if matches!(**base, Expr::Var(v) if v == sret) => {
+                stores.push((k - 1, *offset, ty.clone(), src.clone()));
+                k -= 1;
+            }
+            Stmt::Assign { dst: Expr::Var(_), src } if !src.has_call() => k -= 1,
+            _ => break,
+        }
+    }
+    if stores.len() != fields.len() || !fields.iter().all(|(o, _)| stores.iter().filter(|s| s.1 == *o).count() == 1) {
+        return;
+    }
+    let vars = ir.vars.clone();
+    let mut uses: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let def_of = |t: VarId| -> Option<(usize, Expr)> {
+        let ds: Vec<(usize, &Expr)> = body.iter().enumerate().filter_map(|(i, s)| match s {
+            Stmt::Assign { dst: Expr::Var(x), src } if *x == t => Some((i, src)),
+            _ => None,
+        }).collect();
+        match ds.as_slice() {
+            [(i, e)] => Some((*i, (*e).clone())),
+            _ => None,
+        }
+    };
+    let slot_of = |e: &Expr| -> Option<VarId> {
+        let v = match strip_casts(e) {
+            Expr::Var(v) => *v,
+            Expr::Member { base, offset: 0, .. } => match **base {
+                Expr::Var(v) => v,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        matches!(vars[v].kind, VarKind::Stack { .. }).then_some(v)
+    };
+    let off_of = |v: VarId| match vars[v].kind {
+        VarKind::Stack { offset, .. } => offset,
+        _ => i32::MIN,
+    };
+    // classify: (field offset, slot local) or (field offset, dead store index)
+    let mut slots: Vec<(i32, VarId, Option<usize>)> = vec![];
+    let mut deads: Vec<(i32, usize)> = vec![];
+    let mut base: Option<i32> = None;
+    let field_size = |off: i32| fields.iter().find(|f| f.0 == off).and_then(|f| crate::types::size_of(Some(db), &f.1)).unwrap_or(0);
+    for (_, off, _, src) in &stores {
+        let fsz = field_size(*off);
+        let via = match strip_casts(src) {
+            Expr::Var(t) if matches!(vars[*t].kind, VarKind::Local) && uses.get(t) == Some(&1) => def_of(*t),
+            _ => None,
+        };
+        let slot = slot_of(src).or_else(|| via.as_ref().and_then(|(_, e)| slot_of(e)));
+        if let Some(l) = slot {
+            if !matches!(vars[l].kind, VarKind::Stack { size, .. } if size == fsz) {
+                return;
+            }
+            let o = off_of(l) - off;
+            if base.is_some_and(|b| b != o) {
+                return;
+            }
+            base = Some(o);
+            slots.push((*off, l, via.map(|v| v.0).filter(|_| slot_of(src).is_none())));
+            continue;
+        }
+        deads.push((*off, usize::MAX));
+        let _ = fsz;
+    }
+    let Some(o) = base else { return };
+    for (off, di) in deads.iter_mut() {
+        let st = stores.iter().find(|s| s.1 == *off).unwrap();
+        let fsz = field_size(*off);
+        let Some(i) = ir.dead_stores.iter().position(|d| d.offset == o + *off && d.size == fsz && strip_casts(&d.value) == strip_casts(&st.3)) else { return };
+        *di = i;
+    }
+    // register temps of the register members defined by a call, used only by their store:
+    // (field offset, definition index)
+    let mut folds: Vec<(i32, usize)> = vec![];
+    for (idx, off, _, src) in &stores {
+        if !deads.iter().any(|d| d.0 == *off) {
+            continue;
+        }
+        if let Expr::Var(t) = strip_casts(src) {
+            if matches!(vars[*t].kind, VarKind::Local) && uses.get(t) == Some(&1) {
+                if let Some((di, _)) = def_of(*t) {
+                    if (di + 1..*idx).all(|q| matches!(&body[q], Stmt::Assign { dst: Expr::Var(_) | Expr::Load { .. }, src } if !src.has_call())) {
+                        folds.push((*off, di));
+                    }
+                }
+            }
+        }
+    }
+    let id = ir.vars.len();
+    ir.vars.push(Var { name: "result".into(), ty: Type::Named(cls.clone()), kind: VarKind::Stack { offset: o, size } });
+    let fty = |off: i32| fields.iter().find(|f| f.0 == off).map(|f| f.1.clone()).unwrap();
+    for (off, l, _) in &slots {
+        let m = Expr::Member { base: Box::new(Expr::Var(id)), offset: *off, ty: fty(*off) };
+        Stmt::rewrite_exprs(&mut ir.body, &mut |e| {
+            match e {
+                Expr::Member { base, offset: 0, .. } if matches!(**base, Expr::Var(v) if v == *l) => *e = m.clone(),
+                Expr::Var(v) if *v == *l => *e = m.clone(),
+                _ => {}
+            }
+        });
+    }
+    // drop the member stores (and the temps reading the slots); the register members go into
+    // the local where they were stored; then the whole object returned
+    let mut rm: Vec<usize> = slots.iter().filter_map(|s| s.2).collect();
+    for (idx, off, _, src) in &stores {
+        if deads.iter().any(|d| d.0 == *off) {
+            // (a register temp holding a call's result, used only here: the call itself)
+            let mut val = src.clone();
+            if let Some(&(_, di)) = folds.iter().find(|f| f.0 == *off) {
+                if let Stmt::Assign { src: e, .. } = &ir.body[di] {
+                    val = e.clone();
+                    rm.push(di);
+                }
+            }
+            ir.body[*idx] = Stmt::Assign { dst: Expr::Member { base: Box::new(Expr::Var(id)), offset: *off, ty: fty(*off) }, src: val };
+        } else {
+            rm.push(*idx);
+        }
+    }
+    let ret_at = end;
+    ir.body.insert(ret_at, Stmt::Assign { dst: Expr::Load { base: Box::new(Expr::Var(sret)), offset: 0, ty: Type::Named(cls.clone()) }, src: Expr::Var(id) });
+    rm.sort_unstable();
+    rm.dedup();
+    for i in rm.into_iter().rev() {
+        ir.body.remove(i);
+    }
+    let mut dis: Vec<usize> = deads.iter().map(|d| d.1).collect();
+    dis.sort_unstable();
+    for i in dis.into_iter().rev() {
+        ir.dead_stores.remove(i);
+    }
+    for (n, d) in ir.dead_stores.iter_mut().enumerate() {
+        d.order = n;
+    }
+}
