@@ -78,6 +78,22 @@ pub fn split_scope(q: &str) -> (Option<&str>, &str) {
 
 /// Parse a C++ type spelling as produced by cwdemangle (`const CVector3f&`, `unsigned char*`,
 /// `rstl::vector<int, rstl::rmemory_allocator>&`, `void (*)(int)`).
+/// Position of `pat` outside template brackets (`R (*)(A)` is a function pointer; the same
+/// declarator inside `pair<int, R (*)(A)>` is a template argument).
+fn find_top(s: &str, pat: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            _ if depth == 0 && b[i..].starts_with(pat.as_bytes()) => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn parse_type(s: &str) -> Type {
     let s = s.trim();
     if s.is_empty() {
@@ -85,13 +101,13 @@ pub fn parse_type(s: &str) -> Type {
     }
     // function pointer: R (*)(args) / R (C::*)(args)
     // pointer to array: T (*)[N]
-    if let Some(p) = s.find("(*)[") {
+    if let Some(p) = find_top(s, "(*)[") {
         let rest = &s[p + 3..];
         if let Some(n) = rest.strip_prefix('[').and_then(|r| r.split(']').next()).and_then(|n| n.parse::<u32>().ok()) {
             return Type::Ptr(Box::new(Type::Array(Box::new(parse_type(&s[..p])), n)));
         }
     }
-    if let Some(p) = s.find("(*)") {
+    if let Some(p) = find_top(s, "(*)") {
         let ret = parse_type(&s[..p]);
         let args = &s[p + 3..];
         let args = args.trim().trim_start_matches('(');
@@ -114,7 +130,7 @@ pub fn parse_type(s: &str) -> Type {
             runs_code: false,
         }));
     }
-    if s.contains("::*") {
+    if find_top(s, "::*").is_some() {
         let class = s.split("::*").next().unwrap_or("").rsplit(['(', ' ']).next().unwrap_or("").to_string();
         let size = if s.contains(")(") { 12 } else { 4 };
         return Type::MemberPtr { class, size };

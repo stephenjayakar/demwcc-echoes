@@ -125,6 +125,12 @@ pub fn with_c_mode<R>(c_mode: bool, db: Option<&TypeDb>, f: impl FnOnce() -> R) 
 }
 
 pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -> Emitted {
+    // helper names unique to the function (drafts of one file are integrated together)
+    let e = emit_draft(ir, db, opts);
+    Emitted { preamble: mwdec_lift::helpers::uniquify(&e.preamble, &ir.symbol), body: mwdec_lift::helpers::uniquify(&e.body, &ir.symbol) }
+}
+
+fn emit_draft(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -> Emitted {
     // by-value parameters passed on to an inline function: the body becomes that inline (first)
     if ir.inline_helper.is_none() && !opts.c_mode {
         let mut split = ir.clone();
@@ -133,8 +139,8 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
             mwdec_lift::frameobj::inline_loop_helper(&mut split);
         }
         if let Some(h) = split.inline_helper.take() {
-            let eh = emit_function(&h, db, opts);
-            let em = emit_function(&split, db, opts);
+            let eh = emit_draft(&h, db, opts);
+            let em = emit_draft(&split, db, opts);
             let mut pre: Vec<String> = vec![];
             for l in eh.preamble.lines().chain(em.preamble.lines()) {
                 // (the calls' own declarations of the helpers: their definitions come first)
@@ -159,6 +165,7 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
         let body = fixed.body.clone();
         mwdec_lift::idioms::untype_undeclarable(&body, &mut fixed.vars, db);
         let forwarded = mwdec_lift::postinline::forward_inline_args(&mut fixed.body, &fixed.vars);
+        let forwarded = forwarded + mwdec_lift::postinline::container_index_walks(&mut fixed.body, &fixed.vars, db);
         let forwarded = forwarded + mwdec_lift::postinline::reference_members(&mut fixed.body, &fixed.vars);
         let copies = mwdec_lift::structcopy::apply(&mut fixed.body, &fixed.vars, db);
         let copies = copies + mwdec_lift::postinline::address_temps_first(&mut fixed.body, &fixed.vars);
@@ -2523,7 +2530,26 @@ impl<'a> Em<'a> {
         s
     }
 
+    /// `f() != 0` / `f() == 0` where `f` returns `bool`, or a one-bit field tested (through
+    /// widening casts): (the call or field, `!=`).
+    fn bool_call_test<'e>(&self, e: &'e Expr) -> Option<(&'e Expr, bool)> {
+        let Expr::Binary { op: op @ (BinOp::Ne | BinOp::Eq), l, r, .. } = e else { return None };
+        if r.as_int() != Some(0) {
+            return None;
+        }
+        let mut inner = &**l;
+        while let Expr::Cast { e: x, .. } = inner {
+            inner = x;
+        }
+        // (a one-bit field is a bool member or its getter)
+        (matches!(inner, Expr::Call { ret, .. } if matches!(strip_cv(ret), Type::Bool)) || matches!(inner, Expr::BitField { width: 1, .. })).then_some((inner, *op == BinOp::Ne))
+    }
+
     fn cond(&mut self, e: &Expr) -> String {
+        if let Some((c, ne)) = self.bool_call_test(e) {
+            let x = self.expr(c, 15);
+            return if ne { x } else { format!("!{x}") };
+        }
         // a bool member tested against zero through its widened byte: the bool itself
         // (`x.valid()`, not `(unsigned int)x.valid() != 0`)
         if let Expr::Binary { op: op @ (BinOp::Ne | BinOp::Eq), l, r, .. } = e {
@@ -4586,6 +4612,19 @@ impl<'a> Em<'a> {
                 let p = op.prec();
                 let ls = side(self, l, p);
                 let rs = side(self, r, p + 1);
+                format!("{ls} {} {rs}", op.c_str())
+            }
+            Expr::Binary { op: op @ (BinOp::LogAnd | BinOp::LogOr), l, r, .. } if self.bool_call_test(l).is_some() || self.bool_call_test(r).is_some() => {
+                // operands of `&&` / `||` are tests: a bool call tested against zero is the call
+                let p = op.prec();
+                let ls = match self.bool_call_test(l) {
+                    Some((c, ne)) => if ne { self.expr(c, p) } else { format!("!{}", self.expr(c, 15)) },
+                    None => self.expr(l, p),
+                };
+                let rs = match self.bool_call_test(r) {
+                    Some((c, ne)) => if ne { self.expr(c, p + 1) } else { format!("!{}", self.expr(c, 15)) },
+                    None => self.expr(r, p + 1),
+                };
                 format!("{ls} {} {rs}", op.c_str())
             }
             Expr::Binary { op, l, r, ty } => {

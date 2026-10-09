@@ -6,11 +6,49 @@
 //!   copies it word by word with rotating registers, as it does any struct of that size).
 //! - `mwdec_iter`: a one-word iterator object with a constructor (`w[0]` the pointer), and
 //!   `mwdec_iter_at(p)` returning one by value (a container's inline `begin()`/`end()`).
+//!
+//! A finished draft gives every helper name (these and the functions a draft splits off, see
+//! [`HELPER_FUNCTIONS`]) a suffix unique to the drafted function ([`uniquify`]): drafts of one
+//! source file must not define the same name twice.
 
 const WORDS: &str = "mwdec_words_";
 /// The one-word iterator helper and its by-value maker.
 pub const ITER: &str = "mwdec_iter";
 pub const ITER_AT: &str = "mwdec_iter_at";
+
+/// Functions a draft defines itself before the drafted function (an inline the body was split
+/// into, see `frameobj`).
+pub const HELPER_FUNCTIONS: [&str; 2] = ["mwdec_inline_body", "mwdec_inline_loop"];
+
+/// `text` (a draft of `symbol`) with every helper name suffixed by a hash of `symbol`.
+pub fn uniquify(text: &str, symbol: &str) -> String {
+    if !text.contains("mwdec_") {
+        return text.to_string();
+    }
+    let mut h: u32 = 0x811c9dc5;
+    for b in symbol.bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x01000193);
+    }
+    let is_name = |id: &str| id == ITER || id == ITER_AT || HELPER_FUNCTIONS.contains(&id) || id.strip_prefix(WORDS).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if ident(c) {
+            let end = rest.find(|c: char| !ident(c)).unwrap_or(rest.len());
+            let id = &rest[..end];
+            out.push_str(id);
+            if is_name(id) {
+                out.push_str(&format!("_{h:08x}"));
+            }
+            rest = &rest[end..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
 
 /// The one-word iterator helper type.
 pub fn iter() -> mwdec_core::Type {

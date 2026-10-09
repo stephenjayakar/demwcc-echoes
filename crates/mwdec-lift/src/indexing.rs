@@ -172,6 +172,12 @@ pub fn raw_index(body: &mut [Stmt], vars: &[Var]) {
         if off.as_int().is_some() {
             return;
         }
+        // (a global's address materialised whole and an index scaled by a multiply, `lis; mulli;
+        // addi; add; lwz c(rX)`: the byte spelling `(u8*)g + i * k + c` is that access already)
+        let global = matches!(uncast(p), Expr::Global { .. }) || matches!(uncast(p), Expr::AddrOf(g) if matches!(&**g, Expr::Global { .. }));
+        if global && matches!(uncast(off), Expr::Binary { op: BinOp::Mul, .. }) {
+            return;
+        }
         let pt = types::ty_of(p, vars);
         if !is_ptr(&pt) && !matches!(strip_cv(&pt), Type::Int { size: 4, .. } | Type::Unknown { size: 4 }) {
             return;

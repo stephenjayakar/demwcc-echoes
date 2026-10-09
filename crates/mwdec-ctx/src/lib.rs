@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when the TypeDb produced for the same inputs changes (invalidates caches).
-const CACHE_VERSION: &str = "mwdec-ctx-25-declspec-variables";
+const CACHE_VERSION: &str = "mwdec-ctx-26-nested-template-classes";
 
 /// Hash of the sources that build a TypeDb (build.rs): the cache generation. Concurrent
 /// builds share one work directory; a build with other context code reads and writes its own generation.
@@ -338,54 +338,35 @@ fn build_uncached(root: &Path, context_tu: &str, cflags: &[String], dir: &Path) 
     }
     stats.forced_total = forces.len();
     let ctx_lines = ctx_text.lines().count();
-    let mut alive: Vec<bool> = vec![true; forces.len()];
-    let force_cpp = dir.join("force.cpp");
-    let force_o = dir.join("force.o");
     let t = std::time::Instant::now();
-    let mut elf: Option<Vec<u8>> = None;
-    let mut last_output = String::new();
-    for attempt in 0..8 {
-        stats.compile_attempts = attempt + 1;
-        let mut text = ctx_text.clone();
-        let mut line_of: BTreeMap<usize, usize> = BTreeMap::new();
-        for (k, (_, line)) in forces.iter().enumerate() {
-            // one line per force (empty when dropped) keeps line numbers stable
-            line_of.insert(ctx_lines + 1 + k, k);
-            if alive[k] {
-                text.push_str(line);
-            }
-            text.push('\n');
-        }
-        text.push_str("void __mwdec_anchor(void) {}\n");
-        if std::env::var_os("MWDEC_CTX_KEEP").is_some() {
-            std::fs::write(&force_cpp, &text)?;
-        }
-        let mut args = flags.clone();
-        args.extend(["-g".into(), "-maxerrors".into(), "1000".into()]);
-        let messages = match mwcc::compile_text(root, &text, &args, dir)? {
-            Ok(bytes) => {
-                elf = Some(bytes);
-                break;
-            }
-            Err(m) => m,
-        };
-        let bad = mwcc::error_lines(&messages, &text);
-        let mut removed = 0;
-        for l in bad {
-            if let Some(&k) = line_of.get(&l) {
-                if alive[k] {
-                    alive[k] = false;
-                    removed += 1;
+    let (mut elf, mut alive, mut last_output) = compile_forced(root, &ctx_text, ctx_lines, &flags, dir, &forces, &mut stats)?;
+    // members of classes nested in class templates (`red_black_tree<..>::const_iterator`) are
+    // only instantiated where the context uses them: a second compile completes the nested
+    // classes of every instance the first one produced, so their layouts and inlines are known
+    if let Some(bytes) = elf.as_ref() {
+        let nested = nested_template_classes(&sr);
+        if !nested.is_empty() {
+            let info = dwarf::read_dwarf(bytes)?;
+            let (db0, _) = convert::Converter::new(&info).build_with_dummies();
+            let extra = nested_instances(&db0, &nested);
+            if !extra.is_empty() {
+                let mut forces2: Vec<(Force, String)> = forces.iter().zip(&alive).map(|((f, l), a)| (f.clone(), if *a { l.clone() } else { String::new() })).collect();
+                for (k, n) in extra.iter().enumerate() {
+                    let i = forces2.len();
+                    forces2.push((Force::Type, format!("typedef char {}s{k}[sizeof({n})]; {n}* {}c{i};", convert::DUMMY_PREFIX, convert::DUMMY_PREFIX)));
                 }
-            }
-        }
-        last_output = messages;
-        if removed == 0 {
-            // errors we cannot attribute: drop all forcing (degraded, but still a TypeDb)
-            if alive.iter().any(|a| *a) {
-                alive.iter_mut().for_each(|a| *a = false);
-            } else {
-                break;
+                let mut stats2 = BuildStats::default();
+                let (elf2, alive2, out2) = compile_forced(root, &ctx_text, ctx_lines, &flags, dir, &forces2, &mut stats2)?;
+                // the extra forces may only add types: keep the first build if any original force
+                // was lost
+                if elf2.is_some() && alive2[..forces.len()].iter().zip(&alive).all(|(b, a)| b == a) {
+                    stats.compile_attempts += stats2.compile_attempts;
+                    stats.forced_total = forces2.len();
+                    forces = forces2;
+                    elf = elf2;
+                    alive = alive2;
+                    last_output = out2;
+                }
             }
         }
     }
@@ -400,7 +381,7 @@ fn build_uncached(root: &Path, context_tu: &str, cflags: &[String], dir: &Path) 
         anyhow::bail!("compiling the context with -g failed:\n{last_output}");
     };
     if std::env::var_os("MWDEC_CTX_KEEP").is_some() {
-        let _ = std::fs::write(&force_o, &elf);
+        let _ = std::fs::write(dir.join("force.o"), &elf);
     }
 
     // 4. DWARF -> TypeDb
@@ -477,6 +458,103 @@ fn build_uncached(root: &Path, context_tu: &str, cflags: &[String], dir: &Path) 
     resolve::patch_field_access(&mut db, &sr.fields, &missing_access);
     resolve::apply_decls(&mut db, &sr);
     Ok((db, stats))
+}
+
+/// Compile the context followed by one line per live force, dropping forces that error (by
+/// line) for up to 8 attempts: the object (if any), which forces survived, the last messages.
+fn compile_forced(root: &Path, ctx_text: &str, ctx_lines: usize, flags: &[String], dir: &Path, forces: &[(Force, String)], stats: &mut BuildStats) -> Result<(Option<Vec<u8>>, Vec<bool>, String)> {
+    let force_cpp = dir.join("force.cpp");
+    let mut alive: Vec<bool> = forces.iter().map(|(_, l)| !l.is_empty()).collect();
+    let mut elf: Option<Vec<u8>> = None;
+    let mut last_output = String::new();
+    for attempt in 0..8 {
+        stats.compile_attempts = attempt + 1;
+        let mut text = ctx_text.to_string();
+        let mut line_of: BTreeMap<usize, usize> = BTreeMap::new();
+        for (k, (_, line)) in forces.iter().enumerate() {
+            // one line per force (empty when dropped) keeps line numbers stable
+            line_of.insert(ctx_lines + 1 + k, k);
+            if alive[k] {
+                text.push_str(line);
+            }
+            text.push('\n');
+        }
+        text.push_str("void __mwdec_anchor(void) {}\n");
+        if std::env::var_os("MWDEC_CTX_KEEP").is_some() {
+            std::fs::write(&force_cpp, &text)?;
+        }
+        let mut args = flags.to_vec();
+        args.extend(["-g".into(), "-maxerrors".into(), "1000".into()]);
+        let messages = match mwcc::compile_text(root, &text, &args, dir)? {
+            Ok(bytes) => {
+                elf = Some(bytes);
+                break;
+            }
+            Err(m) => m,
+        };
+        let bad = mwcc::error_lines(&messages, &text);
+        let mut removed = 0;
+        for l in bad {
+            if let Some(&k) = line_of.get(&l) {
+                if alive[k] {
+                    alive[k] = false;
+                    removed += 1;
+                }
+            }
+        }
+        last_output = messages;
+        if removed == 0 {
+            // errors we cannot attribute: drop all forcing (degraded, but still a TypeDb)
+            if alive.iter().any(|a| *a) {
+                alive.iter_mut().for_each(|a| *a = false);
+            } else {
+                break;
+            }
+        }
+    }
+    Ok((elf, alive, last_output))
+}
+
+/// Classes nested in class templates that declare member functions: (template, nested name).
+fn nested_template_classes(sr: &scan::ScanResult) -> Vec<(String, String)> {
+    let templates: std::collections::HashSet<&str> = sr.templates.iter().map(|s| s.as_str()).collect();
+    let mut out: Vec<(String, String)> = vec![];
+    for d in &sr.decls {
+        let Some((base, own)) = d.scope.rsplit_once("::") else { continue };
+        if !templates.contains(base) || templates.contains(d.scope.as_str()) || own.contains('<') || !own.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+            continue;
+        }
+        let e = (base.to_string(), own.to_string());
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// `Instance::Nested` names for the instances of the templates in `nested` that `db` lacks.
+fn nested_instances(db: &TypeDb, nested: &[(String, String)]) -> Vec<String> {
+    let mut out = vec![];
+    for (cname, c) in &db.classes {
+        if c.is_declaration || !cname.ends_with('>') {
+            continue;
+        }
+        let parts = mangle::split_scope(cname);
+        let Some(last) = parts.last() else { continue };
+        let Some(lt) = last.find('<') else { continue };
+        let mut bparts: Vec<&str> = parts[..parts.len() - 1].to_vec();
+        bparts.push(&last[..lt]);
+        let base = bparts.join("::");
+        for (b, n) in nested {
+            if *b == base {
+                let full = format!("{cname}::{n}");
+                if !db.classes.get(&full).is_some_and(|k| !k.is_declaration) {
+                    out.push(full);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn sig_from_decl(d: &DeclInfo, mangled: Option<&str>, db: &TypeDb) -> FuncSig {

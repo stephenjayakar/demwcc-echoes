@@ -174,6 +174,10 @@ pub const ACCUM_SINGLE_UPDATE: &str = "vars.accum_single_update";
 /// The values of a run of register-field inserts are named locals computed before the run.
 pub const INSERT_VALUES_FIRST: &str = "bitfield.insert_values_first";
 
+/// OS low-memory words (0x80000000..0x80004000) accessed through arrays declared at their
+/// addresses (`u32 lomem[256] : 0x80003000;`).
+pub const LOWMEM_ARRAYS: &str = "sdk.lowmem_arrays";
+
 /// Registered decision points: (name, what the alternative does).
 pub const POINTS: &[(&str, &str)] = &[
     (EXPLICIT_DEFAULT_ARGS, "trailing arguments equal to their declared defaults are passed explicitly"),
@@ -209,6 +213,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (SDK_PARAM_VIEW, "accesses through a pointer parameter go through a named local copy of it"),
     (ACCUM_SINGLE_UPDATE, "a value updated once in its callee-saved register is one variable updated in place"),
     (INSERT_VALUES_FIRST, "values inserted by a run of register-field inserts are named locals computed before it"),
+    (LOWMEM_ARRAYS, "OS low-memory words are elements of arrays declared at their addresses"),
     (PARAM_CONST_POINTERS, "parameters only loaded through are declared pointer-to-const (their loads ignore stores)"),
     (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),

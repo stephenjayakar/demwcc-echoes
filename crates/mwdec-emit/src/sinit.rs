@@ -711,6 +711,46 @@ public:
         Some(())
     }
 
+    /// Many stores of one scalar type packed from offset 0: a constructor setting them all is
+    /// too big to inline (MWCC calls it), so the object is an array of a small element class
+    /// (`T a[n] = { T(x, y, z), ... };`, the element constructor inlined per element). Floats
+    /// group in threes or fours (vectors), otherwise the largest group that still inlines.
+    fn sinit_stand_in_array(&mut self, sname: &str, name: &str, fs: &[&(i32, Type, Expr)], size: i32) -> Option<String> {
+        // (members an inlined constructor may set: one more is called out of line)
+        const MAX_INLINE_MEMBERS: usize = 13;
+        let n = fs.len();
+        if n <= MAX_INLINE_MEMBERS || std::env::var_os("MWDEC_NO_SINIT_ARRAYS").is_some() {
+            return None;
+        }
+        let db = self.db?;
+        let t = local_type(&value_type(&fs[0].1));
+        let sz = mwdec_lift::types::size_of(Some(db), &t)? as i32;
+        if sz == 0 || size != n as i32 * sz || !matches!(t, Type::Int { .. } | Type::Float { .. }) {
+            return None;
+        }
+        if fs.iter().enumerate().any(|(i, (o, ft, _))| *o != i as i32 * sz || local_type(&value_type(ft)) != t) {
+            return None;
+        }
+        let float = matches!(t, Type::Float { .. });
+        let per = [3usize, 4]
+            .into_iter()
+            .filter(|_| float)
+            .find(|g| n % g == 0)
+            .or_else(|| (2..=MAX_INLINE_MEMBERS).rev().find(|g| n % g == 0))?;
+        let members: Vec<String> = (0..per).map(|i| format!("{};", decl(&t, &format!("m{i}")))).collect();
+        let params: Vec<String> = (0..per).map(|i| decl(&t, &format!("a{i}"))).collect();
+        let inits: Vec<String> = (0..per).map(|i| format!("m{i}(a{i})")).collect();
+        self.type_defs.push(format!("struct {sname} {{ {} {sname}({}) : {} {{}} }};", members.join(" "), params.join(", "), inits.join(", ")));
+        let elems: Vec<String> = fs
+            .chunks(per)
+            .map(|c| {
+                let vals: Vec<String> = c.iter().map(|(_, _, v)| self.coerce(v, &t)).collect();
+                format!("{sname}({})", vals.join(", "))
+            })
+            .collect();
+        Some(format!("{sname} {name}[{}] = {{ {} }};", n / per, elems.join(", ")))
+    }
+
     fn sinit_def(&mut self, g: &G, k: usize) -> Option<String> {
         let db = self.db?;
         let declared = db.globals.get(&g.symbol).cloned().or_else(|| g.dtor_class.as_ref().map(|c| (symbol_name(&g.symbol), Type::Named(c.clone()))));
@@ -852,6 +892,9 @@ public:
                     t => mwdec_lift::types::size_of(Some(db), t).map(|s| s as i32).unwrap_or(0),
                 };
                 let sname = format!("__mwdec_sinit_{k}");
+                if let Some(d) = self.sinit_stand_in_array(&sname, &name, &fs, size) {
+                    return Some(wrap(d));
+                }
                 let mut members = vec![];
                 let mut params = vec![];
                 let mut inits = vec![];

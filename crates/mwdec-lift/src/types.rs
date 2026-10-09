@@ -18,12 +18,14 @@ pub fn resolve<'a>(db: Option<&'a TypeDb>, t: &'a Type) -> std::borrow::Cow<'a, 
                         let k = norm_name(n);
                         db.typedefs.iter().find(|(x, _)| norm_name(x) == k).map(|(_, t)| t)
                     })
+                    .cloned()
+                    .or_else(|| template_member_typedef(db, n))
                 }
             }),
             _ => None,
         };
         match next {
-            Some(t) => cur = Cow::Owned(t.clone()),
+            Some(t) => cur = Cow::Owned(t),
             None => break,
         }
     }
@@ -394,4 +396,50 @@ pub fn ty_of(e: &Expr, vars: &[Var]) -> Type {
         Expr::BitField { ty, .. } => ty.clone(),
         Expr::IncDec { e, .. } => ty_of(e, vars),
     }
+}
+
+/// A member typedef of a class template instance (`rstl::reserved_vector<int, 64>::iterator`):
+/// the template's typedef (`T*`) with its parameters bound to the instance's arguments (`int*`).
+fn template_member_typedef(db: &TypeDb, n: &str) -> Option<Type> {
+    let (scope, member) = crate::sig::split_scope(n);
+    let scope = scope?;
+    let lt = scope.find('<')?;
+    if !scope.ends_with('>') {
+        return None;
+    }
+    let base = &scope[..lt];
+    let td = db.template_typedefs.get(&format!("{base}::{member}"))?;
+    let params = db.templates.get(base)?;
+    let args = crate::sig::split_top(&scope[lt + 1..scope.len() - 1], ',');
+    if args.len() > params.len() {
+        return None;
+    }
+    let bind: std::collections::HashMap<&str, Type> = params.iter().zip(args.iter()).map(|(p, a)| (p.as_str(), crate::sig::parse_type(a.trim()))).collect();
+    fn subst(t: &Type, bind: &std::collections::HashMap<&str, Type>, depth: u32) -> Type {
+        if depth > 16 {
+            return t.clone();
+        }
+        let rec = |x: &Type| Box::new(subst(x, bind, depth + 1));
+        match t {
+            Type::Named(n) => bind.get(n.as_str()).cloned().unwrap_or_else(|| t.clone()),
+            Type::Ptr(x) => Type::Ptr(rec(x)),
+            Type::Ref(x) => Type::Ref(rec(x)),
+            Type::Const(x) => Type::Const(rec(x)),
+            Type::Volatile(x) => Type::Volatile(rec(x)),
+            Type::Array(x, k) => Type::Array(rec(x), *k),
+            _ => t.clone(),
+        }
+    }
+    let r = subst(td, &bind, 0);
+    // (a typedef still naming a parameter or another member of the template: unresolved)
+    let mut open = false;
+    fn walk(t: &Type, params: &[String], open: &mut bool) {
+        match t {
+            Type::Named(n) => *open |= params.iter().any(|p| p == n),
+            Type::Ptr(x) | Type::Ref(x) | Type::Const(x) | Type::Volatile(x) | Type::Array(x, _) => walk(x, params, open),
+            _ => {}
+        }
+    }
+    walk(&r, params, &mut open);
+    (!open).then_some(r)
 }

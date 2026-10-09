@@ -1140,6 +1140,10 @@ fn assigns<'a>(b: &'a [Stmt], out: &mut Vec<(&'a Expr, &'a Expr)>) {
 pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) -> Vec<GlobalRef> {
     const LO: u32 = 0xCC00_0000;
     const HI: u32 = 0xCC00_8000;
+    // OS low memory (`OSGlobals` words at 0x80000000..0x80004000): objects declared at those
+    // addresses in the source (draft variant [`crate::variants::LOWMEM_ARRAYS`])
+    const LLO: u32 = 0x8000_0000;
+    const LHI: u32 = 0x8000_4000;
     fn konst(e: &Expr) -> Option<u32> {
         match e {
             Expr::Int { value, .. } => Some(*value as u32),
@@ -1178,7 +1182,7 @@ pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) 
     Stmt::walk_exprs(body, &mut |e| {
         if let Expr::Load { base, offset, ty } = e {
             if let (Some((x, n, a)), Some(es)) = (split(base, *offset), scalar_size(ty)) {
-                if (LO..HI).contains(&a) && !declared(a) && matches!(es, 1 | 2 | 4) && a % es == 0 && (x.is_none() || n % es == 0) {
+                if ((LO..HI).contains(&a) || (LLO..LHI).contains(&a)) && !declared(a) && matches!(es, 1 | 2 | 4) && a % es == 0 && (x.is_none() || n % es == 0) {
                     let b = blocks.entry(a & !0x3ff).or_insert(es);
                     if *b != es {
                         *b = 0;
@@ -1188,10 +1192,32 @@ pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) 
         }
     });
     blocks.retain(|_, es| *es != 0);
+    if blocks.keys().any(|b| (LLO..LHI).contains(b)) && !crate::variants::alt(crate::variants::LOWMEM_ARRAYS) {
+        blocks.retain(|b, _| !(LLO..LHI).contains(b));
+    }
     if blocks.is_empty() {
         return vec![];
     }
-    let name = |b: u32| format!("__hwregs_{b:08X}");
+    // (a low-memory object starts at its lowest accessed word and ends after the highest: the
+    // compiler then folds its address into each access like the original's)
+    let mut lo_span: HashMap<u32, (u32, u32)> = HashMap::new();
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Load { base, offset, ty } = e {
+            if let (Some((None, _, a)), Some(es)) = (split(base, *offset), scalar_size(ty)) {
+                if (LLO..LHI).contains(&a) && blocks.get(&(a & !0x3ff)) == Some(&es) {
+                    let sp = lo_span.entry(a & !0x3ff).or_insert((a, a));
+                    sp.0 = sp.0.min(a);
+                    sp.1 = sp.1.max(a);
+                }
+            }
+        }
+    });
+    // (an indexed low-memory access: keep the whole block)
+    for b in blocks.keys().filter(|b| (LLO..LHI).contains(*b)).copied().collect::<Vec<_>>() {
+        lo_span.entry(b).or_insert((b, b + 0x3fc));
+    }
+    let start = |b: u32| lo_span.get(&b).map_or(b, |s| s.0);
+    let name = |b: u32| if (LLO..LHI).contains(&b) { format!("__lomem_{:08X}", start(b)) } else { format!("__hwregs_{b:08X}") };
     // variant: registers whose whole address the target folds into the access are read through a
     // constant pointer (asked only when there is such an access)
     let folded_at = |base: &Expr, offset: i32| konst(base).is_some_and(|k| k & 0xffff == 0) && offset as u32 & 0xffff >= 0x400;
@@ -1204,16 +1230,24 @@ pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) 
         }
     });
     let const_ptr = any_folded && crate::variants::alt(crate::variants::HW_CONST_POINTER);
-    let arr = |es: u32| Type::Array(Box::new(Type::Volatile(Box::new(Type::Int { size: es as u8, signed: false }))), 0x400 / es);
+    // (hardware registers are volatile; low-memory words are ordinary objects)
+    let arr = |es: u32, b: u32| {
+        let et = Type::Int { size: es as u8, signed: false };
+        if let Some(&(lo, hi)) = lo_span.get(&b) {
+            return Type::Array(Box::new(et), (hi - lo) / es + 1);
+        }
+        Type::Array(Box::new(Type::Volatile(Box::new(et))), 0x400 / es)
+    };
     Stmt::rewrite_exprs(body, &mut |e| {
         let Expr::Load { base, offset, ty } = e else { return };
         let Some((x, n, a)) = split(base, *offset) else { return };
         let Some(&es) = blocks.get(&(a & !0x3ff)) else { return };
-        if !(LO..HI).contains(&a) || scalar_size(ty) != Some(es) || a % es != 0 || (x.is_some() && n % es != 0) {
+        if !((LO..HI).contains(&a) || (LLO..LHI).contains(&a)) || scalar_size(ty) != Some(es) || a % es != 0 || (x.is_some() && n % es != 0) {
             return;
         }
-        let b = a & !0x3ff;
-        let folded = const_ptr && x.is_none() && folded_at(base, *offset);
+        let blk = a & !0x3ff;
+        let b = start(blk);
+        let folded = const_ptr && x.is_none() && folded_at(base, *offset) && !lo_span.contains_key(&blk);
         let it = Type::Int { size: 4, signed: true };
         let k = Expr::int(((a - b) / es) as i64);
         let idx = match x {
@@ -1235,13 +1269,13 @@ pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) 
         let arr_base = if folded {
             Expr::Cast { ty: Type::Ptr(Box::new(Type::Volatile(Box::new(et.clone())))), e: Box::new(Expr::Int { value: b as i64, ty: Type::Int { size: 4, signed: false } }) }
         } else {
-            Expr::Global { symbol: name(b), ty: arr(es) }
+            Expr::Global { symbol: name(blk), ty: arr(es, blk) }
         };
         *e = Expr::Index { base: Box::new(arr_base), index: Box::new(idx), ty: et };
     });
     blocks
         .into_iter()
-        .map(|(b, es)| GlobalRef { symbol: name(b), ty: arr(es), is_function: false, section: None, local_def: true, init: None, abs_addr: Some(b) })
+        .map(|(b, es)| GlobalRef { symbol: name(b), ty: arr(es, b), is_function: false, section: None, local_def: true, init: None, abs_addr: Some(start(b)) })
         .collect()
 }
 

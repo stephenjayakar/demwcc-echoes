@@ -1379,6 +1379,64 @@ pub fn fold_double_delete_checks(body: &mut Vec<Stmt>) {
     });
 }
 
+/// `if (c) { ...; v = a; } else { T obj; ...; v = t; } return v;` where an arm constructs an
+/// object of its scope (`CInterruptGuard guard;`, its destructor the arm's last call): the arms
+/// return, `if (c) { ...; return a; } T obj; ...; return t;`. Returned after the scope, the one
+/// value would live across the destructor call in a saved register in both arms; returned in
+/// the scope, the value is computed before the destructor and the other arm returns directly
+/// (what the target's separate return registers show). Returns the number of rewrites.
+pub fn scope_returns(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    fn scoped_object(arm: &[Stmt], vars: &[Var]) -> bool {
+        arm.iter().any(|s| match s {
+            Stmt::Expr(Expr::Call { callee: Callee::Method { sig, this, .. }, args, ret: Type::Void }) if args.is_empty() => {
+                let ctor = sig.this_class.as_deref().is_some_and(|c| sig.qualified_name == format!("{c}::{}", crate::sig::split_scope(c).1));
+                ctor && matches!(&**this, Expr::AddrOf(x) if matches!(&**x, Expr::Var(o) if matches!(vars[*o].kind, VarKind::Stack { .. })))
+            }
+            _ => false,
+        })
+    }
+    let mut uses: HashMap<VarId, usize> = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let k = b.len();
+        if k < 2 {
+            return;
+        }
+        let ok = match (&b[k - 2], &b[k - 1]) {
+            (Stmt::If { then, els, .. }, Stmt::Return(Some(Expr::Var(v)))) if matches!(vars[*v].kind, VarKind::Local) => {
+                let ends_v = |a: &[Stmt]| matches!(a.last(), Some(Stmt::Assign { dst: Expr::Var(x), src }) if x == v && !src.uses_var(*v));
+                ends_v(then) && ends_v(els) && (scoped_object(then, vars) != scoped_object(els, vars))
+            }
+            _ => false,
+        };
+        if !ok {
+            return;
+        }
+        b.pop();
+        let Some(Stmt::If { then, els, .. }) = b.last_mut() else { return };
+        for arm in [&mut *then, &mut *els] {
+            let Some(Stmt::Assign { src, .. }) = arm.pop() else { continue };
+            // (`t = e; return t;`: the value itself)
+            let src = match (arm.last(), &src) {
+                (Some(Stmt::Assign { dst: Expr::Var(t), src: e }), Expr::Var(u)) if t == u && uses.get(t) == Some(&2) && matches!(vars[*t].kind, VarKind::Local) && !e.uses_var(*t) => {
+                    let e = e.clone();
+                    arm.pop();
+                    e
+                }
+                _ => src,
+            };
+            arm.push(Stmt::Return(Some(src)));
+        }
+        // the returning then-arm: the else arm follows the if
+        let Some(Stmt::If { els, .. }) = b.last_mut() else { return };
+        let rest = std::mem::take(els);
+        b.extend(rest);
+        n += 1;
+    });
+    n
+}
+
 /// `v = e; return v;` -> `return e;` (a register local assigned right before returning it).
 pub fn fold_return_values(body: &mut Vec<Stmt>, vars: &[Var]) {
     Stmt::for_each_block_mut(body, &mut |b| {

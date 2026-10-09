@@ -88,6 +88,143 @@ fn subst_inline_arg(e: &mut Expr, v: VarId, val: &Expr) -> bool {
 /// different object from the argument temporary and changes the expansion's registers and
 /// branch layout (`b` over an empty arm of a min/max select). Assignments of other locals in
 /// between (no calls, not read by `e`) stay before the use.
+/// A pointer walking a container's elements in step with a counted loop (`p = v.data(); for (i =
+/// 0; i < n; i++) { ... *p ...; p = p + sizeof(T); }`) is the container indexed by the counter:
+/// `v[i]` (its `operator[]`). Written as a pointer walk, MWCC unrolls the loop; the source indexed
+/// the container. Returns the number of loops rewritten.
+pub fn container_index_walks(body: &mut Vec<Stmt>, _vars: &[Var], db: Option<&mwdec_core::TypeDb>) -> usize {
+    fn uncast(e: &Expr) -> &Expr {
+        match e {
+            Expr::Cast { e, .. } => uncast(e),
+            e => e,
+        }
+    }
+    let mut uses: HashMap<VarId, usize> = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut k = 1;
+        while k < b.len() {
+            let found = (|| {
+                let Stmt::For { init, cond, step, body: lb } = &b[k] else { return None };
+                let [Stmt::Assign { dst: Expr::Var(i), src: i0 }] = init.as_slice() else { return None };
+                let i = *i;
+                if i0.as_int() != Some(0) {
+                    return None;
+                }
+                let Expr::Binary { op: BinOp::Lt, l, .. } = cond else { return None };
+                if !matches!(uncast(l), Expr::Var(x) if *x == i) || step.len() != 1 {
+                    return None;
+                }
+                // the walk's start right before the loop: `p = (cast)container.data()`
+                let Stmt::Assign { dst: Expr::Var(p), src: ps } = &b[k - 1] else { return None };
+                let p = *p;
+                let Expr::Call { callee: Callee::Method { this, sig, .. }, args, ret } = uncast(ps) else { return None };
+                if !args.is_empty() || !sig.qualified_name.ends_with("::data") {
+                    return None;
+                }
+                let elem = strip_cv(pointee(ret)?).clone();
+                let size = crate::types::size_of(db, &elem).filter(|&z| z > 0)? as i64;
+                // the container object (`this` is its address; without the const view the
+                // accessor was called through)
+                let mut obj = (**this).clone();
+                while let Expr::Cast { e, .. } = obj {
+                    obj = *e;
+                }
+                let Expr::AddrOf(obj) = obj else { return None };
+                let obj = *obj;
+                // its only step, last in the body: `p = p + size`
+                let (last, rest) = lb.split_last()?;
+                let Stmt::Assign { dst: Expr::Var(q), src: qs } = last else { return None };
+                let stepped = match uncast(qs) {
+                    Expr::Binary { op: BinOp::Add, l, r, .. } => matches!(uncast(l), Expr::Var(x) if *x == p) && r.as_int() == Some(size),
+                    Expr::AddrOf(x) => matches!(&**x, Expr::Load { base, offset, .. } if matches!(uncast(base), Expr::Var(y) if *y == p) && *offset as i64 == size),
+                    _ => false,
+                };
+                if *q != p || !stepped {
+                    return None;
+                }
+                // p read only in the body (plus its start and its step)
+                let assigned = {
+                    let mut a = false;
+                    let mut rc = rest.to_vec();
+                    Stmt::for_each_block_mut(&mut rc, &mut |bb| a |= bb.iter().any(|s| matches!(s, Stmt::Assign { dst: Expr::Var(x), .. } if *x == p)));
+                    a
+                };
+                let mut local: HashMap<VarId, usize> = HashMap::new();
+                crate::inline::count_uses(&b[k - 1..=k], &mut local);
+                if uses.get(&p) != local.get(&p) || assigned {
+                    return None;
+                }
+                let element = Expr::Index { base: Box::new(obj), index: Box::new(Expr::Var(i)), ty: elem.clone() };
+                let elem_at = Expr::AddrOf(Box::new(element.clone()));
+                let mut nb: Vec<Stmt> = rest.to_vec();
+                Stmt::rewrite_exprs(&mut nb, &mut |e| {
+                    if matches!(e, Expr::Var(x) if *x == p) {
+                        *e = elem_at.clone();
+                    }
+                });
+                // the element written member by member from one object at the same offsets: a
+                // whole-element copy (`v[i] = *src;`)
+                let word = |s: &Stmt| -> Option<(i32, i64, Expr)> {
+                    let Stmt::Assign { dst: Expr::Load { base: db_, offset: o, ty: t }, src: Expr::Load { base: sb, offset: so, ty: st } } = s else { return None };
+                    if **db_ != elem_at || o != so || strip_cv(t) != strip_cv(st) {
+                        return None;
+                    }
+                    Some((*o, crate::types::size_of(db, t)? as i64, (**sb).clone()))
+                };
+                let mut j = 0;
+                while j < nb.len() {
+                    let mut covered = 0i64;
+                    let mut src: Option<Expr> = None;
+                    let mut m = j;
+                    while m < nb.len() {
+                        let Some((o, z, s)) = word(&nb[m]) else { break };
+                        if o as i64 != covered || src.as_ref().is_some_and(|x| *x != s) {
+                            break;
+                        }
+                        src = Some(s);
+                        covered += z;
+                        m += 1;
+                    }
+                    if covered == size && m > j {
+                        let mut s = src.unwrap();
+                        // (a source address computed right before, read only here, folds in)
+                        let mut at = j;
+                        if let Expr::Var(t) = s {
+                            if j > 0 && uses.get(&t) == Some(&(m - j)) {
+                                if let Stmt::Assign { dst: Expr::Var(x), src: ts } = &nb[j - 1] {
+                                    let mut only_inline = true;
+                                    ts.walk(&mut |c| only_inline &= !matches!(c, Expr::Call { .. }) || is_inline_call(c));
+                                    if *x == t && only_inline {
+                                        s = ts.clone();
+                                        at = j - 1;
+                                    }
+                                }
+                            }
+                        }
+                        nb.splice(at..m, [Stmt::Assign { dst: element.clone(), src: Expr::Load { base: Box::new(s), offset: 0, ty: elem.clone() } }]);
+                        j = at;
+                    }
+                    j += 1;
+                }
+                Some(nb)
+            })();
+            match found {
+                Some(nb) => {
+                    if let Stmt::For { body: lb, .. } = &mut b[k] {
+                        *lb = nb;
+                    }
+                    b.remove(k - 1);
+                    n += 1;
+                }
+                None => k += 1,
+            }
+        }
+    });
+    n
+}
+
 pub fn forward_inline_args(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
     let defs = count_defs(body);
     let mut uses = HashMap::new();
