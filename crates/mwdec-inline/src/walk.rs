@@ -85,7 +85,7 @@ fn update(reach: &mut Defs, s: &Stmt, cx: &Ctx) {
     if let Stmt::Assign { dst: Expr::Var(v), src } = s {
         // a single-definition temp computed from a reassigned one's current value (`end = begin +
         // n` before the walk moves `begin`): its value in terms of what reached it
-        if cx.global.contains_key(v) && !src.has_call() {
+        if cx.global.contains_key(v) && crate::matcher::only_inline_calls(src) {
             let mut uses_reached = false;
             src.walk(&mut |x| {
                 if let Expr::Var(w) = x {
@@ -104,7 +104,7 @@ fn update(reach: &mut Defs, s: &Stmt, cx: &Ctx) {
                 reach.insert(*v, val);
             }
         }
-        if matches!(cx.vars[*v].kind, VarKind::Local) && !cx.global.contains_key(v) && !src.has_call() && !src.uses_var(*v) {
+        if matches!(cx.vars[*v].kind, VarKind::Local) && !cx.global.contains_key(v) && crate::matcher::only_inline_calls(src) && !src.uses_var(*v) {
             // no cycles through other known values
             let defs = merged(cx.global, reach);
             if !expand(src, &defs).uses_var(*v) {

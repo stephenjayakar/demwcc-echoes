@@ -3,7 +3,8 @@
 //! Every binary calls [`install`] first: it puts the process (and the compilers it spawns, which
 //! inherit the job) in a Windows job object with a committed-memory limit, so a runaway allocation
 //! fails fast inside mwdec ("memory allocation of N bytes failed") instead of exhausting the
-//! system's commit charge.
+//! system's commit charge. Processes still in the job when the process ends (normally or
+//! killed) are terminated with it.
 //!
 //! Limit: `MWDEC_MEM_MB` (default 3072). `MWDEC_MEM_MB=0` disables the cap.
 
@@ -136,6 +137,7 @@ mod imp {
 
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
     const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x200;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -149,13 +151,15 @@ mod imp {
 
     pub fn install(bytes: u64) -> Result<(), String> {
         unsafe {
-            // The handle is deliberately leaked: the job lives as long as the process.
+            // The handle is deliberately leaked: the job lives as long as the process, and its
+            // other processes (compilers, draft children) end with it, also when the process is
+            // killed (they would otherwise hold a caller's output pipes open indefinitely).
             let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
             if job.is_null() {
                 return Err(format!("CreateJobObjectW: {}", std::io::Error::last_os_error()));
             }
             let mut info = ExtendedLimit::default();
-            info.basic.limit_flags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.basic.limit_flags = JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             info.job_memory_limit = bytes as usize;
             if SetInformationJobObject(
                 job,

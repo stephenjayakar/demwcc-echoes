@@ -480,7 +480,8 @@ impl<'a> Lifter<'a> {
     /// Without a TypeDb we can't tell static members from methods; guess static when the last
     /// GPR parameter register under the "member" layout is never read before being written.
     fn guess_static(&self) -> bool {
-        if self.db.map_or(false, |db| crate::sig::find_class(db, self.sig.this_class.as_deref().unwrap_or("")).is_some()) {
+        // (a class the context only declares (`class C;`) doesn't say which members are static)
+        if self.db.map_or(false, |db| crate::sig::find_class(db, self.sig.this_class.as_deref().unwrap_or("")).is_some_and(|c| !c.is_declaration)) {
             return false; // the DB would have set is_static
         }
         if sig::is_ctor(&self.sig) || sig::is_dtor(&self.sig) || self.sig.is_const {
@@ -670,6 +671,21 @@ impl<'a> Lifter<'a> {
         (3..top.min(11)).rev().find(|&r| r <= 10 && !touched.contains(&gpr(r)) && higher.iter().any(|&d| d > r))
     }
 
+    /// At `mr rX, r0` (instruction k): r0 was last written, in this block, by `mr r0, r3` right
+    /// after a call returned in r3 (only instructions not touching r3 in between).
+    fn call_result_via_r0(&self, k: usize) -> bool {
+        let b = self.cfg.block_of[k];
+        let start = self.cfg.blocks[b].start;
+        let Some(j) = (start..k).rev().find(|&j| defs_uses(&self.insns[j]).0.contains(&gpr(0))) else { return false };
+        let m = &self.insns[j];
+        if !(m.op() == Opcode::Or && m.rs() == 3 && m.rb() == 3 && m.ra() == 0 && !m.rc()) {
+            return false;
+        }
+        // r3 still the call's result at the copy
+        let Some(c) = (start..j).rev().find(|&c| self.insns[c].is_call() || self.insns[c].is_bctrl() || defs_uses(&self.insns[c]).0.contains(&gpr(3))) else { return false };
+        self.insns[c].is_call() || self.insns[c].is_bctrl()
+    }
+
     /// Was `reg` written in the same block before instruction k (after the previous call), or is it
     /// a live-in parameter register?
     /// Walking back from the call `k` in its block, is `reg` read before any write (its value is
@@ -852,28 +868,29 @@ impl<'a> Lifter<'a> {
     /// Like `reg_written_in_block`, continuing into single predecessors (an argument loaded before
     /// a guard: `lwz r5,len ; cmplwi r5,0 ; beq ; ... ; bctrl`), up to the previous call.
     fn reg_written_before_call(&self, k: usize, reg: Reg) -> bool {
-        let mut b = self.cfg.block_of[k];
-        let mut j = k;
-        for _ in 0..4 {
-            let start = self.cfg.blocks[b].start;
-            while j > start {
-                j -= 1;
-                let i = &self.insns[j];
-                if i.is_call() || i.is_bctrl() {
-                    return false;
-                }
-                if !self.frame.skip.contains(&j) && defs_uses(i).0.contains(&reg) {
-                    return true;
-                }
-            }
-            let preds = &self.cfg.blocks[b].preds;
-            if preds.len() != 1 || preds[0] >= b {
+        self.reg_written_on_paths(self.cfg.block_of[k], k, reg, 4)
+    }
+
+    /// Is `reg` written on every path into `b` (from instruction `j` backwards, through at most
+    /// `depth` blocks, forward edges only) before any call? (`li r4, 3; if (c) li r4, 0; f(r4)`:
+    /// an argument set up on both sides of a branch.)
+    fn reg_written_on_paths(&self, b: usize, mut j: usize, reg: Reg, depth: usize) -> bool {
+        let start = self.cfg.blocks[b].start;
+        while j > start {
+            j -= 1;
+            let i = &self.insns[j];
+            if i.is_call() || i.is_bctrl() {
                 return false;
             }
-            b = preds[0];
-            j = self.cfg.blocks[b].end;
+            if !self.frame.skip.contains(&j) && defs_uses(i).0.contains(&reg) {
+                return true;
+            }
         }
-        false
+        let preds = &self.cfg.blocks[b].preds;
+        if depth == 0 || preds.is_empty() || preds.iter().any(|&p| p >= b) {
+            return false;
+        }
+        preds.iter().all(|&p| self.reg_written_on_paths(p, self.cfg.blocks[p].end, reg, depth - 1))
     }
 
     fn reg_written_in_block(&self, k: usize, reg: Reg) -> bool {
@@ -1490,6 +1507,8 @@ impl<'a> Lifter<'a> {
         let mut sret_addr: HashSet<i32> = HashSet::new();
         // addresses that are the receiver of a method call
         let mut receiver_addr: HashSet<i32> = HashSet::new();
+        // (of a method other than a destructor: the class is the object's own)
+        let mut method_receiver: HashSet<i32> = HashSet::new();
         for (k, i) in self.insns.iter().enumerate() {
             if self.frame.skip.contains(&k) {
                 continue;
@@ -1528,6 +1547,9 @@ impl<'a> Lifter<'a> {
                     }
                     if self.addr_is_receiver(k, i.rd()) {
                         receiver_addr.insert(i.simm() as i32);
+                    }
+                    if self.addr_call_role(k, i.rd(), |sig, lay| lay.this == Some(i.rd()) && !sig::is_ctor(sig) && !sig::is_dtor(sig)) {
+                        method_receiver.insert(i.simm() as i32);
                     }
                     continue;
                 }
@@ -1632,8 +1654,9 @@ impl<'a> Lifter<'a> {
             let size = (end - o) as u32;
             // an object of a known class whose interior addresses are passed: declared as that
             // class, so the addresses read as its elements/members (`pts[1]`, not `stack_8 + 0x10`)
+            // (likewise the receiver of a method call, `rc.ReleaseData()` of a copy)
             let ty = match obj_type.get(&o) {
-                Some(t) if with_interior.contains(&o) && types::size_of(self.db, t) == Some(size) => t.clone(),
+                Some(t) if (with_interior.contains(&o) || method_receiver.contains(&o)) && types::size_of(self.db, t) == Some(size) => t.clone(),
                 _ => t_unk(size),
             };
             let v = self.new_var(format!("stack_{:x}", o), ty, VarKind::Stack { offset: o, size }, false);
@@ -3485,7 +3508,14 @@ impl<'a> Lifter<'a> {
                     matches!(i.op(), Opcode::Addi) && i.ra() == 0 || matches!(i.op(), Opcode::Lfs)
                 })
             };
-            if blk.preds.len() == 2 && blk.preds.iter().all(|&p| last_li(p, self)) {
+            // (two constants: `return c ? a : b` / a result variable; not when an arm also stores
+            // or calls: no conditional expression has that arm, and a variable set in both arms
+            // would be built in r0 and copied, where the constants go straight to r3)
+            let effects = |p: usize, me: &Self| -> bool {
+                let pb = &me.cfg.blocks[p];
+                (pb.start..pb.end).any(|k| !me.frame.skip.contains(&k) && (me.insns[k].is_call() || me.insns[k].is_bctrl() || matches!(me.insns[k].op(), Opcode::Stw | Opcode::Sth | Opcode::Stb | Opcode::Stfs | Opcode::Stfd | Opcode::Stwu | Opcode::Stwx | Opcode::Sthx | Opcode::Stbx | Opcode::Stfsx | Opcode::Stfdx | Opcode::Stmw | Opcode::PsqSt)))
+            };
+            if blk.preds.len() == 2 && blk.preds.iter().all(|&p| last_li(p, self)) && !blk.preds.iter().any(|&p| effects(p, self)) {
                 continue;
             }
             // with a tail shared by several tests (`return false;` laid out once) the tests
@@ -4074,6 +4104,16 @@ impl<'a> Lifter<'a> {
                 let s = self.get(st, gpr(i.rs()));
                 let b = self.get(st, gpr(i.rb()));
                 let v = if ins.op == Or && i.rs() == i.rb() {
+                    // a call result moved through r0 into an argument register (`mr r0, r3 ...
+                    // mr r5, r0`): the value was a named local (copy propagation keeps the copy
+                    // of a named local that is moved again)
+                    if i.rs() == 0 && (3..=10).contains(&i.ra()) && self.call_result_via_r0(k) {
+                        if let Expr::Var(v) = &s {
+                            if let Some(t) = self.is_temp.get_mut(*v) {
+                                *t = false;
+                            }
+                        }
+                    }
                     s
                 } else {
                     match ins.op {

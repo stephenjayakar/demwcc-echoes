@@ -438,14 +438,18 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
             if mutate.is_some() && best_mut.as_ref().map_or(true, |(b, ..)| score > *b) {
                 best_mut = Some((score, out.clone(), lo, stmts.clone()));
             }
-            if best.as_ref().map_or(true, |(b, ..)| score > *b) {
+            // (a stack object built from nothing: of a mutator and a constructor with the same
+            // expansion, the constructor (`CColor c(r, g, b, a)`, not `CColor c; c.Set(...)`))
+            let fresh_stack = matches!(&anchor.addr, Expr::AddrOf(x) if matches!(&**x, Expr::Var(v) if matches!(env.vars[*v].kind, mwdec_lift::VarKind::Stack { .. })));
+            let ctor_tie = std::env::var("MWDI_NO_CTOR_TIE").is_err() && fresh_stack && mutate.is_none() && matches!(t.kind, crate::probe::CallKind::Ctor) && best.as_ref().is_some_and(|(b, _, _, was_mut, _)| score == *b && *was_mut);
+            if best.as_ref().map_or(true, |(b, ..)| score > *b) || ctor_tie {
                 best = Some((score, out, lo, mutate.is_some(), stmts));
             }
         }
     }
     let (_, o, l, is_mut, ss) = best?;
     if !is_mut {
-        if let Some((_, mo, ml, mss)) = best_mut.filter(|(.., mss)| *mss == ss) {
+        if let Some((_, mo, ml, _)) = best_mut.filter(|(.., mss)| *mss == ss) {
             if mwdec_lift::variants::alt(mwdec_lift::variants::INPLACE_MUTATOR) {
                 return Some((mo, ml));
             }

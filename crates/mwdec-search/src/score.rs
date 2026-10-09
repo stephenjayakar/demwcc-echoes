@@ -498,6 +498,13 @@ pub struct Scorer<'a> {
     pub pch_broken: std::sync::atomic::AtomicBool,
     /// Proves target placeholders (`fn_<addr>`) equal to our named functions.
     pub prover: Option<&'a dyn mwdec_mwcc::PlaceholderProver>,
+    /// Confirm every compile failure a persistent compiler reports without messages (a
+    /// "trusted" failure, `mwdec_mwcc` fast path) with a normal compile. Which persistent
+    /// compiler serves a request, and whether its failures are trusted yet, depends on timing and
+    /// on the candidates compiled before; a rare spurious failure then dropped a candidate (an
+    /// exact draft variant) in one run and not in another. Set for draft-time decisions, whose
+    /// outcome must not depend on that.
+    pub confirm_failures: std::sync::atomic::AtomicBool,
 }
 
 impl<'a> Scorer<'a> {
@@ -510,7 +517,7 @@ impl<'a> Scorer<'a> {
         ours_ext: Option<&'a ExternIndex>,
         symbol: &str,
     ) -> Scorer<'a> {
-        Scorer { mwcc, ctx, plain, target, tf, ours_ext, symbol: symbol.to_string(), pch_broken: Default::default(), prover: None }
+        Scorer { mwcc, ctx, plain, target, tf, ours_ext, symbol: symbol.to_string(), pch_broken: Default::default(), prover: None, confirm_failures: Default::default() }
     }
 
     /// Resolve target placeholders through `p` (see `mwdec_mwcc::placeholder`).
@@ -563,6 +570,33 @@ pub const CRASH_RETRIES: usize = 2;
 impl Scorer<'_> {
     /// Compile + compare. Second value: whether the compiler actually ran (not a cache hit).
     pub fn eval(&self, src: &str) -> (Eval, bool) {
+        let r = self.eval_untraced(src);
+        self.trace("eval", src, &r.0);
+        if self.confirm_failures.load(std::sync::atomic::Ordering::Relaxed) && matches!(&r.0, Eval::CompileError(m) if m.contains(mwdec_mwcc::UNCONFIRMED_FAILURE)) {
+            return self.eval_normal(src);
+        }
+        r
+    }
+
+    /// `MWDEC_TRACE_EVAL=<symbol substring>`: one stderr line per evaluation of a matching
+    /// function (candidate hash, context state, verdict), to compare two runs.
+    fn trace(&self, what: &str, src: &str, e: &Eval) {
+        static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(t) = T.get_or_init(|| std::env::var("MWDEC_TRACE_EVAL").ok().filter(|s| !s.is_empty())) else { return };
+        if !self.symbol.contains(t.as_str()) {
+            return;
+        }
+        let v = match e {
+            Eval::Ok(f) => format!("exact={} score={:.2} pen={}", f.exact, f.score, f.penalty),
+            Eval::CompileError(m) => format!("compile error: {}", m.chars().take(100).collect::<String>()),
+            Eval::Missing(_) => "missing".into(),
+            Eval::Io(m) => format!("io: {}", m.chars().take(100).collect::<String>()),
+        };
+        let h = mwdec_mwcc::content_hash(&[src.as_bytes()]) as u32;
+        eprintln!("trace-eval {} {what} src#{h:08x} pch_broken={} -> {v}", self.symbol, self.pch_broken.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    fn eval_untraced(&self, src: &str) -> (Eval, bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let mut r = match self.plain {
             Some(plain) if self.pch_broken.load(Relaxed) => self.mwcc.compile_in(plain, src),
@@ -660,6 +694,12 @@ impl Scorer<'_> {
     /// later evaluations agree with it. For verdicts that must not depend on the state of a
     /// persistent compiler (which earlier, unrelated candidates of the unit shaped).
     pub fn eval_normal(&self, src: &str) -> (Eval, bool) {
+        let r = self.eval_normal_untraced(src);
+        self.trace("eval_normal", src, &r.0);
+        r
+    }
+
+    fn eval_normal_untraced(&self, src: &str) -> (Eval, bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let ctx = match self.plain {
             Some(p) if self.pch_broken.load(Relaxed) => p,

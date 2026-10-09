@@ -272,6 +272,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         bitfields::recover(&mut body, &l.vars, db);
         byval::forward(&mut body, &mut l.vars, db);
         byval::copy_temporaries(&mut body, &mut dead_stores, db);
+        byval::member_built_args(&mut body, &l.vars, db);
         aggregates::literal_inits(&mut body, &l.vars, db, obj);
         byval::forward_ptmf_args(&mut body, &l.vars, db);
         construct::fold(&mut body, &l.vars, db);
@@ -410,12 +411,15 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         temp_bytes,
         warnings: l.warnings,
         decl_params: l.decl_params,
+        inline_helper: None,
         dead_stores,
     };
     debug::stage("late simplify", &ir.body, &ir.vars);
     frameobj::fold_single_reads(&mut ir);
+    frameobj::frame_object_copied_back(&mut ir, db);
     frameobj::fold_block_copies(&mut ir, db);
     frameobj::whole_object_copies(&mut ir, db);
+    frameobj::drop_copy_ctor_increments(&mut ir, db);
     frameobj::unknown_callee_byval(&mut ir, db);
     frameobj::forwarded_byval_params(&mut ir, db);
     frameobj::fold_converting_return(&mut ir, db);

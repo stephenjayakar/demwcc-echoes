@@ -617,7 +617,9 @@ pub fn try_stmts_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, idx:
                 }
                 // ... nor when a pattern local was computed in place: the target read the value
                 // itself (`p = in.ptr; in.ptr = p + 1; ... *p`), the inline didn't return it
-                if result.is_some() && !m.folded.is_empty() {
+                // (unless every store of the window is to a member the function can't name: then
+                // the source can't have written it, `in.ReadUint16();` with its value unused)
+                if result.is_some() && !m.folded.is_empty() && !(std::env::var("MWDI_NO_HIDDEN_STORES").is_err() && hidden_stores_only(&b[i..end], env)) {
                     continue;
                 }
                 let Some(call) = mk(&m) else { continue };
@@ -852,4 +854,30 @@ fn try_interleaved_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, t:
         return true;
     }
     false
+}
+
+/// Does every statement of `w` store to a member the function being rewritten can't name (and
+/// is there at least one store)?
+fn hidden_stores_only(w: &[Stmt], env: &Env) -> bool {
+    let mut n = 0;
+    for s in w {
+        let Stmt::Assign { dst, .. } = s else { return false };
+        if matches!(dst, Expr::Var(_)) {
+            continue;
+        }
+        let ty = match dst {
+            Expr::Load { ty, .. } | Expr::Member { ty, .. } => ty.clone(),
+            _ => return false,
+        };
+        let Some((p, off)) = crate::addr::access(dst, env) else { return false };
+        let Some(outer) = crate::addr::outer_class(&p, env) else { return false };
+        let size = mwdec_lift::scalar_size(crate::util::strip(&ty)).unwrap_or(0);
+        let Some((path, _)) = mwdec_lift::types::field_path(env.db, &outer, off, size) else { return false };
+        let hidden = path.iter().any(|pe| matches!(pe, mwdec_lift::types::PathElem::Field(n, owner) if !crate::matcher::member_accessible(env.db, owner, n)));
+        if !hidden {
+            return false;
+        }
+        n += 1;
+    }
+    n > 0
 }

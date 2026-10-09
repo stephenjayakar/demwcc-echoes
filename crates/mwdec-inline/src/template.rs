@@ -198,6 +198,21 @@ fn to_holes(e: &Expr, map: &HashMap<VarId, usize>) -> Option<Expr> {
 pub fn flat_fields(db: &TypeDb, cls: &str) -> Option<Vec<(i32, Type)>> {
     let mut v = vec![];
     flat_into(db, cls, 0, &mut v, 0)?;
+    // members overlaid by an anonymous union (`CColor`: mR..mA bytes over `uint mRgba`): the
+    // widest member covering the others is the object's component
+    if std::env::var("MWDI_NO_UNION_FLAT").is_err() {
+        let size = |t: &Type| mwdec_lift::types::size_of(Some(db), t).unwrap_or(0) as i32;
+        let spans: Vec<(i32, i32)> = v.iter().map(|(o, t)| (*o, *o + size(t))).collect();
+        let keep: Vec<bool> = (0..v.len())
+            .map(|i| {
+                !(0..v.len()).any(|j| j != i && spans[j].0 <= spans[i].0 && spans[i].1 <= spans[j].1 && (spans[j].1 - spans[j].0 > spans[i].1 - spans[i].0 || (spans[j] == spans[i] && j < i)))
+            })
+            .collect();
+        if keep.iter().any(|k| !k) {
+            v = v.into_iter().zip(keep).filter(|(_, k)| *k).map(|(x, _)| x).collect();
+            v.sort_by_key(|(o, _)| *o);
+        }
+    }
     Some(v)
 }
 

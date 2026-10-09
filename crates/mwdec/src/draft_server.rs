@@ -57,11 +57,15 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_e
     let Some(f) = mwdec_obj::find_function(&ui.target, symbol) else {
         return DraftReply { status: "missing".into(), ..Default::default() };
     };
+    let _p = mwdec_core::prof::span("draft.request");
     let kind = emitted_kind(ui, f);
     let mut r = DraftReply { implicit: kind.clone().filter(|k| include_implicit || k != "hdr-inline"), ..Default::default() };
     if include_implicit && kind.is_some() && !lift_emitted {
         // emitted by the compiler on demand: the drafts are instantiations / uses, no lift
-        r.alts = instantiation_drafts(ui, f);
+        r.alts = {
+            let _p = mwdec_core::prof::span("draft.instantiations");
+            instantiation_drafts(ui, f)
+        };
         if !r.alts.is_empty() {
             r.status = "ok".into();
             r.src = Some(r.alts[0].clone());
@@ -74,7 +78,11 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_e
         r.alts = instantiation_drafts(ui, f);
     }
     let _ = mwdec_inline::stmtinl::take_forwarded();
-    match draft_with(ui, f, include_implicit) {
+    let first = {
+        let _p = mwdec_core::prof::span("draft.first");
+        draft_with(ui, f, include_implicit)
+    };
+    match first {
         Ok(s) => {
             r.status = "ok".into();
             // a container statement inline on a member container: also through a local
@@ -84,6 +92,7 @@ pub fn draft_local(ui: &UnitInputs, symbol: &str, include_implicit: bool, lift_e
                 mwdec_inline::stmtinl::set_container_locals(false);
                 r.alts.extend(v);
             }
+            let _p = mwdec_core::prof::span("draft.others");
             if ui.inlines.enabled {
                 r.plain = draft_variant(ui, f, false, true).ok().filter(|p| *p != s);
             }
@@ -137,6 +146,7 @@ fn parse_reply(line: &str) -> DraftReply {
 /// `mwdec draft-server`: one JSON request per stdin line ({"unit","symbol","include_implicit"}),
 /// one reply per stdout line. Keeps only the current unit's inputs.
 pub fn serve(root: &Path, work: &Path, no_db: bool) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let p = load_project(root)?;
     // Probe compiles of the inline library: 2 slots (the parent's search workers of the job
     // waiting for this draft aren't compiling meanwhile).
@@ -155,15 +165,19 @@ pub fn serve(root: &Path, work: &Path, no_db: bool) -> Result<()> {
         let include_implicit = req.get("include_implicit").and_then(|x| x.as_bool()).unwrap_or(false);
         let lift_emitted = req.get("lift_emitted").and_then(|x| x.as_bool()).unwrap_or(false);
         if cur.as_ref().map_or(true, |c| c.0 != unit) {
+            let t = std::time::Instant::now();
             drop(cur.take()); // drop the previous unit before loading the next
             let ui = find_unit(&p, &unit).map_err(|e| e.to_string()).and_then(|u| {
+                let ext_t = mwdec_core::prof::span("server.ext_index");
                 let main = main_ext.get_or_insert_with(|| Arc::new(mwdec_mwcc::ExternIndex::new(p.load_module_data("main")))).clone();
                 let m = Project::module_of(&u.name);
                 let ext = mwdec_mwcc::ExternIndex::layered(main, if m == "main" { vec![] } else { p.load_module_data(m) });
+                drop(ext_t);
                 let objs: &[Arc<ObjectFile>] = if no_db { &[] } else { &ext.objs };
                 unit_inputs(&p, u, &cc, objs, !no_db, Some(&ext)).map_err(|e| e.to_string())
             });
             cur = Some((unit.clone(), ui));
+            mwdec_core::prof::add("server.unit_load", t.elapsed().as_secs_f64());
         }
         // Test hook for the request timeout: a request that never answers in time.
         if let Ok(v) = std::env::var("MWDEC_DRAFT_TEST_SLEEP") {
@@ -187,6 +201,7 @@ pub fn serve(root: &Path, work: &Path, no_db: bool) -> Result<()> {
         writeln!(out, "{}", reply_json(&r))?;
         out.flush()?;
     }
+    mwdec_core::prof::dump("draft-server", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -198,21 +213,79 @@ struct Proc {
     err_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Parent side: a lazily (re)started draft child shared by the eval workers.
+/// Parent side: lazily (re)started draft children shared by the eval workers. A request goes to
+/// the child that holds its unit (waiting for it when busy), else to the least recently used
+/// idle child, so a unit's inputs are built once while other units draft in parallel. Drafts
+/// don't depend on what a child drafted before, so the routing never changes a result.
 pub struct DraftClient {
     root: PathBuf,
     work: PathBuf,
     no_db: bool,
     pub timeout: Duration,
-    proc_: Mutex<Option<Proc>>,
+    procs: Vec<Mutex<Option<Proc>>>,
+    route: Mutex<Route>,
+    free: std::sync::Condvar,
+}
+
+/// Which unit each child holds, which children are serving a request, and when each was last used.
+struct Route {
+    unit: Vec<Option<String>>,
+    busy: Vec<bool>,
+    used: Vec<u64>,
+    tick: u64,
+}
+
+/// Draft children for an eval with `jobs` workers: `MWDEC_DRAFT_CHILDREN`, else `jobs` up to 3
+/// (each child holds one unit's TypeDb and inline library; all of them count against the
+/// parent's memory cap).
+pub fn draft_children(jobs: usize) -> usize {
+    std::env::var("MWDEC_DRAFT_CHILDREN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(jobs.min(3)).clamp(1, 8)
 }
 
 impl DraftClient {
     pub fn new(root: &Path, work: &Path, no_db: bool) -> DraftClient {
+        DraftClient::with_children(root, work, no_db, 1)
+    }
+
+    pub fn with_children(root: &Path, work: &Path, no_db: bool, children: usize) -> DraftClient {
         // (`MWDEC_DRAFT_TIMEOUT` seconds per request; the first request of a unit builds its
         // types and inline library in the child, so the default is generous)
         let secs = std::env::var("MWDEC_DRAFT_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
-        DraftClient { root: root.into(), work: work.into(), no_db, timeout: Duration::from_secs(secs), proc_: Mutex::new(None) }
+        let n = children.max(1);
+        DraftClient {
+            root: root.into(),
+            work: work.into(),
+            no_db,
+            timeout: Duration::from_secs(secs),
+            procs: (0..n).map(|_| Mutex::new(None)).collect(),
+            route: Mutex::new(Route { unit: vec![None; n], busy: vec![false; n], used: vec![0; n], tick: 0 }),
+            free: std::sync::Condvar::new(),
+        }
+    }
+
+    /// A child for a request of `unit`: the one holding the unit, else the least recently used
+    /// idle one (blocks until it is idle).
+    fn acquire(&self, unit: &str) -> usize {
+        let mut r = self.route.lock().unwrap();
+        loop {
+            let pick = match r.unit.iter().position(|u| u.as_deref() == Some(unit)) {
+                Some(i) => (!r.busy[i]).then_some(i),
+                None => (0..r.busy.len()).filter(|&i| !r.busy[i]).min_by_key(|&i| r.used[i]),
+            };
+            if let Some(i) = pick {
+                r.busy[i] = true;
+                r.tick += 1;
+                r.used[i] = r.tick;
+                r.unit[i] = Some(unit.to_string());
+                return i;
+            }
+            r = self.free.wait(r).unwrap();
+        }
+    }
+
+    fn release(&self, i: usize) {
+        self.route.lock().unwrap().busy[i] = false;
+        self.free.notify_all();
     }
 
     fn spawn(&self) -> std::io::Result<Proc> {
@@ -257,10 +330,20 @@ impl DraftClient {
         Ok(Proc { child, stdin, rx, err_tail, err_thread: Some(err_thread) })
     }
 
-    /// Draft `symbol` of `unit` in the child; a dead or hung child is reported for this function
+    /// Draft `symbol` of `unit` in a child; a dead or hung child is reported for this function
     /// and restarted on the next request.
     pub fn draft(&self, unit: &str, symbol: &str, include_implicit: bool, lift_emitted: bool) -> DraftReply {
-        let mut g = self.proc_.lock().unwrap();
+        let w = std::time::Instant::now();
+        let i = self.acquire(unit);
+        mwdec_core::prof::add("client.wait_child", w.elapsed().as_secs_f64());
+        let r = self.draft_on(i, unit, symbol, include_implicit, lift_emitted);
+        self.release(i);
+        r
+    }
+
+    fn draft_on(&self, i: usize, unit: &str, symbol: &str, include_implicit: bool, lift_emitted: bool) -> DraftReply {
+        let _p = mwdec_core::prof::span("client.request");
+        let mut g = self.procs[i].lock().unwrap();
         if g.is_none() {
             match self.spawn() {
                 Ok(p) => *g = Some(p),
@@ -321,18 +404,24 @@ fn kill_tree(pid: u32) {
 
 impl Drop for DraftClient {
     fn drop(&mut self) {
-        if let Some(mut p) = self.proc_.lock().unwrap().take() {
-            drop(p.stdin); // EOF: the child exits
-            // (a child stuck in a request is killed rather than waited for)
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while matches!(p.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if matches!(p.child.try_wait(), Ok(None)) {
-                kill_tree(p.child.id());
-                let _ = p.child.kill();
-            }
-            let _ = p.child.wait();
+        for slot in &self.procs {
+            let Some(p) = slot.lock().unwrap().take() else { continue };
+            stop_child(p);
         }
     }
+}
+
+/// End a draft child: EOF on its stdin, killed when it doesn't exit within 10 s.
+fn stop_child(mut p: Proc) {
+    drop(p.stdin); // EOF: the child exits
+    // (a child stuck in a request is killed rather than waited for)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while matches!(p.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if matches!(p.child.try_wait(), Ok(None)) {
+        kill_tree(p.child.id());
+        let _ = p.child.kill();
+    }
+    let _ = p.child.wait();
 }

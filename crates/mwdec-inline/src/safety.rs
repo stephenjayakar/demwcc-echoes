@@ -9,11 +9,26 @@ use std::collections::HashMap;
 
 /// Canonical memory reads of an expression: (pointer, offset, size).
 pub fn reads(e: &Expr, env: &Env, out: &mut Vec<(Expr, i32, u32)>) {
+    reads_d(e, env, out, 0);
+}
+
+fn reads_d(e: &Expr, env: &Env, out: &mut Vec<(Expr, i32, u32)>, depth: u32) {
     e.walk(&mut |x| {
         if let Expr::Load { ty, .. } | Expr::Member { ty, .. } = x {
             if let Some((p, o)) = access(x, env) {
                 let sz = mwdec_lift::types::size_of(Some(env.db), ty).unwrap_or(4).max(1);
                 out.push((p, o, sz));
+            }
+        }
+        // a folded inline call reads what its expansion reads (an expansion that can't be
+        // recovered reads anything: the whole of its object arguments, conservatively)
+        if let Expr::Call { callee: mwdec_lift::Callee::Direct { sig, symbol } | mwdec_lift::Callee::Method { sig, symbol, .. }, .. } = x {
+            let inline = sig.mangled.is_none() && (symbol.is_empty() || *symbol == sig.qualified_name);
+            if inline && depth < 4 {
+                match crate::matcher::unfold(x, env) {
+                    Some(u) => reads_d(&u, env, out, depth + 1),
+                    None => out.push((Expr::Int { value: 0, ty: mwdec_core::Type::Int { size: 4, signed: true } }, i32::MIN / 2, u32::MAX / 2)),
+                }
             }
         }
     });
@@ -173,7 +188,26 @@ pub fn safe_defs(body: &[Stmt], env: &Env) -> Defs {
     for t in bad {
         d.remove(&t);
     }
+    // temps holding folded inline calls: only when every call's expansion is known (their
+    // reads are then checked like any other)
+    d.retain(|_, e| !e.has_call() || unfoldable(e, env, 0));
     d
+}
+
+fn unfoldable(e: &Expr, env: &Env, depth: u32) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let mut ok = true;
+    e.walk(&mut |x| {
+        if ok && matches!(x, Expr::Call { .. }) {
+            match crate::matcher::unfold(x, env) {
+                Some(u) => ok &= unfoldable(&u, env, depth + 1),
+                None => ok = false,
+            }
+        }
+    });
+    ok
 }
 
 /// Does `e` contain a call that may write memory? Compiler intrinsics (`__fabs`, `__frsqrte`,

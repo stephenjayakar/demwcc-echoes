@@ -201,7 +201,10 @@ pub fn unit_inputs(p: &Project, u: &Unit, cc: &Compilers, module_objs: &[Arc<Obj
     if u.cflags.is_empty() {
         bail!("unit {} has no compiler flags", u.name);
     }
-    let context = crate::ctxext::extended_context(p, u, &harness::context_tu(p, u)?);
+    let context = {
+        let _p = mwdec_core::prof::span("unit.context_tu");
+        crate::ctxext::extended_context(p, u, &harness::context_tu(p, u)?)
+    };
     unit_inputs_with_context(p, u, cc, module_objs, with_db, context, lit_ext)
 }
 
@@ -211,18 +214,29 @@ pub fn unit_inputs_with_context(p: &Project, u: &Unit, cc: &Compilers, module_ob
     if u.cflags.is_empty() {
         bail!("unit {} has no compiler flags", u.name);
     }
+    let _p = mwdec_core::prof::span("unit.inputs");
     let m = cc.for_unit(p, &u.name);
     let target = load_obj(p, &u.target_obj)?;
     let plain = m.plain_context(&context, &u.cflags).named(&u.name);
-    let ctx = if context.is_empty() { plain.clone() } else { m.precompile(&context, &u.cflags).map(|c| c.named(&u.name)).unwrap_or_else(|_| plain.clone()) };
+    let ctx = {
+        let _p = mwdec_core::prof::span("unit.precompile");
+        if context.is_empty() { plain.clone() } else { m.precompile(&context, &u.cflags).map(|c| c.named(&u.name)).unwrap_or_else(|_| plain.clone()) }
+    };
     let c_mode = u.cflags.iter().any(|f| f == "-lang=c" || f == "-lang=c99");
     let db = if with_db {
-        match mwdec_ctx::build_typedb(&context, &u.cflags, &mwdec_ctx::default_work_dir()) {
+        let tdb = mwdec_core::prof::span("unit.typedb");
+        let r = mwdec_ctx::build_typedb(&context, &u.cflags, &mwdec_ctx::default_work_dir());
+        drop(tdb);
+        let _vt = mwdec_core::prof::span("unit.typedb_extend");
+        match r {
             Ok(mut db) => {
                 // vtables of every class the context knows, from all objects of the module
                 for o in module_objs {
+                    let t = std::time::Instant::now();
                     let relevant = o.data.keys().any(|n| mwdec_ctx::vtable::vtable_class(n).is_some_and(|c| db.classes.contains_key(&c)));
+                    mwdec_core::prof::add("unit.vt_scan", t.elapsed().as_secs_f64());
                     if relevant {
+                        let _p = mwdec_core::prof::span("unit.vt_module");
                         let vt = mwdec_ctx::vtables_from_object(o, &db);
                         let vt: std::collections::BTreeMap<_, _> = vt.into_iter().filter(|(c, _)| db.classes.contains_key(c)).collect();
                         mwdec_ctx::apply_vtables(&mut db, &vt);
@@ -238,11 +252,13 @@ pub fn unit_inputs_with_context(p: &Project, u: &Unit, cc: &Compilers, module_ob
                     }
                 }
                 if std::env::var_os("MWDEC_NO_DECLARED_VTABLES").is_none() {
+                    let _p = mwdec_core::prof::span("unit.vt_declared");
                     mwdec_ctx::vtable::declared_vtables(&mut db);
                     mwdec_ctx::resolve::fill_methods(&mut db);
                 }
                 if !c_mode && std::env::var("MWDEC_NO_INLINE").is_err() {
                     // (the probe driver caches its compiles on disk across runs)
+                    let _p = mwdec_core::prof::span("unit.complete_instances");
                     mwdec_inline::complete::complete_in(&mut db, &context, &u.cflags, &cc.probe_driver(p, &u.name), &ctx, &plain);
                 }
                 Some(db)
@@ -255,6 +271,7 @@ pub fn unit_inputs_with_context(p: &Project, u: &Unit, cc: &Compilers, module_ob
     } else {
         None
     };
+    let _tr = mwdec_core::prof::span("unit.tracer");
     let tracer = mwdec_search::trace::Tracer::new(&cc.root, &cc.work.join("trace"), &p.compiler_rel(&u.name), &u.cflags, &context).map(Arc::new);
     let inlines = InlineLibs {
         enabled: db.is_some() && !c_mode && std::env::var("MWDEC_NO_INLINE").is_err(),
@@ -291,6 +308,7 @@ impl InlineLibs {
                 let Some(db) = (if self.enabled { ui.db.as_ref() } else { None }) else {
                     return Arc::new(mwdec_inline::InlineLib::default());
                 };
+                let _p = mwdec_core::prof::span("unit.inline_library");
                 let cache = mwdec_inline::ProbeCache::new(u_flags, &ui.context);
                 Arc::new(mwdec_inline::build_library_for(db, Some(&ui.target), Some(&cache), &|code| {
                     let mut r = self.driver.compile_in(&ui.ctx, code);
@@ -348,11 +366,15 @@ pub fn near_miss_pass(scorer: &Scorer, src: String, tracer: Option<&mwdec_search
         return src;
     }
     scorer.mwcc.enable_fast(4);
+    let _p = mwdec_core::prof::span("rv.near_pass");
     mwdec_search::search::quick_pass_with(scorer, &src, &f, NEAR_MISS_COMPILES, tracer).unwrap_or(src)
 }
 
 fn repair_or_variant_only(scorer: &Scorer, chosen: String, variants: Vec<String>, tracer: Option<&mwdec_search::trace::Tracer>) -> String {
+    let rr = mwdec_core::prof::span("rv.repair");
     let base = repair_registers(scorer, chosen, tracer);
+    drop(rr);
+    let _vv = mwdec_core::prof::span("rv.variants");
     if variants.is_empty() {
         return base;
     }
@@ -1072,6 +1094,52 @@ fn draft_hash(d: &DraftReply) -> String {
     format!("{:032x}", mwdec_mwcc::content_hash(&parts))
 }
 
+/// Hands out an eval's functions (grouped by unit) so each worker drafts whole units: a worker
+/// keeps taking functions of its current unit, then claims the next unclaimed unit, and only when
+/// every unit is claimed helps with the unit that has the most functions left. Workers taking
+/// consecutive functions of one unit serialized on the draft child holding that unit.
+struct UnitSched {
+    /// (functions left, by index into the eval's list) per unit, in list order
+    units: Vec<Mutex<std::collections::VecDeque<usize>>>,
+    claimed: std::sync::atomic::AtomicUsize,
+}
+
+impl UnitSched {
+    fn new<'a>(units: impl Iterator<Item = &'a str>) -> UnitSched {
+        let mut out: Vec<std::collections::VecDeque<usize>> = vec![];
+        let mut last: Option<&str> = None;
+        let mut pos: HashMap<&str, usize> = HashMap::new();
+        for (i, u) in units.enumerate() {
+            let k = if last == Some(u) { out.len() - 1 } else { *pos.entry(u).or_insert_with(|| { out.push(Default::default()); out.len() - 1 }) };
+            out[k].push_back(i);
+            last = Some(u);
+        }
+        UnitSched { units: out.into_iter().map(Mutex::new).collect(), claimed: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    /// The next function for a worker whose current unit is `cur` (updated).
+    fn next(&self, cur: &mut Option<usize>) -> Option<usize> {
+        if let Some(u) = *cur {
+            if let Some(i) = self.units[u].lock().unwrap().pop_front() {
+                return Some(i);
+            }
+        }
+        loop {
+            let u = self.claimed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if u >= self.units.len() {
+                break;
+            }
+            if let Some(i) = self.units[u].lock().unwrap().pop_front() {
+                *cur = Some(u);
+                return Some(i);
+            }
+        }
+        let (u, _) = self.units.iter().enumerate().map(|(u, q)| (u, q.lock().unwrap().len())).filter(|x| x.1 > 0).max_by_key(|x| (x.1, std::cmp::Reverse(x.0)))?;
+        *cur = Some(u);
+        self.units[u].lock().unwrap().pop_front().or_else(|| self.next(cur))
+    }
+}
+
 /// Deterministic shuffle (SplitMix64-driven Fisher-Yates).
 fn shuffle<T>(v: &mut [T], seed: u64) {
     let mut r = mwdec_search::rng::Rng::new(seed);
@@ -1149,104 +1217,110 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
     let units: Mutex<HashMap<String, Arc<Mutex<Option<Arc<Result<UnitInputs, String>>>>>>> = Mutex::new(HashMap::new());
     let externs = ModuleExterns::new(&p);
     // Drafts in a child process (bounded memory; a pathological function becomes a row).
-    let drafter = if std::env::var_os("MWDEC_INPROC_DRAFT").is_some() { None } else { Some(crate::draft_server::DraftClient::new(root, work, a.no_db)) };
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    let drafter = if std::env::var_os("MWDEC_INPROC_DRAFT").is_some() { None } else { Some(crate::draft_server::DraftClient::with_children(root, work, a.no_db, crate::draft_server::draft_children(jobs))) };
+    let sched = UnitSched::new(ds.iter().map(|e| e.unit.as_str()));
+    let done = std::sync::atomic::AtomicUsize::new(0);
     let rows: Mutex<Vec<Row>> = Mutex::new(Vec::new());
     std::thread::scope(|s| {
         for _ in 0..jobs {
-            let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, || loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(e) = ds.get(i) else { break };
-                let t = Instant::now();
-                let mut row = Row { unit: e.unit.clone(), symbol: e.symbol.clone(), size: e.size, ..Default::default() };
-                if a.drafts_only {
-                    let d = match &drafter {
-                        Some(c) => c.draft(&e.unit, &e.symbol, a.include_implicit, false),
-                        None => DraftReply::err("unit-err", "--drafts-only needs the draft server"),
+            let _ = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(s, || {
+                let mut cur = None;
+                loop {
+                    let Some(i) = sched.next(&mut cur) else { break };
+                    let e = &ds[i];
+                    let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let t = Instant::now();
+                    let mut row = Row { unit: e.unit.clone(), symbol: e.symbol.clone(), size: e.size, ..Default::default() };
+                    if a.drafts_only {
+                        let d = match &drafter {
+                            Some(c) => c.draft(&e.unit, &e.symbol, a.include_implicit, false),
+                            None => DraftReply::err("unit-err", "--drafts-only needs the draft server"),
+                        };
+                        row.status = d.status.clone();
+                        row.error = d.error.clone();
+                        row.implicit = d.implicit.clone();
+                        row.drafted = d.src.is_some() || !d.alts.is_empty();
+                        row.draft_hash = Some(draft_hash(&d));
+                        // (`MWDEC_DRAFTS_DUMP=<dir>`: every draft text of the reply, to diff two runs)
+                        if let Some(dir) = std::env::var_os("MWDEC_DRAFTS_DUMP") {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let mut parts: Vec<(String, String)> = vec![("status".into(), d.status.clone()), ("src".into(), d.src.clone().unwrap_or_default())];
+                            parts.extend(d.plain.iter().map(|v| ("plain".to_string(), v.clone())));
+                            parts.extend(d.raw.iter().map(|v| ("raw".to_string(), v.clone())));
+                            parts.extend(d.alts.iter().enumerate().map(|(i, v)| (format!("alt {i}"), v.clone())));
+                            parts.extend(d.variants.iter().enumerate().map(|(i, v)| (format!("variant {i}"), v.clone())));
+                            let text: String = parts.iter().map(|(k, v)| format!("// --- {k}\n{v}\n")).collect();
+                            let _ = std::fs::write(Path::new(&dir).join(format!("{}__{}.cpp", sanitize(&e.unit), sanitize(&e.symbol))), text);
+                        }
+                        row.wrong_meaning = d.src.as_deref().is_some_and(|s| s.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP));
+                        row.seconds = t.elapsed().as_secs_f64();
+                        let mut f = out_file.lock().unwrap();
+                        let _ = writeln!(f, "{}", row.json());
+                        let _ = f.flush();
+                        drop(f);
+                        if (i + 1) % 200 == 0 {
+                            eprintln!("[{:>4}/{}] drafts", i + 1, ds.len());
+                        }
+                        continue;
+                    }
+                    let module = Project::module_of(&e.unit).to_string();
+                    let ext = externs.get(&module);
+                    let slot = units.lock().unwrap().entry(e.unit.clone()).or_default().clone();
+                    let ui = {
+                        let _p = mwdec_core::prof::span("eval.unit_inputs");
+                        let mut g = slot.lock().unwrap();
+                        if g.is_none() {
+                            let r = p
+                                .unit(&e.unit)
+                                .ok_or_else(|| anyhow!("unknown unit"))
+                                .and_then(|u| unit_inputs(&p, u, &cc, &ext.0.objs, !a.no_db && drafter.is_none(), drafter.is_none().then_some(&ext.0)));
+                            *g = Some(Arc::new(r.map_err(|e| e.to_string())));
+                        }
+                        g.clone().unwrap()
                     };
-                    row.status = d.status.clone();
-                    row.error = d.error.clone();
-                    row.implicit = d.implicit.clone();
-                    row.drafted = d.src.is_some() || !d.alts.is_empty();
-                    row.draft_hash = Some(draft_hash(&d));
-                    // (`MWDEC_DRAFTS_DUMP=<dir>`: every draft text of the reply, to diff two runs)
-                    if let Some(dir) = std::env::var_os("MWDEC_DRAFTS_DUMP") {
-                        let _ = std::fs::create_dir_all(&dir);
-                        let mut parts: Vec<(String, String)> = vec![("status".into(), d.status.clone()), ("src".into(), d.src.clone().unwrap_or_default())];
-                        parts.extend(d.plain.iter().map(|v| ("plain".to_string(), v.clone())));
-                        parts.extend(d.raw.iter().map(|v| ("raw".to_string(), v.clone())));
-                        parts.extend(d.alts.iter().enumerate().map(|(i, v)| (format!("alt {i}"), v.clone())));
-                        parts.extend(d.variants.iter().enumerate().map(|(i, v)| (format!("variant {i}"), v.clone())));
-                        let text: String = parts.iter().map(|(k, v)| format!("// --- {k}\n{v}\n")).collect();
-                        let _ = std::fs::write(Path::new(&dir).join(format!("{}__{}.cpp", sanitize(&e.unit), sanitize(&e.symbol))), text);
+                    drop(slot);
+                    run_one(&ui, &ext, e, &a, workers, &runs_dir, drafter.as_ref(), &mut row);
+                    drop(ui);
+                    drop(ext);
+                    {
+                        let mut l = unit_left.lock().unwrap();
+                        let n = l.get_mut(&e.unit).unwrap();
+                        *n -= 1;
+                        if *n == 0 {
+                            units.lock().unwrap().remove(&e.unit);
+                        }
                     }
-                    row.wrong_meaning = d.src.as_deref().is_some_and(|s| s.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP));
+                    {
+                        let mut l = module_left.lock().unwrap();
+                        let n = l.get_mut(&module).unwrap();
+                        *n -= 1;
+                        if *n == 0 {
+                            externs.drop_module(&module);
+                        }
+                    }
                     row.seconds = t.elapsed().as_secs_f64();
-                    let mut f = out_file.lock().unwrap();
-                    let _ = writeln!(f, "{}", row.json());
-                    let _ = f.flush();
-                    drop(f);
-                    if (i + 1) % 200 == 0 {
-                        eprintln!("[{:>4}/{}] drafts", i + 1, ds.len());
+                    row.mem_mb = mwdec_core::memcap::commit_mb();
+                    let line = row.json().to_string();
+                    {
+                        let mut f = out_file.lock().unwrap();
+                        let _ = writeln!(f, "{line}");
+                        let _ = f.flush();
                     }
-                    continue;
+                    eprintln!(
+                        "[{:>4}/{}] {:<9} {:<5} {} {} ({:.1}s, {} compiles, {} MB){}",
+                        i + 1,
+                        ds.len(),
+                        row.status,
+                        e.size,
+                        e.unit,
+                        e.symbol,
+                        row.seconds,
+                        row.compiles,
+                        row.mem_mb,
+                        row.best_score.map(|s| format!(" best {s:.1}")).unwrap_or_default()
+                    );
+                    rows.lock().unwrap().push(row);
                 }
-                let module = Project::module_of(&e.unit).to_string();
-                let ext = externs.get(&module);
-                let slot = units.lock().unwrap().entry(e.unit.clone()).or_default().clone();
-                let ui = {
-                    let mut g = slot.lock().unwrap();
-                    if g.is_none() {
-                        let r = p
-                            .unit(&e.unit)
-                            .ok_or_else(|| anyhow!("unknown unit"))
-                            .and_then(|u| unit_inputs(&p, u, &cc, &ext.0.objs, !a.no_db && drafter.is_none(), drafter.is_none().then_some(&ext.0)));
-                        *g = Some(Arc::new(r.map_err(|e| e.to_string())));
-                    }
-                    g.clone().unwrap()
-                };
-                drop(slot);
-                run_one(&ui, &ext, e, &a, workers, &runs_dir, drafter.as_ref(), &mut row);
-                drop(ui);
-                drop(ext);
-                {
-                    let mut l = unit_left.lock().unwrap();
-                    let n = l.get_mut(&e.unit).unwrap();
-                    *n -= 1;
-                    if *n == 0 {
-                        units.lock().unwrap().remove(&e.unit);
-                    }
-                }
-                {
-                    let mut l = module_left.lock().unwrap();
-                    let n = l.get_mut(&module).unwrap();
-                    *n -= 1;
-                    if *n == 0 {
-                        externs.drop_module(&module);
-                    }
-                }
-                row.seconds = t.elapsed().as_secs_f64();
-                row.mem_mb = mwdec_core::memcap::commit_mb();
-                let line = row.json().to_string();
-                {
-                    let mut f = out_file.lock().unwrap();
-                    let _ = writeln!(f, "{line}");
-                    let _ = f.flush();
-                }
-                eprintln!(
-                    "[{:>4}/{}] {:<9} {:<5} {} {} ({:.1}s, {} compiles, {} MB){}",
-                    i + 1,
-                    ds.len(),
-                    row.status,
-                    e.size,
-                    e.unit,
-                    e.symbol,
-                    row.seconds,
-                    row.compiles,
-                    row.mem_mb,
-                    row.best_score.map(|s| format!(" best {s:.1}")).unwrap_or_default()
-                );
-                rows.lock().unwrap().push(row);
             });
         }
     });
@@ -1256,6 +1330,7 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
         println!("{}", s.line());
     }
     println!("wrote {} ({:.0}s total)", out_path.display(), t0.elapsed().as_secs_f64());
+    mwdec_core::prof::dump("eval", t0.elapsed().as_secs_f64());
     if a.mem_report {
         println!("{}", mwdec_core::memcap::report_line());
     }
@@ -1285,10 +1360,13 @@ fn run_one(
         row.status = "missing".into();
         return;
     };
+    let dt = mwdec_core::prof::span("eval.draft");
     let d = match drafter {
         Some(c) => c.draft(&e.unit, &e.symbol, a.include_implicit, false),
         None => crate::draft_server::draft_local(ui, &e.symbol, a.include_implicit, false),
     };
+    drop(dt);
+    let _cs = mwdec_core::prof::span("eval.after_draft");
     row.implicit = d.implicit.clone();
     let (src, plain) = match (d.status.as_str(), d.src) {
         ("ok", Some(s)) => (s, d.plain),
@@ -1303,6 +1381,11 @@ fn run_one(
     let ti = ObjIndex::with_externs(&ui.target, &ext.0);
     let prover = crate::placeholders::UnitProver::new(&ui.mwcc, &ui.ctx, ui.db.as_ref());
     let scorer = Scorer::new(&ui.mwcc, &ui.ctx, Some(&ui.plain), &ti, f, Some(&ext.1), &e.symbol).with_prover(Some(&prover));
+    // draft-time decisions never act on an unconfirmed persistent-compiler failure
+    // (`MWDEC_TRUST_FAST_FAILURES`: the old behaviour, for comparisons)
+    let confirm = std::env::var_os("MWDEC_TRUST_FAST_FAILURES").is_none();
+    scorer.confirm_failures.store(confirm, std::sync::atomic::Ordering::Relaxed);
+    let ch = mwdec_core::prof::span("eval.choose");
     let src = if d.alts.is_empty() {
         choose_between(&scorer, src, plain)
     } else {
@@ -1327,7 +1410,11 @@ fn run_one(
             best
         }
     };
+    drop(ch);
+    let rv = mwdec_core::prof::span("eval.repair_variant");
     let src = repair_or_variant(&scorer, src, d.variants.clone(), ui.tracer.as_deref());
+    drop(rv);
+    let fe = mwdec_core::prof::span("eval.first");
     // Compile the draft before the search clock starts: a compiler crash with the unit's PCH is
     // repaired here (split PCH, once per unit context, cached on disk), not inside the budget.
     let mut first = eval_draft(&scorer, &src);
@@ -1342,6 +1429,10 @@ fn run_one(
         (None, Some(raw)) if scorer.eval(&raw).0.fitness().is_some() => raw,
         _ => src,
     };
+    drop(fe);
+    // (a search within a time budget may trust them: its result depends on timing anyway)
+    scorer.confirm_failures.store(confirm && a.budget_secs == 0, std::sync::atomic::Ordering::Relaxed);
+    let _se = mwdec_core::prof::span("eval.search");
     let cfg = SearchConfig {
         budget: Duration::from_secs(a.budget_secs),
         max_compiles: a.max_compiles,
@@ -1475,3 +1566,4 @@ fn print_table(rows: &[Row]) {
         }
     }
 }
+

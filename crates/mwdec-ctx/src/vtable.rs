@@ -188,7 +188,7 @@ pub fn declared_vtables(db: &mut TypeDb) -> usize {
             let mut copy = db.clone();
             copy.classes.get_mut(&c).unwrap().vtable.clear();
             let mut m = BTreeMap::new();
-            let Some(slots) = declared_slots(&copy, &c, &mut m, 0) else { continue };
+            let Some(slots) = declared_slots(&copy, &c, &mut m, 0, &[]) else { continue };
             let real = &db.classes[&c].vtable;
             let same = slots.len() == real.len() && slots.iter().zip(real).all(|(a, b)| b.sig.qualified_name.is_empty() || simple_name(&a.sig.qualified_name) == simple_name(&b.sig.qualified_name));
             if same {
@@ -206,14 +206,14 @@ pub fn declared_vtables(db: &mut TypeDb) -> usize {
     let have: Vec<String> = db.classes.iter().filter(|(n, c)| c.vptr_offset == Some(0) && !c.vtable.is_empty() && !n.contains('<')).map(|(n, _)| n.clone()).collect();
     for c in have {
         let real = db.classes[&c].vtable.clone();
-        let v = completed(db, &c, &real, &mut memo, 0);
+        let v = completed(db, &c, &real, &mut memo, 0, &[]);
         if v.len() != real.len() || v.iter().zip(&real).any(|(a, b)| a.sig.qualified_name != b.sig.qualified_name) {
             db.classes.get_mut(&c).unwrap().vtable = v;
             n += 1;
         }
     }
     for c in names {
-        if let Some(slots) = declared_slots(db, &c, &mut memo, 0) {
+        if let Some(slots) = declared_slots(db, &c, &mut memo, 0, &[]) {
             if !slots.is_empty() {
                 db.classes.get_mut(&c).unwrap().vtable = slots;
                 n += 1;
@@ -253,22 +253,19 @@ fn norm_ty(db: &TypeDb, t: &Type) -> String {
 
 /// An object's vtable with the names of its unnamed (pure) slots and its trailing slots taken
 /// from the declaration-order layout, where the two agree on every named slot.
-fn completed(db: &TypeDb, cls: &str, real: &[VirtualMethod], memo: &mut BTreeMap<String, Option<Vec<VirtualMethod>>>, depth: u32) -> Vec<VirtualMethod> {
-    let mut copy_db = None;
+/// `cleared`: classes whose object vtable is treated as absent (the declaration-order layout
+/// of a class is computed as if its own vtable were unknown).
+fn completed(db: &TypeDb, cls: &str, real: &[VirtualMethod], memo: &mut BTreeMap<String, Option<Vec<VirtualMethod>>>, depth: u32, cleared: &[&str]) -> Vec<VirtualMethod> {
     let decl = {
         let key = format!("#decl#{cls}");
         if let Some(v) = memo.get(&key) {
             v.clone()
         } else {
-            let d = copy_db.get_or_insert_with(|| {
-                let mut c = db.clone();
-                if let Some(k) = c.classes.get_mut(cls) {
-                    k.vtable.clear();
-                }
-                c
-            });
+            // (`cls` without its vtable: a list of names, not a copy of the whole TypeDb)
+            let mut cl: Vec<&str> = cleared.to_vec();
+            cl.push(cls);
             let mut m = BTreeMap::new();
-            let v = declared_slots(d, cls, &mut m, depth + 1);
+            let v = declared_slots(db, cls, &mut m, depth + 1, &cl);
             memo.insert(key, v.clone());
             v
         }
@@ -298,7 +295,7 @@ fn simple_name(q: &str) -> &str {
     q.rsplit("::").next().unwrap_or(q)
 }
 
-fn declared_slots(db: &TypeDb, cls: &str, memo: &mut BTreeMap<String, Option<Vec<VirtualMethod>>>, depth: u32) -> Option<Vec<VirtualMethod>> {
+fn declared_slots(db: &TypeDb, cls: &str, memo: &mut BTreeMap<String, Option<Vec<VirtualMethod>>>, depth: u32, cleared: &[&str]) -> Option<Vec<VirtualMethod>> {
     if let Some(v) = memo.get(cls) {
         return v.clone();
     }
@@ -311,10 +308,10 @@ fn declared_slots(db: &TypeDb, cls: &str, memo: &mut BTreeMap<String, Option<Vec
         let mut slots: Vec<VirtualMethod> = match c.bases.iter().find(|b| b.offset == 0 && !b.is_virtual && db.classes.get(&b.name).is_some_and(|bc| bc.vptr_offset.is_some())) {
             Some(b) => {
                 let bc = db.classes.get(&b.name)?;
-                if bc.vtable.is_empty() {
-                    declared_slots(db, &b.name, memo, depth + 1)?
+                if bc.vtable.is_empty() || cleared.contains(&b.name.as_str()) {
+                    declared_slots(db, &b.name, memo, depth + 1, cleared)?
                 } else {
-                    completed(db, &b.name, &bc.vtable, memo, depth)
+                    completed(db, &b.name, &bc.vtable, memo, depth, cleared)
                 }
             }
             None => vec![],

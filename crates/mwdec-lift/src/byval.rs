@@ -674,3 +674,105 @@ fn type_copy_sources(body: &mut Vec<Stmt>, vars: &mut [Var], db: &TypeDb) {
         }
     });
 }
+
+/// A by-value class argument built member by member right before the call, nothing else using
+/// it (`S.current = p; destroy(S, ...)`, the copy of an inline's returned iterator): the object
+/// is constructed in the argument, `destroy(T(p), ...)`, by the class's constructor taking the
+/// members in order (the compiler makes the temporary and the parameter copy again).
+pub fn member_built_args(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
+    let mut total: HashMap<VarId, usize> = HashMap::new();
+    Stmt::walk_exprs(body, &mut |x| {
+        if let Expr::Var(v) = x {
+            *total.entry(*v).or_default() += 1;
+        }
+    });
+    let stack = |v: VarId| matches!(vars[v].kind, VarKind::Stack { .. });
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut j = 0;
+        while j < b.len() {
+            // the by-value stack object arguments of this statement
+            let mut cands: Vec<(VarId, Type)> = vec![];
+            for e in head_exprs(&b[j]) {
+                e.walk(&mut |x| {
+                    if let Expr::Call { callee, args, .. } = x {
+                        if let Some(sig) = call_params(callee) {
+                            for (n, a) in args.iter().enumerate() {
+                                if let (Expr::Var(v), Some(p)) = (a, sig.params.get(n)) {
+                                    if stack(*v) && is_byval(db, &p.ty) {
+                                        cands.push((*v, strip_cv(&p.ty).clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            let mut removed = 0usize;
+            for (v, t) in cands {
+                let Some(cls) = named(&types::resolve(Some(db), &t)).map(|s| s.to_string()) else { continue };
+                if type_key(db, &vars[v].ty) != type_key(db, &t) && !matches!(vars[v].ty, Type::Unknown { .. }) {
+                    continue;
+                }
+                let mut fields = vec![];
+                if !crate::idioms::flat_fields(db, &cls, 0, &mut fields, 0) || fields.is_empty() || fields.len() > 4 {
+                    continue;
+                }
+                // its member stores just before, over stores into other frame objects only
+                let mut stores: Vec<(usize, i32, Expr)> = vec![];
+                let mut k = j - removed;
+                while k > 0 {
+                    k -= 1;
+                    match &b[k] {
+                        Stmt::Assign { dst: Expr::Member { base, offset, .. }, src } if matches!(**base, Expr::Var(x) if x == v) => {
+                            stores.push((k, *offset, src.clone()));
+                        }
+                        Stmt::Assign { dst: Expr::Member { base, .. }, src } if matches!(**base, Expr::Var(x) if stack(x)) && !src.has_call() => {}
+                        _ => break,
+                    }
+                }
+                let pure = stores.iter().all(|(_, _, e)| !e.has_call() && vars_in(e).iter().all(|&x| !stack(x)));
+                let covers = stores.len() == fields.len() && fields.iter().all(|(o, _)| stores.iter().filter(|s| s.1 == *o).count() == 1);
+                if !pure || !covers || total.get(&v).copied().unwrap_or(0) != stores.len() + 1 {
+                    continue;
+                }
+                // a constructor taking the members in order (scalars and pointers)
+                let base = crate::frameobj::strip_template_args(&cls);
+                let last = sig::split_scope(&base).1.to_string();
+                let fits = db.decls.get(&format!("{base}::{last}")).is_some_and(|ds| {
+                    ds.iter().any(|d| {
+                        d.params.len() == fields.len()
+                            && d.params.iter().zip(&fields).all(|(p, (_, ft))| {
+                                let pt = strip_cv(&p.ty);
+                                !types::is_aggregate(Some(db), pt) && !matches!(pt, Type::Ref(_)) && is_ptr(pt) == is_ptr(ft) && is_float(pt) == is_float(ft)
+                            })
+                    })
+                });
+                if !fits {
+                    continue;
+                }
+                let args: Vec<Expr> = fields
+                    .iter()
+                    .map(|(o, ft)| {
+                        let e = stores.iter().find(|s| s.1 == *o).unwrap().2.clone();
+                        let et = types::ty_of(&e, vars);
+                        if is_ptr(ft) && !is_ptr(strip_cv(&et)) {
+                            Expr::Cast { ty: ft.clone(), e: Box::new(e) }
+                        } else {
+                            e
+                        }
+                    })
+                    .collect();
+                let built = Expr::Construct { class: t.clone(), ctor: None, args };
+                let jj = j - removed;
+                replace_var(&mut b[jj], v, &built);
+                let mut ks: Vec<usize> = stores.iter().map(|s| s.0).collect();
+                ks.sort_unstable();
+                for k in ks.into_iter().rev() {
+                    b.remove(k);
+                    removed += 1;
+                }
+            }
+            j = j + 1 - removed;
+        }
+    });
+}

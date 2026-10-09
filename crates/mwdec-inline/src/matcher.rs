@@ -388,6 +388,14 @@ impl<'a, 'e> M<'a, 'e> {
                 if !compat(ty, &ty_of(rt, self.env.vars), self.env.db) {
                     return false;
                 }
+                // a float parameter can't take a double value (only a double literal the compiler
+                // widened from a float one)
+                if matches!(strip(ty), Type::Float { size: 4 }) && matches!(strip(&ty_of(rt, self.env.vars)), Type::Float { size: 8 }) && std::env::var("MWDI_NO_F64CHECK").is_err() {
+                    let narrow_lit = matches!(rt, Expr::Float { bits, double: true } if (f64::from_bits(*bits) as f32) as f64 == f64::from_bits(*bits));
+                    if !narrow_lit {
+                        return false;
+                    }
+                }
             }
             if let Some(HoleKind::Obj { ptr: false, .. }) = self.t.holes.get(*h) {
                 // a reference parameter used as the object itself (`*this = other`): bound to
@@ -410,6 +418,16 @@ impl<'a, 'e> M<'a, 'e> {
             }
         } else {
             let t = res(t, defs);
+            // a fast-cast helper call in the pattern (the probe's own expansion, named by the
+            // lifter) against the target's opened conversion (see `apply`)
+            if let (Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }, Expr::Cast { ty: Type::Volatile(_), e: inner }) = (p, t) {
+                if args.len() == 1 && FAST_CASTS.iter().any(|(_, s)| s == symbol) {
+                    return self.m(&args[0], inner);
+                }
+                if args.len() == 1 && FAST_LOADS.iter().any(|(_, s)| s == symbol) {
+                    return self.m(&args[0], &Expr::AddrOf(inner.clone()));
+                }
+            }
             // pointer casts don't change values
             if let Expr::Cast { ty, e: inner } = t {
                 if matches!(strip(ty), Type::Ptr(_)) && !matches!(p, Expr::Cast { .. }) {
@@ -425,6 +443,20 @@ impl<'a, 'e> M<'a, 'e> {
             if let Expr::Cast { ty, e: inner } = t {
                 if matches!(strip(ty), Type::Int { size: 4, .. }) && !matches!(p, Expr::Cast { .. }) && vclass(&ty_of(res(inner, defs), self.env.vars), self.env.db) == 2 {
                     return self.m(p, inner);
+                }
+            }
+            // a constant argument the compiler folded into the expansion (`Lerp(a, b, 3.14f)`:
+            // `(1.0f - t)` became `-2.1415927f`): solve the pattern for its free hole
+            if matches!(t, Expr::Float { .. } | Expr::Int { .. }) && matches!(p, Expr::Binary { .. } | Expr::Unary { .. } | Expr::Cast { .. }) && std::env::var("MWDI_NO_SOLVE").is_err() {
+                if let Some(c) = Num::of(t) {
+                    let snap = self.b.clone();
+                    if std::env::var("MWDI_TRACE_SOLVE").is_ok() {
+                        eprintln!("SOLVE {} {p:?} = {c:?}", self.t.name);
+                    }
+                    if self.solve(p, c, 0) {
+                        return true;
+                    }
+                    self.b = snap;
                 }
             }
             match (p, t) {
@@ -445,7 +477,7 @@ impl<'a, 'e> M<'a, 'e> {
                     false
                 }
                 (Expr::Unary { op, e, .. }, Expr::Unary { op: op2, e: e2, .. }) => op == op2 && self.m(e, e2),
-                (Expr::Cast { ty, e }, Expr::Cast { ty: ty2, e: e2 }) => vclass(ty, self.env.db) == vclass(ty2, self.env.db) && self.m(e, e2),
+                (Expr::Cast { ty, e }, Expr::Cast { ty: ty2, e: e2 }) => is_opened_cast(p) == is_opened_cast(t) && vclass(ty, self.env.db) == vclass(ty2, self.env.db) && self.m(e, e2),
                 (Expr::Int { value, .. }, Expr::Int { value: v2, .. }) => value == v2,
                 (Expr::Float { bits, double }, Expr::Float { bits: b2, double: d2 }) => bits == b2 && double == d2,
                 (Expr::Global { symbol, .. }, Expr::Global { symbol: s2, .. }) => symbol == s2 || symbol.strip_prefix(crate::template::LITERAL_PREFIX).is_some_and(|h| literal_hex(s2).as_deref() == Some(h)),
@@ -503,6 +535,97 @@ impl<'a, 'e> M<'a, 'e> {
                 }
                 _ => false,
             }
+        }
+    }
+
+    /// The constant value of pattern `p` under the current bindings (literals and holes bound to
+    /// literals, through + - * / and negation), if it has one.
+    fn const_val(&self, p: &Expr, depth: u32) -> Option<Num> {
+        if depth > 8 {
+            return None;
+        }
+        match p {
+            Expr::Float { .. } | Expr::Int { .. } => Num::of(p),
+            Expr::Var(h) => match (self.t.holes.get(*h), &self.b[*h]) {
+                (Some(HoleKind::Scalar(_)), Some(Bind::Val(v))) => Num::of(res(v, self.defs())),
+                _ => None,
+            },
+            Expr::Unary { op: mwdec_lift::UnOp::Neg, e, .. } => self.const_val(e, depth + 1).map(|v| v.neg()),
+            Expr::Unary { op: mwdec_lift::UnOp::BitNot, e, ty } => match self.const_val(e, depth + 1)? {
+                Num::I(v, s, g) => Num::I(!v, s, g).cast(ty).or(Some(Num::I(!v, s, g))),
+                _ => None,
+            },
+            Expr::Cast { ty, e } => self.const_val(e, depth + 1).and_then(|v| v.cast(ty)),
+            Expr::Binary { op, l, r, ty } => Num::bin(*op, self.const_val(l, depth + 1)?, self.const_val(r, depth + 1)?, ty),
+            _ => None,
+        }
+    }
+
+    /// Make pattern `p` (arithmetic over scalar holes and literals) equal the constant `c`,
+    /// binding its one free scalar hole. The value found is checked by evaluating `p` again
+    /// (the compiler folded the constant expression with the same rounding).
+    fn solve(&mut self, p: &Expr, c: Num, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        if let Some(v) = self.const_val(p, 0) {
+            return v.same(&c);
+        }
+        let ok = match p {
+            Expr::Var(h) => match self.t.holes.get(*h) {
+                Some(HoleKind::Scalar(ty)) if self.b[*h].is_none() => match c.cast(ty) {
+                    Some(v) if v.cast(&c.ty()).is_some_and(|w| w.same(&c)) => {
+                        self.b[*h] = Some(Bind::Val(v.expr()));
+                        true
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            Expr::Unary { op: mwdec_lift::UnOp::Neg, e, .. } => self.solve(e, c.neg(), depth + 1),
+            Expr::Cast { ty, e } => {
+                // (an int or narrower value converted: solve in the operand's type)
+                let inner_ty = self.pat_ty(e);
+                match inner_ty.and_then(|it| c.cast(&it)) {
+                    Some(v) if v.cast(ty).is_some_and(|w| w.same(&c)) => self.solve(e, v, depth + 1),
+                    _ => false,
+                }
+            }
+            Expr::Binary { op, l, r, ty } => {
+                let (kl, kr) = (self.const_val(l, 0), self.const_val(r, 0));
+                let inv = |op: BinOp, k: Num, left_known: bool| -> Option<Num> {
+                    match (op, left_known) {
+                        (BinOp::Add, _) => Num::bin(BinOp::Sub, c, k, ty),
+                        (BinOp::Sub, false) => Num::bin(BinOp::Add, c, k, ty),
+                        (BinOp::Sub, true) => Num::bin(BinOp::Sub, k, c, ty),
+                        (BinOp::Mul, _) if !k.is_zero() => Num::bin(BinOp::Div, c, k, ty),
+                        (BinOp::Div, false) => Num::bin(BinOp::Mul, c, k, ty),
+                        _ => None,
+                    }
+                };
+                match (kl, kr) {
+                    (Some(k), None) => inv(*op, k, true).is_some_and(|v| self.solve(r, v, depth + 1)),
+                    (None, Some(k)) => inv(*op, k, false).is_some_and(|v| self.solve(l, v, depth + 1)),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        // the solution must reproduce the folded constant exactly
+        ok && self.const_val(p, 0).is_some_and(|v| v.same(&c))
+    }
+
+    /// Type of a pattern expression over holes (scalar holes and literals only).
+    fn pat_ty(&self, p: &Expr) -> Option<Type> {
+        match p {
+            Expr::Var(h) => match self.t.holes.get(*h) {
+                Some(HoleKind::Scalar(t)) => Some(t.clone()),
+                _ => None,
+            },
+            Expr::Float { double, .. } => Some(Type::Float { size: if *double { 8 } else { 4 } }),
+            Expr::Int { ty, .. } | Expr::Cast { ty, .. } | Expr::Binary { ty, .. } => Some(ty.clone()),
+            Expr::Unary { e, .. } => self.pat_ty(e),
+            _ => None,
         }
     }
 
@@ -589,8 +712,31 @@ impl<'a, 'e> M<'a, 'e> {
                 out.push(c.clone());
                 continue;
             }
+            // a scalar parameter the expansion never reads (an overload's tag enum, `SetColumn(kDZ,
+            // v)`): any value compiles the same; the enum's first value / zero
+            if self.b[h].is_none() && std::env::var("MWDI_NO_UNUSED_ARG").is_err() {
+                if let HoleKind::Scalar(ty) = k {
+                    let rt = mwdec_lift::types::resolve(Some(self.env.db), strip(ty)).into_owned();
+                    let zero = if mwdec_lift::types::is_enum(Some(self.env.db), &rt) {
+                        Some(Expr::Cast { ty: strip(ty).clone(), e: Box::new(Expr::Int { value: 0, ty: Type::Int { size: 4, signed: true } }) })
+                    } else {
+                        // (only tags: a constructor's unread scalar would explain an object by
+                        // zeros, `CAABox(x, y, 0, 0, 0, z).GetPointE()`)
+                        None
+                    };
+                    if let Some(z) = zero {
+                        out.push(z);
+                        continue;
+                    }
+                }
+            }
             let b = self.b[h].as_ref()?;
             match (k, b) {
+                // a float parameter given a double literal the compiler widened at compile time
+                // (`fmodf(3.1415927f, ..)` -> `fmod(3.1415927410125732, ..)`): the float literal
+                (HoleKind::Scalar(ty), Bind::Val(Expr::Float { bits, double: true })) if std::env::var("MWDI_NO_SOLVE").is_err() && matches!(strip(ty), Type::Float { size: 4 }) && (f64::from_bits(*bits) as f32) as f64 == f64::from_bits(*bits) => {
+                    out.push(Expr::Float { bits: (f64::from_bits(*bits) as f32).to_bits() as u64, double: false })
+                }
                 (HoleKind::Scalar(_), Bind::Val(e)) => out.push(e.clone()),
                 (HoleKind::ScalarRef(t), Bind::Val(e)) => match literal_value(e, t, self.env.db) {
                     // a literal the compiler made for a constant argument: the constant
@@ -646,7 +792,15 @@ impl<'a, 'e> M<'a, 'e> {
                         out.push(a);
                     } else if *temp_ok && depth < 3 && !matches!(self.t.shape, Shape::Stmts { .. }) {
                         let (v, sc) = explain_object(self.env, class, m, depth + 1)?;
-                        score += sc;
+                        // (a one-member object built around a scalar, `sine(CRelAngle::FromRadians(x))`
+                        // for `sinf(x)`, explains nothing more than the scalar: no bonus, a tie-break
+                        // penalty)
+                        if m.len() == 1 && std::env::var("MWDI_NO_SINGLE_EXPLAIN_PENALTY").is_err() {
+                            // (keep its penalties: a constructor fallback stays a last resort)
+                            score += sc.min(0) - 1;
+                        } else {
+                            score += sc;
+                        }
                         // pointer holes (`this` of a const method) take the temporary's address
                         out.push(if *ptr { Expr::AddrOf(Box::new(v)) } else { v });
                     } else if *temp_ok && !*ptr && depth < 3 && whole_object(self.env, class, m) {
@@ -671,6 +825,122 @@ impl<'a, 'e> M<'a, 'e> {
             score += CTOR_PENALTY;
         }
         Some((out, score))
+    }
+}
+
+/// A literal value with its type, for folding constant arguments.
+#[derive(Clone, Copy, Debug)]
+pub enum Num {
+    F32(f32),
+    F64(f64),
+    I(i64, u8, bool),
+}
+
+impl Num {
+    fn of(e: &Expr) -> Option<Num> {
+        match e {
+            Expr::Float { bits, double: false } => Some(Num::F32(f32::from_bits(*bits as u32))),
+            Expr::Float { bits, double: true } => Some(Num::F64(f64::from_bits(*bits))),
+            Expr::Int { value, ty } => match strip(ty) {
+                Type::Int { size, signed } => Some(Num::I(*value, *size, *signed)),
+                Type::Bool | Type::Char => Some(Num::I(*value, 1, false)),
+                _ => Some(Num::I(*value, 4, true)),
+            },
+            _ => None,
+        }
+    }
+    fn ty(&self) -> Type {
+        match self {
+            Num::F32(_) => Type::Float { size: 4 },
+            Num::F64(_) => Type::Float { size: 8 },
+            Num::I(_, size, signed) => Type::Int { size: *size, signed: *signed },
+        }
+    }
+    fn expr(&self) -> Expr {
+        match self {
+            Num::F32(v) => Expr::Float { bits: v.to_bits() as u64, double: false },
+            Num::F64(v) => Expr::Float { bits: v.to_bits(), double: true },
+            Num::I(v, _, _) => Expr::Int { value: *v, ty: self.ty() },
+        }
+    }
+    fn same(&self, o: &Num) -> bool {
+        match (self, o) {
+            (Num::F32(a), Num::F32(b)) => a.to_bits() == b.to_bits(),
+            (Num::F64(a), Num::F64(b)) => a.to_bits() == b.to_bits(),
+            (Num::F32(a), Num::F64(b)) | (Num::F64(b), Num::F32(a)) => (*a as f64).to_bits() == b.to_bits(),
+            (Num::I(a, ..), Num::I(b, ..)) => a == b,
+            _ => false,
+        }
+    }
+    fn is_zero(&self) -> bool {
+        match self {
+            Num::F32(v) => *v == 0.0,
+            Num::F64(v) => *v == 0.0,
+            Num::I(v, ..) => *v == 0,
+        }
+    }
+    fn neg(&self) -> Num {
+        match self {
+            Num::F32(v) => Num::F32(-v),
+            Num::F64(v) => Num::F64(-v),
+            Num::I(v, s, g) => Num::I(-v, *s, *g),
+        }
+    }
+    fn cast(&self, ty: &Type) -> Option<Num> {
+        Some(match (strip(ty), self) {
+            (Type::Float { size: 4 }, Num::F32(v)) => Num::F32(*v),
+            (Type::Float { size: 4 }, Num::F64(v)) => Num::F32(*v as f32),
+            (Type::Float { size: 4 }, Num::I(v, ..)) => Num::F32(*v as f32),
+            (Type::Float { size: 8 }, Num::F32(v)) => Num::F64(*v as f64),
+            (Type::Float { size: 8 }, Num::F64(v)) => Num::F64(*v),
+            (Type::Float { size: 8 }, Num::I(v, ..)) => Num::F64(*v as f64),
+            (Type::Int { size, signed }, n) => {
+                let x: i64 = match n {
+                    Num::F32(v) if v.fract() == 0.0 && v.abs() < 2e9 => *v as i64,
+                    Num::F64(v) if v.fract() == 0.0 && v.abs() < 2e9 => *v as i64,
+                    Num::I(v, ..) => *v,
+                    _ => return None,
+                };
+                let bits = (*size as u32) * 8;
+                let m = if bits >= 64 { x } else if *signed { (x << (64 - bits)) >> (64 - bits) } else { x & ((1i64 << bits) - 1) };
+                Num::I(m, *size, *signed)
+            }
+            _ => return None,
+        })
+    }
+    fn bin(op: BinOp, a: Num, b: Num, ty: &Type) -> Option<Num> {
+        let a = a.cast(ty)?;
+        let b = b.cast(ty)?;
+        Some(match (a, b) {
+            (Num::F32(x), Num::F32(y)) => Num::F32(match op {
+                BinOp::Add => x + y,
+                BinOp::Sub => x - y,
+                BinOp::Mul => x * y,
+                BinOp::Div if y != 0.0 => x / y,
+                _ => return None,
+            }),
+            (Num::F64(x), Num::F64(y)) => Num::F64(match op {
+                BinOp::Add => x + y,
+                BinOp::Sub => x - y,
+                BinOp::Mul => x * y,
+                BinOp::Div if y != 0.0 => x / y,
+                _ => return None,
+            }),
+            (Num::I(x, s, g), Num::I(y, ..)) => {
+                let v = match op {
+                    BinOp::Add => x.wrapping_add(y),
+                    BinOp::Sub => x.wrapping_sub(y),
+                    BinOp::Mul => x.wrapping_mul(y),
+                    BinOp::Shl if (0..32).contains(&y) => x << y,
+                    BinOp::And => x & y,
+                    BinOp::Or => x | y,
+                    BinOp::Xor => x ^ y,
+                    _ => return None,
+                };
+                Num::I(v, s, g).cast(&Type::Int { size: s, signed: g })?
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -935,6 +1205,9 @@ fn const_object(a: &Expr, env: &Env) -> bool {
 }
 
 pub fn explain_object(env: &Env, cls: &str, m: &BTreeMap<i32, Expr>, depth: u32) -> Option<(Expr, i32)> {
+    if std::env::var("MWDI_TRACE_SOLVE").is_ok() {
+        eprintln!("EXPLAIN {cls} {:?} {m:?}", env.objects.get(&mwdec_lift::sig::norm_name(cls)).map(|l| l.iter().map(|i| env.lib.templates[*i].name.clone()).collect::<Vec<_>>()));
+    }
     let list = env.objects.get(&mwdec_lift::sig::norm_name(cls))?;
     let mut best: Option<(Expr, i32)> = None;
     // one value in every component, computed once (`CVector3f(r, r, r)`): the member-wise
@@ -953,6 +1226,12 @@ pub fn explain_object(env: &Env, cls: &str, m: &BTreeMap<i32, Expr>, depth: u32)
         let mut mm = M::new(env, t);
         let ok = comps.iter().filter(|c| m.contains_key(&c.off)).all(|c| mm.m(&c.pat, &m[&c.off]));
         if !ok {
+            continue;
+        }
+        // a template that hands one object hole's components back unchanged explains nothing
+        // (`DepthCompareUpdate(false, false)` specialised to a copy): its nested explanation
+        // would be the same object again
+        if std::env::var("MWDI_NO_IDENTITY_GUARD").is_err() && mm.b.iter().any(|b| matches!(b, Some(Bind::Comps(c)) if c.len() == m.len() && c.iter().all(|(o, v)| m.get(o).is_some_and(|w| teq(v, w, env.defs))))) {
             continue;
         }
         if let Some((args, extra)) = mm.finalize(depth) {
@@ -1013,7 +1292,7 @@ fn collect_defs(body: &[Stmt], n: &HashMap<VarId, usize>, vars: &[Var], out: &mu
     for s in body {
         match s {
             Stmt::Assign { dst: Expr::Var(v), src } => {
-                if n.get(v) == Some(&1) && matches!(vars[*v].kind, VarKind::Local) && !src.has_call() && !src.uses_var(*v) {
+                if n.get(v) == Some(&1) && matches!(vars[*v].kind, VarKind::Local) && only_inline_calls(src) && !src.uses_var(*v) {
                     out.insert(*v, src.clone());
                 }
             }
@@ -1096,9 +1375,33 @@ pub fn index(lib: &InlineLib) -> Index {
                     member_refs.push((i, k));
                 }
             }
+        }
+        // the same with tag parameters the expansion never reads (`GetRow(EDimY)`), or the
+        // object itself reinterpreted (`GetRow(EDimX)`: `*reinterpret_cast<const CVector3f*>(&m00)`)
+        if let (Shape::Scalar(p), CallKind::Method, false) = (&t.shape, &t.kind, op_name) {
+            let tags = t.holes.len() > 1 && t.holes[1..].iter().enumerate().all(|(k, h)| matches!(h, HoleKind::Scalar(_)) && !p.uses_var(k + 1));
+            let reinterp = matches!(p, Expr::Var(0)) && ref_pointee_class(t).is_some_and(|c| t.class.as_deref().is_some_and(|tc| mwdec_lift::sig::norm_name(tc) != mwdec_lift::sig::norm_name(&c)));
+            if (tags || (t.holes.len() == 1 && reinterp)) && (matches!(p, Expr::AddrOf(_)) || reinterp) && t.dead.is_empty() && std::env::var_os("MWDI_TAGGED_REFS").is_some() {
+                if let Some((0, k)) = pat_canon(p, &t.holes) {
+                    member_refs.push((i, k));
+                }
+            }
+        }
+        if let (Shape::Scalar(p), CallKind::Method, 1, false) = (&t.shape, &t.kind, t.holes.len(), op_name) {
             // (a scalar result: by-value class returns are object templates)
-            let scalar_ret = !matches!(strip(&t.sig.ret), Type::Named(_)) && mwdec_lift::scalar_size(strip(&t.sig.ret)).is_some();
-            if !t.ret_ref && t.dead.is_empty() && scalar_ret {
+            let mut scalar_ret = !matches!(strip(&t.sig.ret), Type::Named(_)) && mwdec_lift::scalar_size(strip(&t.sig.ret)).is_some();
+            // (through a conversion to the declared return type: `EType GetType() const { return
+            // static_cast<EType>(mType); }`)
+            let p = match p {
+                Expr::Cast { e, ty } if std::env::var("MWDI_NO_CAST_READS").is_err() && strip(ty) == strip(&t.sig.ret) && matches!(&**e, Expr::Load { .. } | Expr::Member { .. }) => {
+                    scalar_ret = true;
+                    &**e
+                }
+                p => p,
+            };
+            // (an enum result too: checked against the TypeDb where the template is used)
+            let named_ret = matches!(strip(&t.sig.ret), Type::Named(_)) && std::env::var("MWDI_NO_CAST_READS").is_err();
+            if !t.ret_ref && t.dead.is_empty() && (scalar_ret || named_ret) {
                 if let Some((0, k, ty)) = comp_of(p, &t.holes) {
                     member_reads.push((i, k, ty.clone()));
                 }
@@ -1110,7 +1413,11 @@ pub fn index(lib: &InlineLib) -> Index {
             }
             Shape::Scalar(p) => {
                 // (a plain read only with the dead stores of a by-value class to tell it apart)
-                if (t.ops >= 1 && !matches!(p, Expr::Var(_) | Expr::Load { .. } | Expr::Member { .. } | Expr::AddrOf(_) | Expr::Cast { .. })) || !t.dead.is_empty() {
+                // (a converted call result, `(float)atan2((double)y, (double)x)`, is specific: the
+                // library forwarders of math.h; an element read `(&mX)[i]` too)
+                let conv_call = matches!(p, Expr::Cast { e, .. } if matches!(&**e, Expr::Call { .. }) || (t.ops >= 1 && !matches!(&**e, Expr::Var(_) | Expr::Load { .. } | Expr::Member { .. } | Expr::Cast { .. }))) && std::env::var("MWDI_NO_CONVCALL").is_err();
+                let elem = matches!(p, Expr::Index { .. }) && std::env::var("MWDI_NO_ELEMREAD").is_err();
+                if (t.ops >= 1 && !matches!(p, Expr::Var(_) | Expr::Load { .. } | Expr::Member { .. } | Expr::AddrOf(_) | Expr::Cast { .. })) || !t.dead.is_empty() || conv_call || elem {
                     scalars.push(i);
                     if crate::cflow::has_cflow(p) {
                         cflow.push(i);
@@ -1180,11 +1487,43 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     LITERALS.with(|d| *d.borrow_mut() = ir.literal_bytes.iter().cloned().collect());
     TEMPS.with(|d| *d.borrow_mut() = ir.temp_bytes.iter().cloned().collect());
     crate::walkptr::apply(ir, lib, db);
+    PURE_OK.with(|p| *p.borrow_mut() = Some(lib.effectful.clone()));
+    NAMED.with(|n| n.borrow_mut().clear());
+    // the lifter names the fast-cast helpers' expansions (`psq_st` / `psq_l` through the
+    // quantization registers) as their calls (`CCast::ToUint8(f)`, `CCast::ToReal32(b)`); inline
+    // bodies that convert through them (`CColor::WithAlphaOf`: `(mRgba & ~0xff) | ToUint8(a *
+    // 255.f)`) see the conversion, so for matching they are opened into a tagged cast, and the
+    // ones no fold consumed become the call again
+    let fast = std::env::var("MWDI_NO_FASTCAST_OPEN").is_err();
+    if fast {
+        open_fast_casts(&mut ir.body);
+    }
     let n = apply_inner(ir, lib, db);
+    if fast {
+        restore_fast_casts(ir, db);
+    }
+    PURE_OK.with(|p| *p.borrow_mut() = None);
     TARGET_DEAD.with(|d| d.borrow_mut().clear());
     LITERALS.with(|d| d.borrow_mut().clear());
     TEMPS.with(|d| d.borrow_mut().clear());
     n
+}
+
+/// Only folded inline calls (a template's or a trivial accessor's call, no real call): the
+/// value of such a temp is pure, so it can be looked through like any expression (`t =
+/// fabs(x); ... (float)t` is `fabsf(x)`) and dropped when dead.
+pub fn only_inline_calls(e: &Expr) -> bool {
+    if std::env::var("MWDI_NO_PURE_CALL_DEFS").is_ok() {
+        return !e.has_call();
+    }
+    let mut ok = true;
+    e.walk(&mut |x| match x {
+        Expr::Call { callee: Callee::Direct { sig, symbol }, .. } => ok &= sig.mangled.is_none() && *symbol == sig.qualified_name,
+        Expr::Call { callee: Callee::Method { sig, symbol, .. }, .. } => ok &= symbol.is_empty() && sig.mangled.is_none(),
+        Expr::Call { .. } | Expr::New { .. } => ok = false,
+        _ => {}
+    });
+    ok
 }
 
 thread_local! {
@@ -1213,6 +1552,32 @@ pub fn member_accessible(db: &TypeDb, owner: &str, field: &str) -> bool {
         Some(mwdec_core::Access::Protected) => befriended() || own.as_deref().is_some_and(|o| is_base_or_same_any(db, owner, o)),
         Some(mwdec_core::Access::Private) => befriended(),
     }
+}
+
+/// Class a reference/pointer-returning template returns (`const CVector3f&` -> CVector3f).
+fn ref_pointee_class(t: &Template) -> Option<String> {
+    match strip(&t.sig.ret) {
+        Type::Ref(x) | Type::Ptr(x) => match strip(x) {
+            Type::Named(n) => Some(n.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Default arguments for the holes after the object (tags the expansion never reads).
+fn tag_defaults(t: &Template) -> Vec<Expr> {
+    t.holes[1..]
+        .iter()
+        .map(|h| match h {
+            HoleKind::Scalar(ty) => match strip(ty) {
+                Type::Named(_) => Expr::Cast { ty: strip(ty).clone(), e: Box::new(Expr::Int { value: 0, ty: Type::Int { size: 4, signed: true } }) },
+                Type::Float { size: 4 } => Expr::Float { bits: 0, double: false },
+                t => Expr::Int { value: 0, ty: t.clone() },
+            },
+            _ => Expr::Int { value: 0, ty: Type::Int { size: 4, signed: true } },
+        })
+        .collect()
 }
 
 /// Can the function name the object at `delta` inside what `b` points at (every member on the
@@ -1417,6 +1782,17 @@ fn accessor_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
             return 1 + name_inside(e, call, env, idx);
         }
     }
+    // an object lvalue the function can't name (passed by reference / copied): the accessor
+    // returning a reference to it
+    if let Expr::Load { ty, .. } | Expr::Member { ty, .. } = &*e {
+        if class_name(ty, env.db).is_some() && std::env::var_os("MWDI_TAGGED_REFS").is_some() {
+            if let Some(Expr::AddrOf(c)) = member_ref_call(&Expr::AddrOf(Box::new(e.clone())), env, idx) {
+                note_named(&c);
+                *e = *c;
+                return 1 + accessor_expr(e, env, idx);
+            }
+        }
+    }
     let mut n = 0;
     match e {
         // the address of a member lvalue: its base only (a value accessor's call is no lvalue)
@@ -1431,12 +1807,33 @@ fn accessor_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
         Expr::Binary { l, r, .. } => n += accessor_expr(l, env, idx) + accessor_expr(r, env, idx),
         Expr::Ternary { c, t, f, .. } => n += accessor_expr(c, env, idx) + accessor_expr(t, env, idx) + accessor_expr(f, env, idx),
         Expr::Call { callee, args, .. } => {
+            let params: Vec<Type> = match &*callee {
+                Callee::Direct { sig, .. } | Callee::Method { sig, .. } => sig.params.iter().map(|p| p.ty.clone()).collect(),
+                Callee::Virtual { sig: Some(sig), .. } => sig.params.iter().map(|p| p.ty.clone()).collect(),
+                _ => vec![],
+            };
             match callee {
                 Callee::Method { this, .. } | Callee::Virtual { this, .. } => n += accessor_expr(this, env, idx),
                 Callee::Indirect(x) => n += accessor_expr(x, env, idx),
                 _ => {}
             }
-            for a in args {
+            for (i, a) in args.iter_mut().enumerate() {
+                // an object pointer passed where another class is expected (`const CVector3f&`
+                // given a `CTransform4f*`): the object's accessor returning that class
+                // (`xf.GetRow(kDX)` = `*reinterpret_cast<const CVector3f*>(&m00)`)
+                if let Some(pt) = params.get(i) {
+                    if let (Type::Ref(x) | Type::Ptr(x), true) = (strip(pt), std::env::var_os("MWDI_TAGGED_REFS").is_some()) {
+                        if class_name(x, env.db).is_some() && matches!(vclass(&ty_of(a, env.vars), env.db), 2) {
+                            let cast = Expr::Cast { ty: Type::Ptr(x.clone()), e: Box::new(a.clone()) };
+                            if let Some(Expr::AddrOf(c)) = member_ref_call(&cast, env, idx) {
+                                note_named(&c);
+                                *a = Expr::AddrOf(c);
+                                n += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 n += accessor_expr(a, env, idx);
             }
         }
@@ -1509,10 +1906,32 @@ fn object_as_written(e: &Expr, b: &Expr, off: i32, cls: &str, env: &Env) -> Opti
     Some(canon)
 }
 
+thread_local! {
+    /// Calls the accessor naming pass made (qualified names), for measurement: a naming of a
+    /// member the function can't access is not an inline recovered from its expansion.
+    static NAMED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn note_named(call: &Expr) {
+    let c = match call {
+        Expr::AddrOf(x) => &**x,
+        c => c,
+    };
+    if let Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } = c {
+        NAMED.with(|n| n.borrow_mut().push(sig.qualified_name.clone()));
+    }
+}
+
+/// The accessor-naming calls of the last [`apply`] on this thread (cleared by the call).
+pub fn take_named() -> Vec<String> {
+    NAMED.with(|n| std::mem::take(&mut *n.borrow_mut()))
+}
+
 /// Replace `e` by its accessor call, then name what the call's own object is reached through
 /// (`bc.GetOwner().GetModelData()`): not that object's address itself, which an accessor of an
 /// enclosing object at the same address would name again, around and around.
 fn name_inside(e: &mut Expr, call: Expr, env: &Env, idx: &Index) -> usize {
+    note_named(&call);
     *e = call;
     let c = match e {
         Expr::AddrOf(x) => &mut **x,
@@ -1545,11 +1964,33 @@ fn acc_rank(name: &str, is_const: bool) -> u8 {
 fn member_ref_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
     // explicit member addresses only (a plain object pointer is not the address of its first
     // member)
-    let explicit = match e {
-        Expr::AddrOf(x) => matches!(&**x, Expr::Load { .. } | Expr::Member { .. }),
-        Expr::Binary { op: BinOp::Add, r, .. } => matches!(&**r, Expr::Int { value, .. } if *value > 0),
-        _ => false,
+    // (or an object pointer reinterpreted as another class: `(const CVector3f*)xf`)
+    let cast_to: Option<String> = match e {
+        Expr::Cast { ty: Type::Ptr(x), e: inner } if std::env::var_os("MWDI_TAGGED_REFS").is_some() => {
+            let to = class_name(x, env.db);
+            let from = mwdec_lift::pointee(&ty_of(inner, env.vars)).and_then(|t| class_name(t, env.db));
+            to.filter(|t| from.is_some_and(|f| mwdec_lift::sig::norm_name(&f) != mwdec_lift::sig::norm_name(t)))
+        }
+        // `*(const T*)p` read as an object at the start of another class's object
+        Expr::AddrOf(x) if std::env::var_os("MWDI_TAGGED_REFS").is_some() => match &**x {
+            Expr::Load { base, offset: 0, ty } => {
+                let to = class_name(ty, env.db);
+                let from = mwdec_lift::pointee(&ty_of(base, env.vars)).and_then(|t| class_name(t, env.db));
+                to.filter(|t| from.is_some_and(|f| mwdec_lift::sig::norm_name(&f) != mwdec_lift::sig::norm_name(t) && !is_base_or_same(env.db, t, &f)))
+            }
+            _ => None,
+        },
+        _ => None,
     };
+    if std::env::var("MWDI_TRACE_ACC").is_ok() && matches!(e, Expr::Cast { .. } | Expr::AddrOf(_)) {
+        eprintln!("MREF cast {e:?} -> {cast_to:?}");
+    }
+    let explicit = cast_to.is_some()
+        || match e {
+            Expr::AddrOf(x) => matches!(&**x, Expr::Load { .. } | Expr::Member { .. }),
+            Expr::Binary { op: BinOp::Add, r, .. } => matches!(&**r, Expr::Int { value, .. } if *value > 0),
+            _ => false,
+        };
     if !explicit || !matches!(vclass(&ty_of(e, env.vars), env.db), 2) {
         return None;
     }
@@ -1573,7 +2014,15 @@ fn member_ref_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
         if !object_path_ok(env.db, &b, o - k, env) {
             continue;
         }
-        if k == 0 {
+        // reinterpreted: the accessor must return that class
+        if let Some(to) = &cast_to {
+            if !ref_pointee_class(t).is_some_and(|c| mwdec_lift::sig::norm_name(&c) == mwdec_lift::sig::norm_name(to)) {
+                continue;
+            }
+        } else if matches!(t.shape, Shape::Scalar(Expr::Var(_))) {
+            continue;
+        }
+        if k == 0 && cast_to.is_none() {
             // the object's own address: only through an explicit member lvalue of another type
             let Expr::AddrOf(x) = e else { continue };
             if class_name(&ty_of(x, env.vars), env.db).map_or(true, |c| is_base_or_same(env.db, class, &c)) {
@@ -1670,7 +2119,9 @@ fn member_ref_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
     }
     let (_, ti, addr) = best?;
     let t = &env.lib.templates[ti];
-    let mut call = make_call(t, vec![addr]);
+    let mut args = vec![addr];
+    args.extend(tag_defaults(t));
+    let mut call = make_call(t, args);
     if t.ret_ref {
         if let (Expr::Call { ret, .. }, Type::Ref(inner)) = (&mut call, strip(&t.sig.ret)) {
             *ret = (**inner).clone();
@@ -1692,6 +2143,9 @@ fn member_read_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
     let mut best: Option<(u8, String, usize, Expr)> = None;
     for (ti, k, ty) in &idx.member_reads {
         let t = &env.lib.templates[*ti];
+        if matches!(strip(&t.sig.ret), Type::Named(_)) && !mwdec_lift::types::is_enum(Some(env.db), strip(&t.sig.ret)) {
+            continue;
+        }
         if *k != o && o < *k {
             continue;
         }
@@ -1781,6 +2235,66 @@ fn member_read_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
     Some(Expr::Call { callee: Callee::Method { symbol: String::new(), sig: a.sig.clone(), this: Box::new(addr), qualified: false }, args: vec![], ret: a.sig.ret.clone() })
 }
 
+/// The lifter's fast-cast helpers for quantized stores (float -> u8, u16, s8, s16).
+const FAST_CASTS: [(&str, &str); 4] = [("CCast::ToUint8", "ToUint8__5CCastFf"), ("CCast::FtoUS", "FtoUS__5CCastFf"), ("CCast::ToInt8", "ToInt8__5CCastFf"), ("CCast::FtoS", "FtoS__5CCastFf")];
+/// ... and for quantized loads (u8, s16 -> float), taking the integer by reference.
+const FAST_LOADS: [(&str, &str); 2] = [("CCast::ToReal32", "ToReal32__5CCastFRCUc"), ("CCast::StoF", "StoF__5CCastFRCs")];
+
+/// A conversion opened from a fast-cast helper call: the cast's type is wrapped in `Volatile`.
+fn is_opened_cast(e: &Expr) -> bool {
+    matches!(e, Expr::Cast { ty: Type::Volatile(_), .. })
+}
+
+fn open_fast_casts(body: &mut [Stmt]) {
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Call { callee: Callee::Direct { symbol, .. }, args, ret } = e else { return };
+        if args.len() != 1 {
+            return;
+        }
+        if FAST_CASTS.iter().any(|(_, s)| s == symbol) {
+            *e = Expr::Cast { ty: Type::Volatile(Box::new(ret.clone())), e: Box::new(args[0].clone()) };
+        } else if FAST_LOADS.iter().any(|(_, s)| s == symbol) {
+            if let Expr::AddrOf(x) = &args[0] {
+                *e = Expr::Cast { ty: Type::Volatile(Box::new(ret.clone())), e: x.clone() };
+            }
+        }
+    });
+}
+
+fn restore_fast_casts(ir: &mut IrFunction, db: &TypeDb) {
+    let vars = ir.vars.clone();
+    let mut restore = |e: &mut Expr| {
+        let Expr::Cast { ty: Type::Volatile(qt), e: x } = e else { return };
+        let call = |sym: &str, arg: Expr, ret: Type| Expr::Call { callee: Callee::Direct { symbol: sym.to_string(), sig: mwdec_lift::sig::sig_of(sym, Some(db)) }, args: vec![arg], ret };
+        let store = match strip(qt) {
+            Type::Int { size: 1, signed: false } => Some(0),
+            Type::Int { size: 2, signed: false } => Some(1),
+            Type::Int { size: 1, signed: true } => Some(2),
+            Type::Int { size: 2, signed: true } => Some(3),
+            _ => None,
+        };
+        if let Some(k) = store {
+            *e = call(FAST_CASTS[k].1, (**x).clone(), (**qt).clone());
+            return;
+        }
+        let load = match strip(&ty_of(x, &vars)) {
+            Type::Int { size: 1, signed: false } => Some(0),
+            Type::Int { size: 2, signed: true } => Some(1),
+            _ => None,
+        };
+        match load {
+            Some(k) => *e = call(FAST_LOADS[k].1, Expr::AddrOf(x.clone()), (**qt).clone()),
+            None => *e = Expr::Cast { ty: (**qt).clone(), e: x.clone() },
+        }
+    };
+    Stmt::rewrite_exprs(&mut ir.body, &mut restore);
+    for init in ir.init_list.iter_mut() {
+        for a in init.args.iter_mut() {
+            a.rewrite(&mut restore);
+        }
+    }
+}
+
 thread_local! {
     /// Bytes of the function's literal symbols while it is being rewritten.
     static LITERALS: std::cell::RefCell<HashMap<String, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
@@ -1846,6 +2360,14 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         total += crate::buffers::type_object_slots(ir, db);
     }
     total += crate::util::prof::time(0, || crate::objlocals::group(ir, lib, &idx, db));
+    if std::env::var("MWDI_DUMP_IR").is_ok_and(|f| ir.symbol.contains(f.as_str())) {
+        for st in &ir.body {
+            eprintln!("IR {st:?}");
+        }
+        for (k, v) in ir.vars.iter().enumerate() {
+            eprintln!("VAR {k} {:?} {:?}", v.kind, v.ty);
+        }
+    }
     // by-value accessor results bound to a reference local (their dead stores), before folding
     // so the folds read the local's members
     total += crate::reflocal::apply(ir, lib, db);
@@ -1970,6 +2492,27 @@ pub fn drop_write_only_stack(body: &mut Vec<Stmt>, vars: &[Var]) {
 
 /// Scalar templates in the statement's own expressions (not its nested statement lists).
 pub fn scalar_shallow(s: &mut Stmt, env: &Env, idx: &Index) -> usize {
+    // an object built in place by its (out-of-line) member-wise constructor: the value of an
+    // object-valued inline (`CVector2f::Lerp(a, b, t)` returning `CVector2f(x, y)`)
+    if std::env::var("MWDI_NO_CTOR_EXPLAIN").is_err() {
+        if let Stmt::Expr(Expr::Call { callee: Callee::Method { sig, this, .. }, args, .. }) = &*s {
+            if let (Some(cls), Expr::AddrOf(slot)) = (sig.this_class.as_deref(), &**this) {
+                let (_, last) = mwdec_lift::sig::split_scope(&sig.qualified_name);
+                let ctor = mwdec_lift::sig::split_scope(cls).1.split('<').next() == Some(last);
+                if ctor && matches!(&**slot, Expr::Var(_)) && args.len() > 1 && args.iter().any(|a| !matches!(a, Expr::Int { .. } | Expr::Float { .. })) {
+                    if let Some(fields) = crate::template::flat_fields(env.db, cls).filter(|f| f.len() == args.len()) {
+                        let m: BTreeMap<i32, Expr> = fields.iter().zip(args.iter()).map(|((o, _), a)| (*o, a.clone())).collect();
+                        if let Some((call, sc)) = explain_object(env, cls, &m, 0) {
+                            if sc >= MIN_SCORE && !matches!(call, Expr::Construct { .. }) {
+                                *s = Stmt::Assign { dst: (**slot).clone(), src: call };
+                                return 1 + scalar_shallow(s, env, idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     match s {
         Stmt::Expr(e) | Stmt::Return(Some(e)) => scalar_expr(e, env, idx),
         Stmt::Assign { dst, src } => {
@@ -2065,6 +2608,7 @@ fn root_ok(p: &Expr, t: &Expr) -> bool {
         (Expr::Binary { op, .. }, Expr::Binary { op: o2, .. }) => op == o2,
         (Expr::Unary { op, .. }, Expr::Unary { op: o2, .. }) => op == o2,
         (Expr::Call { .. }, Expr::Call { .. }) | (Expr::Ternary { .. }, Expr::Ternary { .. }) | (Expr::Index { .. }, Expr::Index { .. }) => true,
+        (Expr::Cast { e: a, .. }, Expr::Cast { e: b, .. }) => matches!((&**a, &**b), (Expr::Call { .. }, Expr::Call { .. })) || (!matches!(&**a, Expr::Cast { .. }) && root_ok(a, b)),
         _ => false,
     }
 }
@@ -2155,7 +2699,16 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
                 }
                 continue;
             };
-            let sc = use_score(t, extra, false, &args);
+            let mut sc = use_score(t, extra, false, &args);
+            // an element read of an object (`v[i]` = `(&v.mX)[i]`): the object binding is the
+            // evidence (no operator nodes to count)
+            if matches!(p, Expr::Index { .. }) && t.ops == 0 && std::env::var("MWDI_NO_ELEMREAD").is_err() {
+                // (a const object only has the const overload)
+                if matches!(t.kind, CallKind::Method) && !t.sig.is_const && args.first().is_some_and(|a| const_object(a, env)) {
+                    continue;
+                }
+                sc = sc.max(MIN_SCORE);
+            }
             if tr {
                 eprintln!("SCALAR {} score {sc}", t.name);
             }
@@ -2284,6 +2837,29 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
 }
 
 /// Remove definitions of local temps that are no longer read.
+/// A value dce may drop: no call, or (`PURE_NAMES` set) only folded calls of side-effect-free
+/// inlines.
+fn pure_value(src: &Expr) -> bool {
+    if !src.has_call() {
+        return true;
+    }
+    if !only_inline_calls(src) || std::env::var("MWDI_NO_PURE_CALL_DEFS").is_ok() {
+        return false;
+    }
+    let mut ok = true;
+    src.walk(&mut |x| {
+        if let Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } = x {
+            ok &= PURE_OK.with(|p| p.borrow().as_ref().is_some_and(|eff| !eff.contains(&sig.qualified_name)));
+        }
+    });
+    ok
+}
+
+thread_local! {
+    /// Names of effectful inlines of the library in use (None outside `apply`).
+    static PURE_OK: std::cell::RefCell<Option<std::collections::HashSet<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn dce(body: &mut Vec<Stmt>, vars: &[Var]) {
     loop {
         let mut uses: HashMap<VarId, usize> = HashMap::new();
@@ -2298,7 +2874,7 @@ pub fn dce(body: &mut Vec<Stmt>, vars: &[Var]) {
         let mut changed = false;
         Stmt::for_each_block_mut(body, &mut |b| {
             b.retain(|s| match s {
-                Stmt::Assign { dst: Expr::Var(v), src } if matches!(vars[*v].kind, VarKind::Local) && !src.has_call() => {
+                Stmt::Assign { dst: Expr::Var(v), src } if matches!(vars[*v].kind, VarKind::Local) && pure_value(src) => {
                     let reads = uses.get(v).copied().unwrap_or(0) - dsts.get(v).copied().unwrap_or(0).min(uses.get(v).copied().unwrap_or(0));
                     if reads == 0 {
                         changed = true;
@@ -2397,7 +2973,7 @@ pub fn unfold_pub(e: &Expr, env: &Env) -> Option<Expr> {
 
 /// The expansion of a folded scalar inline call (`v.size()` -> `v.mCount`), from its template,
 /// when every hole is a plain value or object pointer.
-fn unfold(e: &Expr, env: &Env) -> Option<Expr> {
+pub(crate) fn unfold(e: &Expr, env: &Env) -> Option<Expr> {
     let Expr::Call { callee, args, .. } = e else { return None };
     let (sig, this) = match callee {
         Callee::Method { sig, this, .. } if sig.mangled.is_none() => (sig, Some(&**this)),

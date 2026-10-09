@@ -416,12 +416,20 @@ fn short(s: &str) -> String {
     s.chars().take(60).collect()
 }
 
+thread_local! {
+    /// The accessor naming pass's calls of the last [`diagnose_fn`] (reported apart).
+    static IW_NAMED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Candidates, and the inline calls the draft did fold (their method names).
 fn diagnose_fn(ui: &UnitInputs, f: &Function, max: usize, only: Option<&[String]>) -> Result<(Vec<Candidate>, Vec<String>, Vec<String>)> {
     let db = ui.db.as_ref().ok_or_else(|| anyhow!("no TypeDb"))?;
     let mut ir = mwdec_lift::lift_function(ui.lift_obj.as_ref().unwrap_or(&ui.target), f, Some(db))?;
     let lib = ui.inlines.get(ui, &format!("{}\n{}", ui.mwcc.compiler, ui.ctx.cflags.join(" ")));
     mwdec_inline::apply(&mut ir, &lib, db);
+    // (measurement: the accessor naming pass's calls, reported apart from recovered inlines)
+    let named: Vec<String> = mwdec_inline::matcher::take_named().iter().map(|q| method_name(q).to_string()).collect();
+    IW_NAMED.with(|n| *n.borrow_mut() = named);
     let mut folded: Vec<String> = vec![];
     Stmt::walk_exprs(&ir.body, &mut |e| {
         if let Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } = e {
@@ -515,7 +523,7 @@ pub fn cmd_inline_why(root: &Path, work: &Path, unit: Option<String>, symbol: Op
             }
             if let Some(f) = outf.as_mut() {
                 use std::io::Write;
-                let _ = writeln!(f, "{}", serde_json::json!({"unit": uname, "symbol": s, "folded": folded, "known": known, "candidates": cands.iter().map(|c| c.json()).collect::<Vec<_>>()}));
+                let _ = writeln!(f, "{}", serde_json::json!({"unit": uname, "symbol": s, "folded": folded, "named": IW_NAMED.with(|n| n.borrow().clone()), "known": known, "candidates": cands.iter().map(|c| c.json()).collect::<Vec<_>>()}));
             }
         }
     }

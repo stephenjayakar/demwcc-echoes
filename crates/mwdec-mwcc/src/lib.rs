@@ -21,6 +21,7 @@ pub mod compare;
 pub mod placeholder;
 mod fast;
 mod split;
+pub mod sweep;
 pub use fast::FastStats;
 pub use compare::{compare, compare_detailed, compare_indexed, Detailed, DiffClass, ExternIndex, ObjIndex};
 pub use placeholder::PlaceholderProver;
@@ -162,7 +163,8 @@ impl Drop for PoolGuard<'_> {
 /// Output of one successful compile.
 #[derive(Debug, Clone)]
 pub struct Compiled {
-    /// Object bytes (also written to `obj_path` unless served from the memory cache).
+    /// Object bytes (also at `obj_path` when that is set: the on-disk cache entry, or the
+    /// object a `compile_tu` call leaves for its caller).
     pub obj: Arc<Vec<u8>>,
     /// Where the object was written (may be a cache file).
     pub obj_path: PathBuf,
@@ -260,6 +262,10 @@ impl MemCache {
     }
 }
 
+/// Messages of a compile failure a persistent compiler reported without confirmation by a normal
+/// compile (a trusted failure of the fast path).
+pub const UNCONFIRMED_FAILURE: &str = "compile failed (persistent compiler; messages not collected)";
+
 /// Compiler driver bound to a project root.
 pub struct Mwcc {
     /// Project root; compiler cwd.
@@ -285,6 +291,8 @@ impl Mwcc {
     /// Driver with `jobs` parallel compiler processes, scratch under `work`
     /// (`work/tmp`, `work/pch`, `work/cache`).
     pub fn new(root: &Path, work: &Path, jobs: usize) -> Mwcc {
+        // scratch that ended processes left behind (once per work dir and process)
+        sweep::sweep_once(work);
         Mwcc {
             root: root.to_path_buf(),
             compiler: DEFAULT_COMPILER.to_string(),
@@ -317,7 +325,10 @@ impl Mwcc {
 
     /// Run the compiler with `args` (cwd = root), bounded by the pool. Returns (status ok, messages, ms).
     fn run(&self, args: &[String], log_stem: &Path) -> Result<(bool, Option<i32>, String, f64), MwccError> {
+        let w = Instant::now();
         let _slot = self.pool.acquire();
+        mwdec_core::prof::add("mwcc.slot_wait", w.elapsed().as_secs_f64());
+        let _p = mwdec_core::prof::span("mwcc.process");
         let out_path = log_stem.with_extension("log");
         let out = std::fs::File::create(&out_path).map_err(io("creating compiler log"))?;
         let err = out.try_clone().map_err(io("cloning log handle"))?;
@@ -443,6 +454,10 @@ impl Mwcc {
         args.extend(["-c".into(), win_path(&src), "-o".into(), win_path(&obj)]);
         let res = self.run(&args, &stem);
         let _ = std::fs::remove_file(&src);
+        if res.is_err() {
+            // (a compiler killed on timeout may have left a partial object)
+            let _ = std::fs::remove_file(&obj);
+        }
         let (ok, status, messages, ms) = res?;
         if !ok {
             let _ = std::fs::remove_file(&obj);
@@ -485,6 +500,7 @@ impl Mwcc {
     /// Run the precompiler on `context` into a new uniquely named `.mch` in `dir` (retrying when
     /// the compiler could not open one of our files).
     fn build_mch(&self, context: &str, cflags: &[String], dir: &Path, stem_name: &str) -> Result<PathBuf, MwccError> {
+        let _p = mwdec_core::prof::span("mwcc.pch_build");
         std::fs::create_dir_all(dir).map_err(io("creating pch dir"))?;
         let mut attempt = 0;
         loop {
@@ -548,14 +564,23 @@ impl Mwcc {
         let cached = self.mem_cache.lock().unwrap().get(&key).cloned();
         match cached {
             Some(Ok((_, true))) if !allow_fast => {}
-            Some(e) => return hit(e, self.cache_path(key, "o").unwrap_or_default()),
+            Some(e) => {
+                mwdec_core::prof::add("mwcc.hit_mem", 0.0);
+                return hit(e, self.cache_path(key, "o").unwrap_or_default());
+            }
             None => {}
         }
         if let Some(e) = self.disk_get(key) {
+            mwdec_core::prof::add("mwcc.hit_disk", 0.0);
             self.mem_cache.lock().unwrap().insert(key, e.clone());
             return hit(e, self.cache_path(key, "o").unwrap_or_default());
         }
         let mut fast_failed = None;
+        // Test hook: a persistent compiler that wrongly reports (and trusts) a compile failure
+        // for candidates containing this text.
+        if allow_fast && std::env::var("MWDEC_TEST_TRUSTED_FAIL").is_ok_and(|t| !t.is_empty() && code.contains(t.as_str())) {
+            return Err(MwccError::Compile { status: Some(1), messages: UNCONFIRMED_FAILURE.into() });
+        }
         if allow_fast {
             if let Some((fp, spec)) = self.fast_spec(ctx) {
                 let t = Instant::now();
@@ -575,12 +600,14 @@ impl Mwcc {
                         }
                         self.mem_cache.lock().unwrap().insert(key, Ok((obj.clone(), true)));
                         let ms = t.elapsed().as_secs_f64() * 1000.0;
+                        mwdec_core::prof::add("mwcc.fast_obj", ms / 1000.0);
                         return Ok(Compiled { obj, obj_path: PathBuf::new(), messages: String::new(), ms, cache_hit: false, fast: true });
                     }
                     fast::Outcome::Failed(w) => {
+                        mwdec_core::prof::add("mwcc.fast_failed", t.elapsed().as_secs_f64());
                         if fp.trusted_failure(w) {
                             // a compile error without its messages (not cached: unconfirmed)
-                            return Err(MwccError::Compile { status: Some(1), messages: "compile failed (persistent compiler; messages not collected)".into() });
+                            return Err(MwccError::Compile { status: Some(1), messages: UNCONFIRMED_FAILURE.into() });
                         }
                         fast_failed = Some((fp, w))
                     }
@@ -588,7 +615,10 @@ impl Mwcc {
                 }
             }
         }
-        let res = self.compile_in_slow(ctx, code, key);
+        let res = {
+            let _p = mwdec_core::prof::span(if ctx.mch.is_some() { "mwcc.compile_pch" } else { "mwcc.compile_plain" });
+            self.compile_in_slow(ctx, code, key)
+        };
         if let (Some((fp, w)), Err(MwccError::Compile { .. })) = (&fast_failed, &res) {
             fp.failure_confirmed(*w);
         }
@@ -612,12 +642,17 @@ impl Mwcc {
                     // context), else the plain context (same codegen, much slower).
                     Err(MwccError::Crash { status, messages }) => {
                         if log {
-                            eprintln!("mwcc: PCH compile crashed (status {status:?}). {}", messages.lines().take(3).collect::<Vec<_>>().join(" | "));
+                            eprintln!("mwcc: PCH compile crashed (status {status:?}, code#{:08x}, split {}). {}", content_hash(&[code.as_bytes()]) as u32, split.is_some(), messages.lines().take(3).collect::<Vec<_>>().join(" | "));
                         }
                         let rep = if split.is_none() { self.repair(ctx, code) } else { None };
                         match rep.map(|sp| self.compile_pch(&sp, code)) {
                             Some(r @ (Ok(_) | Err(MwccError::Compile { .. }))) => r,
-                            _ => self.plain_compile(ctx, code),
+                            _ => {
+                                if log {
+                                    eprintln!("mwcc: plain-context compile for code#{:08x}", content_hash(&[code.as_bytes()]) as u32);
+                                }
+                                self.plain_compile(ctx, code)
+                            }
                         }
                     }
                     r => r,
@@ -628,10 +663,9 @@ impl Mwcc {
         // Cache only deterministic outcomes (not crashes / timeouts / I/O failures).
         match &mut res {
             Ok(c) => {
-                if let Some(p) = self.disk_put(key, Ok(&c.obj)) {
-                    let _ = std::fs::remove_file(&c.obj_path);
-                    c.obj_path = p;
-                }
+                // the scratch object is not kept: its bytes are in `c.obj` (and the caches)
+                let _ = std::fs::remove_file(&c.obj_path);
+                c.obj_path = self.disk_put(key, Ok(&c.obj)).unwrap_or_default();
                 self.mem_cache.lock().unwrap().insert(key, Ok((c.obj.clone(), false)));
             }
             Err(e @ MwccError::Compile { .. }) => {

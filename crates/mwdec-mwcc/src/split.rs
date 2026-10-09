@@ -106,11 +106,12 @@ impl Mwcc {
         let tmp = self.work.join("tmp");
         let m = ctx.mch.as_deref();
         let name = ctx.tu_name.as_deref();
-        if ctx.text.is_empty() {
+        let r = if ctx.text.is_empty() {
             self.compile_tu_as(code, &ctx.cflags, m, &tmp, name)
         } else {
             self.compile_tu_as(&format!("{}{code}", ctx.text), &ctx.cflags, m, &tmp, name)
-        }
+        };
+        drop_scratch(r)
     }
 
     pub(crate) fn plain_compile(&self, ctx: &UnitContext, code: &str) -> Result<Compiled, MwccError> {
@@ -119,7 +120,7 @@ impl Mwcc {
             tu.push('\n');
         }
         tu.push_str(code);
-        self.compile_tu_as(&tu, &ctx.cflags, None, &self.work.join("tmp"), ctx.tu_name.as_deref())
+        drop_scratch(self.compile_tu_as(&tu, &ctx.cflags, None, &self.work.join("tmp"), ctx.tu_name.as_deref()))
     }
 
     /// The split context for `ctx` given a candidate `code` that crashes its PCH: established once
@@ -267,4 +268,14 @@ impl Mwcc {
         }
         result
     }
+}
+
+/// The scratch object of a candidate compile is deleted once read (its bytes are in the result;
+/// callers that keep objects store them in the caches).
+fn drop_scratch(r: Result<Compiled, MwccError>) -> Result<Compiled, MwccError> {
+    r.map(|mut c| {
+        let _ = std::fs::remove_file(&c.obj_path);
+        c.obj_path = std::path::PathBuf::new();
+        c
+    })
 }

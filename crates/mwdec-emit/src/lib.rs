@@ -86,6 +86,9 @@ struct Em<'a> {
     fn_decls: std::collections::BTreeMap<String, (u8, String)>,
     /// parameter types of the functions declared from a call's argument types
     fn_param_tys: std::collections::HashMap<String, Vec<Type>>,
+    /// primary function templates declared (name and parameters): one declaration serves every
+    /// instance (another return type would make an ambiguous overload)
+    tmpl_primaries: HashSet<String>,
     /// Types the context lacks (classes of the unit's own source), synthesized from their uses.
     synth: std::collections::BTreeMap<String, Synth>,
     /// Their rendered definitions (first in the preamble).
@@ -122,6 +125,31 @@ pub fn with_c_mode<R>(c_mode: bool, db: Option<&TypeDb>, f: impl FnOnce() -> R) 
 }
 
 pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -> Emitted {
+    // by-value parameters passed on to an inline function: the body becomes that inline (first)
+    if ir.inline_helper.is_none() && !opts.c_mode {
+        let mut split = ir.clone();
+        mwdec_lift::frameobj::inline_by_value_helper(&mut split, db);
+        if split.inline_helper.is_none() {
+            mwdec_lift::frameobj::inline_loop_helper(&mut split);
+        }
+        if let Some(h) = split.inline_helper.take() {
+            let eh = emit_function(&h, db, opts);
+            let em = emit_function(&split, db, opts);
+            let mut pre: Vec<String> = vec![];
+            for l in eh.preamble.lines().chain(em.preamble.lines()) {
+                // (the calls' own declarations of the helpers: their definitions come first)
+                let decl = |n: &str| l.contains(&format!(" {n}(")) && !l.contains('{');
+                if !decl(&h.symbol) && !decl(mwdec_lift::helpers::ITER_AT) && !pre.iter().any(|x| x == l) {
+                    pre.push(l.to_string());
+                }
+            }
+            let preamble = if pre.is_empty() { String::new() } else { pre.join("
+") + "
+" };
+            let hbody = eh.body.replacen("extern \"C\" ", "", 1);
+            return Emitted { preamble, body: format!("inline {hbody}{}", em.body) };
+        }
+    }
     // locals typed after lifting (folded inline expansions) whose class can't be declared
     // without constructor arguments stay untyped buffers
     let mut fixed;
@@ -199,7 +227,7 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
             }
         }
     });
-    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), obj_arrays: Default::default(), vt_count: 0, sret_local: None, gtypes: Default::default(), gstructs: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), fn_param_tys: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false, member_store: false, narrowed: narrowed.clone() };
+    let new_em = || Em { ir, db, opts, out: String::new(), externs: BTreeSet::new(), lvalue_ctx: false, constructed: HashSet::new(), brace_vars: HashSet::new(), brace_done: HashSet::new(), declared: HashSet::new(), obj_arrays: Default::default(), vt_count: 0, sret_local: None, gtypes: Default::default(), gstructs: Default::default(), local_statics: BTreeSet::new(), fn_decls: Default::default(), fn_param_tys: Default::default(), tmpl_primaries: Default::default(), synth: Default::default(), type_defs: vec![], sret_ctor_decl: false, vt_ret_hint: None, this_local: false, member_store: false, narrowed: narrowed.clone() };
     // a static initializer: the global definitions it is generated from
     if ir.symbol.starts_with("__sinit_") {
         let mut em = new_em();
@@ -645,7 +673,7 @@ impl<'a> Em<'a> {
             Some((b, k)) => (b, k),
             None => (cls, vec![]),
         };
-        if (cls.chars().next().map_or(true, |c| c.is_ascii_lowercase()) && ns_vars) || (cls.contains("::") && !declared_nested) || cls.contains('<') || cls.contains('@') || sig::find_class(db, &cls).is_some_and(|c| !c.is_declaration || !declared_nested) || db.namespaces.contains(&cls) || db.templates.contains_key(&cls) {
+        if (cls.chars().next().map_or(true, |c| c.is_ascii_lowercase()) && ns_vars) || (cls.contains("::") && !declared_nested) || cls.contains('<') || cls.contains('@') || sig::find_class(db, &cls).is_some_and(|c| !c.is_declaration || (cls.contains("::") && !declared_nested)) || db.namespaces.contains(&cls) || db.templates.contains_key(&cls) {
             return;
         }
         let mut base: Option<String> = None;
@@ -877,6 +905,18 @@ impl<'a> Em<'a> {
                     e.targs = k;
                 }
             }
+        }
+        // static data members of those classes the function reads
+        for g in ir.globals.iter().filter(|g| !g.is_function && !db.globals.contains_key(&g.symbol)) {
+            let Some(d) = sig::demangle(&g.symbol) else { continue };
+            if d.contains('(') {
+                continue;
+            }
+            let (sc, n) = sig::split_scope(&d);
+            let Some(sc) = sc.map(strip_unnamed_ns).filter(|sc| wanted.contains(sc)) else { continue };
+            let t = self.gtypes.get(&g.symbol).cloned().unwrap_or_else(|| extern_type(&g.ty));
+            let decl_s = format!("static {}", decl(&t, n));
+            self.synth.entry(sc).or_default().add_method(&format!("static {n}"), decl_s);
         }
         for v in &ir.vars {
             if let (VarKind::Stack { size, .. }, Type::Named(n)) = (&v.kind, &v.ty) {
@@ -1554,6 +1594,30 @@ impl<'a> Em<'a> {
                 }
                 let dt = if matches!(dst, Expr::Var(_)) { local_type(&self.decl_type_rw(dst, false)) } else { self.decl_type_rw(dst, false) };
                 let d = self.lvalue(dst);
+                // `m = (e + m) + k` (`add t, e, m; addi t, t, k`): the compiler builds that from
+                // `m += e + k` (it computes `m + (e + k)` as `(e + m) + k`, while `e + m + k`
+                // becomes `e + (m + k)`, the constant added first)
+                let word = |t: &Type| strip_cv(t).int_info().is_some_and(|(sz, _)| sz == 4) || matches!(strip_cv(t), Type::Unknown { size: 4 });
+                if matches!(dst, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. } | Expr::Var(_)) && word(&ty_of(dst, self.vars())) {
+                    let inner = match src {
+                        Expr::Cast { e, ty } if word(ty) => &**e,
+                        e => e,
+                    };
+                    if let Expr::Binary { op: BinOp::Add, l: el, r: k, .. } = inner {
+                        if let (Expr::Binary { op: BinOp::Add, l: e, r: m, ty }, Some(_)) = (&**el, k.as_int()) {
+                            let m = match &**m {
+                                Expr::Cast { e, ty } if word(ty) => &**e,
+                                m => m,
+                            };
+                            if *m == *dst && !is_ptr(&ty_of(e, self.vars())) && !is_ptr(&ty_of(dst, self.vars())) {
+                                let sum = Expr::Binary { op: BinOp::Add, l: e.clone(), r: k.clone(), ty: ty.clone() };
+                                let v = self.expr(&sum, 1);
+                                let _ = writeln!(self.out, "{ind}{d} += {v};");
+                                return;
+                            }
+                        }
+                    }
+                }
                 // read-modify-write of a memory word: `m |= v` (the older compiler computes the
                 // address of `m = m | v` twice and folds it into an update-form load)
                 if matches!(dst, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. }) && strip_cv(&ty_of(dst, self.vars())).int_info().is_some_and(|(sz, _)| sz == 4) {
@@ -2202,6 +2266,9 @@ impl<'a> Em<'a> {
             tmpl = format!("template <{}> ", ps.join(", "));
             name = base[..lt].to_string();
         }
+        if !tmpl.is_empty() && !self.tmpl_primaries.insert(format!("{:?}|{tmpl}|{name}|{plist}", scope)) {
+            return;
+        }
         let mut d = format!("{tmpl}{}({plist});", decl(&ret, &name));
         if demangled.is_none() && !c_mode {
             d = format!("extern \"C\" {d}");
@@ -2289,6 +2356,14 @@ impl<'a> Em<'a> {
             }
         }
         if let Type::Ref(inner) = tos {
+            // a frame temporary bound to a reference of the same class: itself
+            if let Expr::Var(v) = e {
+                if let (VarKind::Stack { .. }, Type::Ref(vt)) = (&self.ir.vars[*v].kind, &self.ir.vars[*v].ty) {
+                    if named(strip_cv(vt)).map(sig::norm_name) == named(strip_cv(inner)).map(sig::norm_name) && (matches!(**inner, Type::Const(_)) || !matches!(**vt, Type::Const(_))) {
+                        return self.expr(e, 0);
+                    }
+                }
+            }
             // a reference is bound to the object the register points at
             return match e {
                 // an unknown virtual call's object result bound to a const reference: the
@@ -3133,6 +3208,16 @@ impl<'a> Em<'a> {
     /// Member of an aggregate lvalue (stack region, global, by-value param).
     fn member_access(&mut self, base: &Expr, off: i32, ty: &Type) -> String {
         let read = !std::mem::replace(&mut self.lvalue_ctx, false);
+        // a word of a helper block (`mwdec_words_N`): its array element
+        if let Expr::Var(v) = base {
+            if let Type::Named(n) = strip_cv(&self.vars()[*v].ty) {
+                if mwdec_lift::helpers::is_helper(n) && off % 4 == 0 && scalar_size(ty) == Some(4) {
+                    let b = self.expr(base, 15);
+                    let w = format!("{b}.w[{}]", off / 4);
+                    return if matches!(strip_cv(ty), Type::Int { size: 4, signed: true }) { w } else { format!("(*({})&{w})", ptr_to(&extern_type(ty))) };
+                }
+            }
+        }
         if let Expr::Global { symbol, .. } = base {
             if let Some(t) = self.gstructs.get(symbol).and_then(|l| l.iter().find(|f| f.0 == off)).map(|f| f.1.clone()) {
                 let dt = self.gtypes.get(symbol).cloned().unwrap_or_else(|| t.clone());
@@ -3760,7 +3845,15 @@ impl<'a> Em<'a> {
         let [obj, pm, rest @ ..] = args else { return None };
         let ir = self.ir;
         let ot = ty_of(obj, self.vars());
-        let cls = pointee(&ot).and_then(named).map(|s| s.to_string()).or_else(|| ir.sig.this_class.clone())?;
+        // (an object the types don't say: a stand-in class whose member the pointer names)
+        let standin = pointee(&ot).and_then(named).is_none() && ir.sig.this_class.is_none();
+        let cls = pointee(&ot).and_then(named).map(|s| s.to_string()).or_else(|| ir.sig.this_class.clone()).unwrap_or_else(|| "__mwdec_pm_class".to_string());
+        if standin {
+            let def = "struct __mwdec_pm_class { };".to_string();
+            if !self.type_defs.contains(&def) {
+                self.type_defs.push(def);
+            }
+        }
         let forwards = ir.this_var.is_some() && rest.len() == ir.params.len() && ir.sig.this_class.as_deref().map(sig::norm_name) == Some(sig::norm_name(&cls));
         let (rt, ps, is_const, rendered): (Type, Vec<String>, bool, Vec<String>) = if forwards {
             let rt = if matches!(ir.sig.ret, Type::Unknown { size: 0 }) { Type::Void } else { ir.sig.ret.clone() };
@@ -3790,7 +3883,7 @@ impl<'a> Em<'a> {
         };
         let cq = if is_const { " const" } else { "" };
         let pmt = format!("{} ({cls}::**)({}){cq}", type_str(&rt), ps.join(", "));
-        let o = self.expr(obj, 14);
+        let o = if standin { format!("(({cls}*){})", self.expr(obj, 14)) } else { self.expr(obj, 14) };
         let p = self.expr(pm, 14);
         Some(format!("({o}->*(*({pmt}){p}))({})", rendered.join(", ")))
     }
@@ -3849,6 +3942,7 @@ impl<'a> Em<'a> {
 
     fn args(&mut self, args: &[Expr], sig: Option<&mwdec_core::FuncSig>) -> String {
         let mut v = vec![];
+        let overloaded = sig.is_some_and(|s| self.db.and_then(|db| db.decls.get(&strip_template_args(&s.qualified_name))).is_some_and(|d| d.len() > 1));
         let keep = sig.map_or(args.len(), |s| self.args_without_defaults(args, s));
         for (i, a) in args.iter().enumerate().take(keep) {
             // unknown parameter types (undeclared functions, declared from these arguments): as is
@@ -3861,7 +3955,12 @@ impl<'a> Em<'a> {
             });
             // (the count-leading-zeros intrinsic takes an `unsigned int`: a pointer is converted)
             let clz_ptr = sig.is_some_and(|s| s.qualified_name == "__cntlzw") && is_ptr(&ty_of(a, self.vars()));
+            // a function with overloads: a scalar argument of another arithmetic type than the
+            // called overload's parameter is converted explicitly (passed as is, it may convert
+            // to several overloads equally well: `f(unsigned)` against `f(int)` and `f(float)`)
+            let other_arith = overloaded && pt.as_ref().is_some_and(|t| self.other_arith_type(a, t));
             let s = match pt {
+                Some(t) if other_arith => format!("({}){}", type_str(strip_cv(&t)), self.expr(a, 14)),
                 Some(_) if same_int => self.expr(a, 0),
                 Some(t) => self.coerce(a, &t),
                 None if clz_ptr => format!("(unsigned int){}", self.expr(a, 14)),
@@ -3870,6 +3969,28 @@ impl<'a> Em<'a> {
             v.push(s);
         }
         v.join(", ")
+    }
+
+    /// Is `a` (not a literal) of an arithmetic type other than the arithmetic parameter type `t`
+    /// (different kind, size or signedness)?
+    fn other_arith_type(&self, a: &Expr, t: &Type) -> bool {
+        if matches!(a, Expr::Int { .. } | Expr::Float { .. }) {
+            return false;
+        }
+        let kind = |t: &Type| -> Option<(u8, u32, bool)> {
+            match mwdec_lift::types::resolve(self.db, strip_cv(t)).as_ref() {
+                Type::Int { size, signed } => Some((0, *size as u32, *signed)),
+                Type::Long { signed } => Some((0, 4, *signed)),
+                Type::Char => Some((0, 1, true)),
+                Type::Bool => Some((2, 1, false)),
+                Type::Float { size } => Some((1, *size as u32, true)),
+                _ => None,
+            }
+        };
+        match (kind(&ty_of(a, self.vars())), kind(t)) {
+            (Some(x), Some(y)) => x != y,
+            _ => false,
+        }
     }
 
     /// How many leading arguments to pass: trailing arguments equal to the declaration's

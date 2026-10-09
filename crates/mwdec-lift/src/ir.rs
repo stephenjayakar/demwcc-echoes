@@ -301,6 +301,9 @@ pub struct IrFunction {
     pub temp_bytes: Vec<(String, Vec<u8>)>,
     /// Frame stores nothing reads, dropped from `body` (see [`DeadStackStore`]).
     pub dead_stores: Vec<DeadStackStore>,
+    /// An inline function the body is written into (the draft defines it first, `inline`, and
+    /// the function only calls it): see `frameobj::inline_by_value_helper`.
+    pub inline_helper: Option<Box<IrFunction>>,
 }
 
 /// A store into a frame slot that nothing reads or takes the address of, dropped from the

@@ -427,6 +427,249 @@ pub fn forwarded_byval_params(ir: &mut IrFunction, db: Option<&mwdec_core::TypeD
     ir.body = vec![Stmt::Expr(call)];
 }
 
+/// Name of the helper of [`inline_by_value_helper`].
+pub const INLINE_HELPER: &str = "mwdec_inline_body";
+
+/// An undeclared function whose every parameter is read once, as a word (`*arg0`, `*arg1`),
+/// leaving frame stores of exactly those words that nothing reads: the source passed its by-value
+/// one-word class parameters on to an inline function by value (`destroy<It>(It b, It e) {
+/// destroy_impl(b, e); }`: MWCC copies them into the inline's parameter objects and then works
+/// on registers). The body moves into a helper `inline` function taking one-word objects
+/// (`w[0]` read once each), which the function calls with its parameters.
+pub fn inline_by_value_helper(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let declared = crate::sig::demangle(&ir.symbol).is_some() || db.is_some_and(|db| db.decls.contains_key(ir.symbol.as_str()) || db.decls.contains_key(&format!("::{}", ir.symbol)) || db.functions.contains_key(ir.symbol.as_str()));
+    if declared || ir.this_var.is_some() || ir.params.is_empty() || ir.inline_helper.is_some() || !matches!(ir.sig.ret, Type::Void) || ir.dead_stores.is_empty() {
+        return;
+    }
+    let mut uses: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *uses.entry(*v).or_default() += 1;
+        }
+    });
+    let word = |p: VarId| Expr::Load { base: Box::new(Expr::Var(p)), offset: 0, ty: Type::Int { size: 4, signed: true } };
+    let is_word = |e: &Expr, p: VarId| matches!(e, Expr::Load { base, offset: 0, ty } if matches!(**base, Expr::Var(v) if v == p) && scalar_size(ty) == Some(4));
+    for &p in &ir.params {
+        if uses.get(&p) != Some(&1) {
+            return;
+        }
+        let mut read = 0;
+        Stmt::walk_exprs(&ir.body, &mut |e| read += is_word(e, p) as usize);
+        // (the frame copy of the word: the inline's parameter object)
+        if read != 1 || !ir.dead_stores.iter().any(|d| d.size == 4 && is_word(&d.value, p)) {
+            return;
+        }
+    }
+    let _ = word;
+    let words = crate::helpers::words(4);
+    let mut h = ir.clone();
+    h.symbol = INLINE_HELPER.to_string();
+    h.sig.qualified_name = INLINE_HELPER.to_string();
+    h.sig.mangled = None;
+    h.dead_stores = vec![];
+    for &p in &ir.params {
+        h.vars[p].ty = words.clone();
+        if let VarKind::Param { index } = h.vars[p].kind {
+            if let Some(sp) = h.sig.params.get_mut(index) {
+                sp.ty = words.clone();
+            }
+        }
+    }
+    let params = ir.params.clone();
+    Stmt::rewrite_exprs(&mut h.body, &mut |e| {
+        if let Some(&p) = params.iter().find(|&&p| is_word(e, p)) {
+            *e = Expr::Member { base: Box::new(Expr::Var(p)), offset: 0, ty: Type::Int { size: 4, signed: true } };
+        }
+    });
+    for &p in &ir.params {
+        ir.vars[p].ty = words.clone();
+        if let VarKind::Param { index } = ir.vars[p].kind {
+            if let Some(sp) = ir.sig.params.get_mut(index) {
+                sp.ty = words.clone();
+            }
+        }
+    }
+    let call = Expr::Call { callee: Callee::Direct { symbol: INLINE_HELPER.to_string(), sig: h.sig.clone() }, args: ir.params.iter().map(|&p| Expr::Var(p)).collect(), ret: Type::Void };
+    ir.body = vec![Stmt::Expr(call)];
+    ir.inline_helper = Some(Box::new(h));
+}
+
+/// A loop `v = X; e = Y; ... while (v != e) {...}` whose begin and end words were also stored to
+/// frame slots nothing reads: the source called an inline function taking the begin and end
+/// iterators by value (`uninitialized_copy(begin(), end(), out)`; MWCC copies each argument into
+/// the parameter object and runs the loop on registers). The loop and its setup move into a
+/// helper `inline` function taking two one-word iterator objects (made by value, as a
+/// container's inline `begin()`/`end()` returns them) and the loop's other inputs.
+pub fn inline_loop_helper(ir: &mut IrFunction) {
+    if ir.inline_helper.is_some() || ir.dead_stores.iter().filter(|d| d.size == 4).count() < 2 {
+        return;
+    }
+    let snapshot = ir.clone();
+    let whole = ir.body.clone();
+    let mut made: Option<IrFunction> = None;
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        if made.is_some() {
+            return;
+        }
+        for k in 0..b.len() {
+            if let Some((h, call, range)) = loop_helper_at(&snapshot, &whole, b, k) {
+                b.splice(range, [call]);
+                made = Some(h);
+                return;
+            }
+        }
+    });
+    if let Some(h) = made {
+        ir.inline_helper = Some(Box::new(h));
+    }
+}
+
+/// The helper for the loop at `b[k]`: (helper function, the call replacing the run, the run).
+fn loop_helper_at(ir: &IrFunction, whole: &[Stmt], b: &[Stmt], k: usize) -> Option<(IrFunction, Stmt, std::ops::Range<usize>)> {
+    let Stmt::While { cond, body: lb } = &b[k] else { return None };
+    fn strip(e: &Expr) -> Expr {
+        let mut e = e;
+        while let Expr::Cast { e: x, .. } = e {
+            e = x;
+        }
+        e.clone()
+    }
+    let Expr::Binary { op: BinOp::Ne, l, r, .. } = cond else { return None };
+    let (Expr::Var(v), Expr::Var(e)) = (strip(l), strip(r)) else { return None };
+    // the setup run right before the loop: `x = src` assignments
+    let mut j = k;
+    while j > 0 && matches!(&b[j - 1], Stmt::Assign { dst: Expr::Var(_), src } if !src.has_call()) {
+        j -= 1;
+    }
+    let inits: Vec<(VarId, Expr)> = b[j..k]
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Assign { dst: Expr::Var(x), src } => Some((*x, src.clone())),
+            _ => None,
+        })
+        .collect();
+    let def = |x: VarId| inits.iter().find(|(y, _)| *y == x).map(|(_, s)| s.clone());
+    let x_src = def(v)?;
+    let y_src = def(e)?;
+    // Y in terms of what the run started from (`e = v + n*k` reads v's start)
+    let mut y_full = y_src.clone();
+    y_full.rewrite(&mut |t| {
+        if matches!(t, Expr::Var(w) if *w == v) {
+            *t = x_src.clone();
+        }
+    });
+    let stored = |want: &Expr| ir.dead_stores.iter().filter(|d| d.size == 4 && strip(&d.value) == strip(want)).count();
+    // (the stored end may still read the begin variable)
+    if stored(&x_src) == 0 || stored(&y_full) + stored(&y_src) == 0 {
+        return None;
+    }
+    // inputs: variables the loop and the setup read that the setup doesn't define
+    let mut reads: Vec<VarId> = vec![];
+    {
+        let mut note = |t: &Expr| {
+            if let Expr::Var(w) = t {
+                if !reads.contains(w) {
+                    reads.push(*w);
+                }
+            }
+        };
+        cond.walk(&mut note);
+        Stmt::walk_exprs(lb, &mut note);
+        // (begin and end are computed at the call)
+        for (x, s) in &inits {
+            if *x != v && *x != e {
+                s.walk(&mut note);
+            }
+        }
+    }
+    let defined: Vec<VarId> = inits.iter().map(|(x, _)| *x).collect();
+    let mut inputs: Vec<VarId> = reads.iter().copied().filter(|w| !defined.contains(w) && *w != v && *w != e).collect();
+    inputs.sort_unstable();
+    // nothing the loop or setup writes is read anywhere else
+    let mut written: Vec<VarId> = defined.clone();
+    let mut lbc = lb.clone();
+    Stmt::for_each_block_mut(&mut lbc, &mut |bb| {
+        for s in bb.iter() {
+            if let Stmt::Assign { dst: Expr::Var(w), .. } = s {
+                written.push(*w);
+            }
+        }
+    });
+    let count = |stmts: &[Stmt]| {
+        let mut n = 0usize;
+        Stmt::walk_exprs(stmts, &mut |t| {
+            if let Expr::Var(w) = t {
+                if written.contains(w) {
+                    n += 1;
+                }
+            }
+        });
+        n
+    };
+    if count(whole) != count(&b[j..=k]) || inputs.iter().any(|w| matches!(ir.vars[*w].kind, VarKind::Stack { .. })) {
+        return None;
+    }
+    // the helper: (begin, end, inputs...)
+    let iter = crate::helpers::iter();
+    let int = Type::Int { size: 4, signed: true };
+    let mut h = ir.clone();
+    h.symbol = INLINE_LOOP.to_string();
+    h.sig.qualified_name = INLINE_LOOP.to_string();
+    h.sig.mangled = None;
+    h.sig.ret = Type::Void;
+    h.sig.this_class = None;
+    h.sig.is_const = false;
+    h.this_var = None;
+    h.dead_stores = vec![];
+    h.inline_helper = None;
+    for var in h.vars.iter_mut() {
+        if matches!(var.kind, VarKind::Param { .. } | VarKind::This | VarKind::StructRet) {
+            var.kind = VarKind::Local;
+        }
+    }
+    let bv = h.vars.len();
+    let ev = bv + 1;
+    h.vars.push(Var { name: "begin".into(), ty: iter.clone(), kind: VarKind::Param { index: 0 } });
+    h.vars.push(Var { name: "end".into(), ty: iter.clone(), kind: VarKind::Param { index: 1 } });
+    let mut params = vec![bv, ev];
+    let mut sp = vec![mwdec_core::Param { name: Some("begin".into()), ty: iter.clone() }, mwdec_core::Param { name: Some("end".into()), ty: iter.clone() }];
+    for (n, &w) in inputs.iter().enumerate() {
+        h.vars[w].kind = VarKind::Param { index: 2 + n };
+        params.push(w);
+        sp.push(mwdec_core::Param { name: Some(h.vars[w].name.clone()), ty: h.vars[w].ty.clone() });
+    }
+    h.params = params;
+    h.decl_params = vec![];
+    h.sig.params = sp;
+    let word = |p: VarId| Expr::Member { base: Box::new(Expr::Var(p)), offset: 0, ty: int.clone() };
+    let mut hb: Vec<Stmt> = vec![];
+    for (x, s) in &inits {
+        if *x == e {
+            continue;
+        }
+        let src = if *x == v { word(bv) } else { s.clone() };
+        hb.push(Stmt::Assign { dst: Expr::Var(*x), src });
+    }
+    let mut hcond = cond.clone();
+    hcond.rewrite(&mut |t| {
+        if matches!(t, Expr::Var(w) if *w == e) {
+            *t = word(ev);
+        }
+    });
+    hb.push(Stmt::While { cond: hcond, body: lb.clone() });
+    h.body = hb;
+    // the call: (iter_at(X), iter_at(Y), inputs...)
+    let at_sig = mwdec_core::FuncSig { qualified_name: crate::helpers::ITER_AT.into(), mangled: None, ret: iter.clone(), params: vec![mwdec_core::Param { name: None, ty: int.clone() }], this_class: None, is_const: false, is_static: false, is_virtual: false, variadic: false, runs_code: false };
+    let at = |x: Expr| Expr::Call { callee: Callee::Direct { symbol: crate::helpers::ITER_AT.into(), sig: at_sig.clone() }, args: vec![Expr::cast(int.clone(), x)], ret: iter.clone() };
+    let mut args = vec![at(x_src), at(y_full)];
+    args.extend(inputs.iter().map(|&w| Expr::Var(w)));
+    let call = Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol: INLINE_LOOP.to_string(), sig: h.sig.clone() }, args, ret: Type::Void });
+    Some((h, call, j..k + 1))
+}
+
+/// Name of the helper of [`inline_loop_helper`].
+pub const INLINE_LOOP: &str = "mwdec_inline_loop";
+
 /// `v.@0 = <member>` where the member is a class object of exactly the stored size and `v` a
 /// frame object: (v, the member as that class, the class).
 fn whole_member_store(s: &Stmt, vars: &[Var], db: &mwdec_core::TypeDb) -> Option<(VarId, Expr, Type)> {
@@ -544,7 +787,7 @@ pub fn fold_converting_return(ir: &mut IrFunction, db: Option<&mwdec_core::TypeD
 }
 
 /// `rstl::optional_object<CAABox>` -> `rstl::optional_object` (decl keys carry no arguments).
-fn strip_template_args(s: &str) -> String {
+pub(crate) fn strip_template_args(s: &str) -> String {
     let mut out = String::new();
     let mut d = 0;
     for c in s.chars() {
@@ -757,4 +1000,229 @@ pub fn fold_default_constructed_return(ir: &mut IrFunction, db: Option<&mwdec_co
         }
         b.splice(k..=r, std::iter::once(Stmt::Return(Some(Expr::Construct { class: rt.clone(), ctor: Some(ctor.clone()), args: vec![] }))));
     });
+}
+
+/// The member a class's inline copy constructor increments through (`rc_ptr(const rc_ptr& o)
+/// : mPtr(o.mPtr), mRefCount(o.mRefCount) { ++*mRefCount; }`): its offset.
+fn copy_ctor_increment(db: &mwdec_core::TypeDb, cls: &str) -> Option<i32> {
+    let base = strip_template_args(cls);
+    let last = crate::sig::split_scope(&base).1.to_string();
+    let ds = db.decls.get(&format!("{base}::{last}"))?;
+    let d = ds.iter().find(|d| {
+        d.is_inline_defined && d.params.len() == 1 && matches!(strip_cv(&d.params[0].ty), Type::Ref(x) if named(strip_cv(x)).is_some_and(|n| strip_template_args(n) == base))
+    })?;
+    let body = d.inline_body.as_deref()?.replace("( ( void ) 0 ) ;", "");
+    let toks: Vec<&str> = body.split_whitespace().collect();
+    let name = match toks.as_slice() {
+        ["++", "*", n, ";"] | ["++", "(", "*", n, ")", ";"] | ["*", n, "+=", "1", ";"] => *n,
+        _ => return None,
+    };
+    let c = crate::sig::find_class(db, cls)?;
+    c.fields.iter().find(|f| f.name == name).map(|f| f.offset as i32)
+}
+
+/// A frame object built as a copy of an object of a class whose inline copy constructor
+/// increments a counter through a member (`rc_ptr`): the increment right after the member
+/// stores (`stack.mRefCount = p; *p += 1;`) is the copy constructor's body, implicit in the
+/// copy-initialization the stores fold to.
+pub fn drop_copy_ctor_increments(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    let vars = ir.vars.clone();
+    let mut uses: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    crate::inline::count_uses(&ir.body, &mut uses);
+    let mut untype: Vec<VarId> = vec![];
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        let mut j = 0;
+        while j < b.len() {
+            let Stmt::Assign { dst: Expr::Load { base, offset: 0, .. }, src: Expr::Binary { op: BinOp::Add, l, r, .. } } = &b[j] else {
+                j += 1;
+                continue;
+            };
+            if !(matches!(&**l, Expr::Load { base: lb, offset: 0, .. } if lb == base) && matches!(&**r, Expr::Int { value: 1, .. })) {
+                j += 1;
+                continue;
+            }
+            // the counter pointer just stored into a frame object's counter member
+            let p = (**base).clone();
+            let stored = b[j.saturating_sub(3)..j].iter().find_map(|s| match s {
+                Stmt::Assign { dst: Expr::Member { base: ob, offset, .. }, src } if *src == p => match &**ob {
+                    Expr::Var(d) if matches!(vars[*d].kind, VarKind::Stack { .. }) && named(&vars[*d].ty).and_then(|c| copy_ctor_increment(db, c)) == Some(*offset) => Some(*d),
+                    _ => None,
+                },
+                _ => None,
+            });
+            if let Some(d) = stored {
+                // (a register temp used for nothing else: the store and the increment's read
+                // and write; otherwise the object stays raw storage, its copy explicit)
+                if matches!(p, Expr::Var(t) if uses.get(&t).copied().unwrap_or(0) != 3) {
+                    untype.push(d);
+                } else {
+                    b.remove(j);
+                    continue;
+                }
+            }
+            j += 1;
+        }
+    });
+    for d in untype {
+        if let VarKind::Stack { size, .. } = ir.vars[d].kind {
+            ir.vars[d].ty = Type::Unknown { size };
+        }
+    }
+}
+
+/// The 4-byte stack local a word copy reads (`L`, `L.@0`, through casts).
+fn word_local(e: &Expr, vars: &[Var]) -> Option<VarId> {
+    let v = match e {
+        Expr::Cast { e, .. } => return word_local(e, vars),
+        Expr::Var(v) => *v,
+        Expr::Member { base, offset: 0, .. } => match **base {
+            Expr::Var(v) => v,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    matches!(vars[v].kind, VarKind::Stack { size: 4, .. }).then_some(v)
+}
+
+fn strip_casts(e: &Expr) -> &Expr {
+    match e {
+        Expr::Cast { e, .. } => strip_casts(e),
+        e => e,
+    }
+}
+
+/// Word slots of the frame filled one by one and copied out as words into consecutive members
+/// of an object, the next member stored from a register whose value a dead frame store right
+/// after the slots holds too (`CSphere(center, r)` built in the frame and assigned: the radius
+/// store into the temporary is dead, the assignment takes it from the register): one frame
+/// object of the destination member's class, built member-wise and assigned whole.
+pub fn frame_object_copied_back(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    if ir.dead_stores.is_empty() {
+        return;
+    }
+    let mut uses: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    crate::inline::count_uses(&ir.body, &mut uses);
+    let vars = ir.vars.clone();
+    let off_of = |v: VarId| match vars[v].kind {
+        VarKind::Stack { offset, .. } => offset,
+        _ => i32::MIN,
+    };
+    let mut new_vars: Vec<Var> = vec![];
+    let mut consumed: Vec<usize> = vec![];
+    let dead = ir.dead_stores.clone();
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        // word copies out of stack locals, directly or through a register temp read once:
+        // (index, destination base, offset, local, the temp's definition)
+        let temp_def = |t: VarId| -> Option<(usize, VarId)> {
+            if !matches!(vars[t].kind, VarKind::Local) || uses.get(&t).copied().unwrap_or(0) != 1 {
+                return None;
+            }
+            let ds: Vec<(usize, &Expr)> = b.iter().enumerate().filter_map(|(i, s)| match s {
+                Stmt::Assign { dst: Expr::Var(x), src } if *x == t => Some((i, src)),
+                _ => None,
+            }).collect();
+            match ds.as_slice() {
+                [(i, src)] => word_local(src, &vars).map(|l| (*i, l)),
+                _ => None,
+            }
+        };
+        let copies: Vec<(usize, Expr, i32, VarId, Option<usize>)> = b
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if scalar_size(ty) == Some(4) => match strip_casts(src) {
+                    Expr::Var(t) if matches!(vars[*t].kind, VarKind::Local) => temp_def(*t).map(|(ti, l)| (i, (**base).clone(), *offset, l, Some(ti))),
+                    _ => word_local(src, &vars).map(|l| (i, (**base).clone(), *offset, l, None)),
+                },
+                _ => None,
+            })
+            .collect();
+        for &(i0, ref d, d0, l0, _) in &copies {
+            // a run starting here: consecutive destination offsets and slots
+            let mut run = vec![(i0, l0)];
+            let mut temps: Vec<usize> = copies.iter().filter(|c| c.0 == i0).filter_map(|c| c.4).collect();
+            loop {
+                let k = run.len() as i32;
+                match copies.iter().find(|c| c.1 == *d && c.2 == d0 + 4 * k && off_of(c.3) == off_of(l0) + 4 * k) {
+                    Some(c) => {
+                        run.push((c.0, c.3));
+                        temps.extend(c.4);
+                    }
+                    None => break,
+                }
+            }
+            let n = run.len() as i32;
+            if n < 2 || copies.iter().any(|c| c.1 == *d && c.2 == d0 - 4 && off_of(c.3) == off_of(l0) - 4) {
+                continue;
+            }
+            let last = run.iter().map(|r| r.0).max().unwrap();
+            // the next member from the register a dead store at the next slot holds
+            let Some((iv, vty, val)) = b.iter().enumerate().skip(last + 1).take(3).find_map(|(i, s)| match s {
+                Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if **base == *d && *offset == d0 + 4 * n => Some((i, ty.clone(), src.clone())),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let vsize = scalar_size(&vty).unwrap_or(0);
+            let Some(di) = dead.iter().position(|x| x.offset == off_of(l0) + 4 * n && x.size == vsize && strip_casts(&x.value) == strip_casts(&val)) else { continue };
+            if consumed.contains(&di) {
+                continue;
+            }
+            // the destination member's class spans exactly the slots and that member
+            let size = (4 * n) as u32 + vsize;
+            let Some(cls) = (match &crate::types::ty_of(d, &vars) {
+                t if is_ptr(t) => pointee(t).and_then(|p| named(&crate::types::resolve(Some(db), p)).map(|s| s.to_string())),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(t) = crate::aggregates::aggregate_at(db, &cls, d0).into_iter().find(|t| crate::types::size_of(Some(db), t) == Some(size)) else { continue };
+            // each slot: one definition in this list before its copy, read only by it
+            let mut defs = vec![];
+            for &(ci, l) in &run {
+                let ds: Vec<usize> = b.iter().enumerate().filter(|(_, s)| matches!(s, Stmt::Assign { dst: Expr::Var(x), .. } if *x == l)).map(|(i, _)| i).collect();
+                if ds.len() != 1 || ds[0] > ci || uses.get(&l).copied().unwrap_or(0) != 1 {
+                    break;
+                }
+                defs.push(ds[0]);
+            }
+            if defs.len() != run.len() {
+                continue;
+            }
+            let id = vars.len() + new_vars.len();
+            new_vars.push(Var { name: format!("stack_{:x}", off_of(l0)), ty: t.clone(), kind: VarKind::Stack { offset: off_of(l0), size } });
+            for (k, &di2) in defs.iter().enumerate() {
+                if let Stmt::Assign { dst, .. } = &mut b[di2] {
+                    let lt = vars[run[k].1].ty.clone();
+                    *dst = Expr::Member { base: Box::new(Expr::Var(id)), offset: 4 * k as i32, ty: lt };
+                }
+            }
+            // the register member and the whole assignment in place of the last copy
+            let mut out: Vec<Stmt> = Vec::with_capacity(b.len());
+            for (i, s) in std::mem::take(b).into_iter().enumerate() {
+                if i == last {
+                    out.push(Stmt::Assign { dst: Expr::Member { base: Box::new(Expr::Var(id)), offset: 4 * n, ty: vty.clone() }, src: val.clone() });
+                    out.push(Stmt::Assign { dst: Expr::Load { base: Box::new(d.clone()), offset: d0, ty: t.clone() }, src: Expr::Var(id) });
+                } else if i == iv || run.iter().any(|r| r.0 == i) || temps.contains(&i) {
+                    continue;
+                } else {
+                    out.push(s);
+                }
+            }
+            *b = out;
+            consumed.push(di);
+            // (one object per list and pass: indices changed)
+            break;
+        }
+    });
+    ir.vars.extend(new_vars);
+    consumed.sort_unstable();
+    for di in consumed.into_iter().rev() {
+        ir.dead_stores.remove(di);
+    }
+    for (i, d) in ir.dead_stores.iter_mut().enumerate() {
+        d.order = i;
+    }
 }

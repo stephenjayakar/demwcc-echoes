@@ -3,6 +3,7 @@
 
 pub mod memcap;
 pub mod paths;
+pub mod prof;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
