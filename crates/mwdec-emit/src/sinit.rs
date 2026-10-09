@@ -94,6 +94,9 @@ impl<'a> Em<'a> {
         if let Some(d) = self.sinit_pooled_objects() {
             return Some(d);
         }
+        if let Some(d) = self.sinit_ref_literal_object() {
+            return Some(d);
+        }
         // single-definition register locals are inlined into the values
         let mut defs: HashMap<VarId, Expr> = HashMap::new();
         let mut ndefs: HashMap<VarId, usize> = HashMap::new();
@@ -377,6 +380,100 @@ impl<'a> Em<'a> {
 ", strip_unnamed_ns(cls)));
         }
         Some(out)
+    }
+
+
+    /// One file-static object the context can't name (`lbl_...`), built by an inlined
+    /// constructor whose parameters are references to const: the constant arguments live in
+    /// compiler literals (`@684`) the body reads. Its class is the context's class of that size
+    /// with such a constructor taking as many references as literals read:
+    /// `static CMaterialList sObject(EMaterialTypes(59), EMaterialTypes(60));`. The k-th such
+    /// constructor for the draft variant k.
+    fn sinit_ref_literal_object(&mut self) -> Option<String> {
+        let db = self.db?;
+        let ir = self.ir;
+        let mut lits: Vec<String> = vec![];
+        let mut target: Option<String> = None;
+        let mut extent = 0i32;
+        let unnamed = |s: &str| (s.starts_with("lbl_") || s.starts_with('@')) && !db.globals.contains_key(s);
+        let mut ok = true;
+        each_stmt(&ir.body, &mut |st| match st {
+            Stmt::Assign { dst, src } => {
+                src.walk(&mut |x| {
+                    if let Expr::Global { symbol, .. } = x {
+                        if ir.literal_bytes.iter().chain(ir.temp_bytes.iter()).any(|(n, b)| n == symbol && b.len() == 4) {
+                            if !lits.contains(symbol) {
+                                lits.push(symbol.clone());
+                            }
+                        } else if !target.as_ref().is_some_and(|t| t == symbol) {
+                            ok = false;
+                        }
+                    }
+                });
+                match dst {
+                    Expr::Var(_) => {}
+                    _ => match global_lvalue(dst) {
+                        Some((g, _, off, t)) if unnamed(&g) && target.as_ref().is_none_or(|x| *x == g) => {
+                            extent = extent.max(off + mwdec_lift::types::size_of(Some(db), &t).unwrap_or(4) as i32);
+                            target = Some(g);
+                        }
+                        _ => ok = false,
+                    },
+                }
+            }
+            Stmt::Return(None) | Stmt::Comment(_) => {}
+            _ => ok = false,
+        });
+        let g = target?;
+        if !ok || lits.is_empty() || extent <= 0 {
+            return None;
+        }
+        let vals: Vec<i64> = lits
+            .iter()
+            .map(|l| {
+                let b = &ir.literal_bytes.iter().chain(ir.temp_bytes.iter()).find(|(n, _)| n == l).unwrap().1;
+                i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64
+            })
+            .collect();
+        // (references to const of an enum or integer)
+        let const_ref_scalar = |t: &Type| match strip_cv(t) {
+            Type::Ref(x) => match &**x {
+                Type::Const(y) => {
+                    let r = mwdec_lift::types::resolve(Some(db), y).into_owned();
+                    mwdec_lift::types::is_enum(Some(db), &r) || matches!(r, Type::Int { .. })
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        let mut cands: Vec<(String, Vec<Type>)> = vec![];
+        for c in db.classes.values() {
+            if c.size as i32 != extent || c.is_declaration || c.name.contains('<') {
+                continue;
+            }
+            let last = sig::split_scope(&c.name).1.to_string();
+            for d in db.decls.get(&format!("{}::{last}", c.name)).into_iter().flatten() {
+                if d.params.len() == lits.len() && d.template_params.is_empty() && d.params.iter().all(|p| const_ref_scalar(&p.ty)) {
+                    cands.push((c.name.clone(), d.params.iter().map(|p| p.ty.clone()).collect()));
+                }
+            }
+        }
+        cands.sort_by(|a, b| a.0.cmp(&b.0));
+        let (cls, ptys) = cands.get(self.opts.sinit_variant.saturating_sub(1) as usize)?.clone();
+        let args: Vec<String> = ptys
+            .iter()
+            .zip(&vals)
+            .map(|(t, v)| {
+                let inner = match strip_cv(t) {
+                    Type::Ref(x) => strip_cv(x).clone(),
+                    t => t.clone(),
+                };
+                format!("{}({v})", type_str(&inner))
+            })
+            .collect();
+        let _ = g;
+        Some(format!("static {} sObject0({});
+", type_str(&Type::Named(cls)), args.join(", ")))
     }
 
     /// The member an inline setter of `cls` stores its argument into: (offset, type).

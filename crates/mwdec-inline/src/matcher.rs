@@ -412,8 +412,9 @@ impl<'a, 'e> M<'a, 'e> {
                     self.b[*h] = Some(Bind::Val(t.clone()));
                     true
                 }
-                // (a pointer value used through a cast: `((int*)p)[i]` for `p[i]`)
-                Some(Bind::Val(x)) => teq(x, t, defs) || matches!(t, Expr::Cast { ty, e } if matches!(strip(ty), Type::Ptr(_)) && teq(x, e, defs)),
+                // (a pointer value used through a cast: `((int*)p)[i]` for `p[i]`; a word read
+                // again with another signedness: `(unsigned int)n >> 5` for `n & 31`'s `n`)
+                Some(Bind::Val(x)) => teq(x, t, defs) || matches!(t, Expr::Cast { ty, e } if matches!(strip(ty), Type::Ptr(_)) && teq(x, e, defs)) || teq(same_word(res(x, defs), self.env), same_word(res(t, defs), self.env), defs),
                 Some(Bind::Comps(_)) => false,
             }
         } else {
@@ -3063,6 +3064,22 @@ fn ptr_step(e: &Expr) -> Option<(&Expr, i64)> {
         Expr::Binary { op: BinOp::Add, l, r, .. } => r.as_int().map(|k| (&**l, k)),
         _ => None,
     }
+}
+
+/// `e` without a conversion between same-size integer types.
+fn same_word<'a>(e: &'a Expr, env: &Env) -> &'a Expr {
+    if let Expr::Cast { ty, e: inner } = e {
+        let it = ty_of(res(inner, env.defs), env.vars);
+        let size = |t: &Type| match strip(t) {
+            Type::Int { size, .. } => Some(*size as u32),
+            Type::Unknown { size } => Some(*size as u32),
+            _ => None,
+        };
+        if size(ty).is_some() && size(ty) == size(&it) {
+            return inner;
+        }
+    }
+    e
 }
 
 fn ok_lvalue(e: &Expr) -> bool {

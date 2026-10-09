@@ -163,6 +163,10 @@ pub const HW_CONST_POINTER: &str = "hw.const_pointer";
 /// old value in another (`cpr = x; prev = cpr; cpr &= m; ... return prev;`).
 pub const UPDATE_AFTER_COPY: &str = "vars.update_after_copy";
 
+/// (older compiler) Memory reached through a named local copy of a pointer parameter
+/// (`__GXFifoObj* realFifo = (__GXFifoObj*)fifo;`).
+pub const SDK_PARAM_VIEW: &str = "sdk.param_view";
+
 /// Registered decision points: (name, what the alternative does).
 pub const POINTS: &[(&str, &str)] = &[
     (EXPLICIT_DEFAULT_ARGS, "trailing arguments equal to their declared defaults are passed explicitly"),
@@ -195,6 +199,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (EXPR_MASK_SELECT, "a value masked by a 0/-1 select is a select between the value and zero"),
     (HW_CONST_POINTER, "hardware registers at folded addresses are read through a constant pointer, not an array at the address"),
     (UPDATE_AFTER_COPY, "a register updated in place after a copy of its old value: one variable updated, the copy in another"),
+    (SDK_PARAM_VIEW, "accesses through a pointer parameter go through a named local copy of it"),
     (PARAM_CONST_POINTERS, "parameters only loaded through are declared pointer-to-const (their loads ignore stores)"),
     (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),

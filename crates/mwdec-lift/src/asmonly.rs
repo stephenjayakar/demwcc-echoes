@@ -9,6 +9,7 @@
 //!   the `__setflm` pair, paired-single arithmetic, and paired or unquantized paired-single
 //!   loads/stores (these compilers have no paired-single intrinsics; they only emit single
 //!   quantized loads/stores for int<->float conversions, and prologue/epilogue saves), and
+//!   integer compares into cr2-cr7 (compiled code uses cr0, cr1 for floats),
 //!   addresses built with `@h`/`@l` (the compiler uses `@ha`), absolute branches, the stack
 //!   pointer written outside the prologue/epilogue, r2/r13 read as values, and a return through LR loaded from a register other
 //!   than r0 (calls through pointers use `mtlr r12; blrl`, returns restore LR from r0);
@@ -49,6 +50,9 @@ pub fn requires_asm(obj: &ObjectFile, f: &Function) -> Option<String> {
                 let (w, q) = if matches!(i.op(), PsqL | PsqLu | PsqSt | PsqStu) { (i.ins.field_ps_w(), i.ins.field_ps_i()) } else { (i.ins.field_ps_wx(), i.ins.field_ps_ix()) };
                 w == 0 || q == 0
             }
+            // integer compares into cr2-cr7: compiled code compares into cr0 (cr1 for floats);
+            // only hand-written code spreads tests over fields (`cmpwi cr6, r6, 0; bnelr cr6`)
+            Cmp | Cmpi | Cmpl | Cmpli => i.ins.field_crfd() >= 2,
             op => is_paired_single(op),
         };
         // an address built with `lis @h` + `ori @l`: the compiler always uses `@ha` + `addi`/`@l`

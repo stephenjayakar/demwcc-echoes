@@ -443,6 +443,17 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         }
     }
 
+    // accesses through a local copy of each pointer parameter (older compiler; variant)
+    if l.param_home_slots {
+        let mut probe = body.clone();
+        let mut pvars = l.vars.clone();
+        if sdkframe::param_views(&mut probe, &mut pvars) && variants::alt(variants::SDK_PARAM_VIEW) {
+            body = probe;
+            l.vars = pvars;
+            l.is_temp.resize(l.vars.len(), false);
+        }
+    }
+
     // more volatile-register locals in the draft than the target's frame has scalar slots for
     // (each costs this compiler a slot): fold the extra ones into their uses (variant)
     if l.param_home_slots && l.frame.info.size > 0 {
@@ -472,6 +483,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         if samereg::update_after_copy(&mut probe, &mut pvars) && variants::alt(variants::UPDATE_AFTER_COPY) {
             body = probe;
             l.vars = pvars;
+            l.is_temp.resize(l.vars.len(), false);
         }
     }
 

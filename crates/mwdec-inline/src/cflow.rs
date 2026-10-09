@@ -309,6 +309,19 @@ pub fn rewrite_regions(b: &mut Vec<Stmt>, whole: &[Stmt], env: &MEnv, idx: &Inde
     n
 }
 
+/// Assignments to `v` in `w` (nested lists too).
+fn assigns_in(w: &[Stmt], v: VarId) -> usize {
+    let mut n = 0;
+    for s in w {
+        match s {
+            Stmt::Assign { dst: Expr::Var(x), .. } if *x == v => n += 1,
+            Stmt::If { then, els, .. } => n += assigns_in(then, v) + assigns_in(els, v),
+            _ => {}
+        }
+    }
+    n
+}
+
 /// Try to fold a region starting at `b[i]` (largest window first). True if rewritten.
 pub fn try_region_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &MEnv, idx: &Index) -> bool {
     if idx.cflow.is_empty() || !matches!(b.get(i), Some(Stmt::Assign { dst: Expr::Var(_), .. }) | Some(Stmt::If { .. })) {
@@ -338,7 +351,9 @@ pub fn try_region_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &MEnv, id
                     });
                     c
                 };
-                calls || uses_in(w, *v) > 1 && !matches!(src, Expr::Int { .. } | Expr::Float { .. } | Expr::Var(_))
+                // (a variable the window assigns again is its result, `v = a; if (c) v = b;`)
+                let result = std::env::var_os("MWDI_NO_REGION_DEFAULTS").is_none() && assigns_in(w, *v) > 1;
+                calls || uses_in(w, *v) > 1 && !result && !matches!(src, Expr::Int { .. } | Expr::Float { .. } | Expr::Var(_))
             }
             _ => false,
         });

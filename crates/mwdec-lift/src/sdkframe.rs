@@ -133,3 +133,50 @@ pub fn fold_volatile_locals(body: &mut Vec<Stmt>, vars: &[Var], limit: usize) ->
     });
     done
 }
+
+/// The older compiler treats memory reached through a pointer parameter differently from memory
+/// reached through a local copy of it (the SDK's `__GXFifoObj* realFifo = (__GXFifoObj*)fifo;`):
+/// draft variant [`crate::variants::SDK_PARAM_VIEW`] reads and writes through a named local copy
+/// of each pointer parameter used as an access base (other uses keep the parameter).
+pub fn param_views(body: &mut Vec<Stmt>, vars: &mut Vec<Var>) -> bool {
+    let params: Vec<VarId> = (0..vars.len()).filter(|&v| matches!(vars[v].kind, VarKind::Param { .. })).collect();
+    let mut based: Vec<VarId> = vec![];
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Load { base, .. } = e {
+            let mut b = &**base;
+            while let Expr::Cast { e, .. } = b {
+                b = e;
+            }
+            if let Expr::Var(v) = b {
+                if params.contains(v) && !based.contains(v) {
+                    based.push(*v);
+                }
+            }
+        }
+    });
+    if based.is_empty() {
+        return false;
+    }
+    let mut inits = vec![];
+    for p in based {
+        let v = vars.len();
+        // (a byte pointer: offsets are added to it as they are, no cast per access, which the
+        // compiler would treat as a separate address computation)
+        let byte_ptr = mwdec_core::Type::Ptr(Box::new(mwdec_core::Type::Char));
+        vars.push(Var { name: format!("{}_v", vars[p].name), ty: byte_ptr.clone(), kind: VarKind::Local });
+        Stmt::rewrite_exprs(body, &mut |e| {
+            if let Expr::Load { base, .. } = e {
+                let mut b = &mut **base;
+                while let Expr::Cast { e, .. } = b {
+                    b = e;
+                }
+                if matches!(b, Expr::Var(x) if *x == p) {
+                    *b = Expr::Var(v);
+                }
+            }
+        });
+        inits.push(Stmt::Assign { dst: Expr::Var(v), src: Expr::Cast { ty: byte_ptr, e: Box::new(Expr::Var(p)) } });
+    }
+    body.splice(0..0, inits);
+    true
+}
