@@ -572,3 +572,222 @@ pub fn literal_inits(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb, obj: &mwde
 fn offset_end(off: i32, ty: &Type) -> Box<i64> {
     Box::new(off as i64 + scalar_size(ty).unwrap_or(1).max(1) as i64)
 }
+
+/// A local array initialized with values the function computes (`const T* v[2] = {&a, &b};`):
+/// MWCC copies a literal template object word by word into the frame and then stores the
+/// computed elements over it. The copies and the stores become the array's initializer (the
+/// template's words stand for the elements nothing overwrites); the elements are pointers,
+/// ints or floats.
+pub fn patched_literal_arrays(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, obj: &mwdec_core::ObjectFile) {
+    fn is_word(t: &Type) -> bool {
+        scalar_size(t) == Some(4) || matches!(t, Type::Unknown { size: 4 })
+    }
+    // (stack var, offset) a word store writes
+    fn word_dst(e: &Expr, vars: &[Var]) -> Option<(VarId, i32)> {
+        let (v, offset, ty) = match e {
+            Expr::Member { base, offset, ty } => match **base {
+                Expr::Var(v) => (v, *offset, ty),
+                _ => return None,
+            },
+            Expr::Load { base, offset, ty } => match &**base {
+                Expr::AddrOf(x) => match **x {
+                    Expr::Var(v) => (v, *offset, ty),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        };
+        (matches!(vars[v].kind, VarKind::Stack { .. }) && is_word(ty)).then_some((v, offset))
+    }
+    // (literal, offset) a word load reads
+    fn lit_word(e: &Expr) -> Option<(String, i32)> {
+        let e = match e {
+            Expr::Cast { e, .. } => e,
+            e => e,
+        };
+        let glob = |b: &Expr| -> Option<String> {
+            let b = match b {
+                Expr::AddrOf(x) => &**x,
+                b => b,
+            };
+            match b {
+                Expr::Global { symbol, .. } if is_literal_sym(symbol) => Some(symbol.clone()),
+                _ => None,
+            }
+        };
+        match e {
+            Expr::Global { symbol, ty } if is_literal_sym(symbol) && is_word(ty) => Some((symbol.clone(), 0)),
+            Expr::Member { base, offset, ty } | Expr::Load { base, offset, ty } if is_word(ty) => glob(base).map(|g| (g, *offset)),
+            _ => None,
+        }
+    }
+    let mut retyped: Vec<(VarId, Type)> = vec![];
+    let snapshot = vars.clone();
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let vars = &snapshot;
+        let mut i = 0;
+        while i < b.len() {
+            // a literal word copied to offset 0 of a frame object
+            let start = match &b[i] {
+                Stmt::Assign { dst, src } => match (word_dst(dst, vars), lit_word(src)) {
+                    (Some((v, 0)), Some((g, 0))) => Some((v, g)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some((v, g)) = start else {
+                i += 1;
+                continue;
+            };
+            let VarKind::Stack { size, .. } = vars[v].kind else {
+                i += 1;
+                continue;
+            };
+            let size = size as i32;
+            if size < 8 || size % 4 != 0 || size > 64 || named(&vars[v].ty).is_some() {
+                i += 1;
+                continue;
+            }
+            // the window: temps holding template words, copies, then the computed stores, up to
+            // the first other use of the object
+            let mut temps: HashMap<VarId, i32> = HashMap::new();
+            let mut copied: Vec<i32> = vec![];
+            let mut patched: Vec<(i32, Expr, usize)> = vec![];
+            let mut removable: Vec<usize> = vec![];
+            let mut ok = true;
+            // temp definitions of template words just before the start
+            let mut k0 = i;
+            while k0 > 0 {
+                match &b[k0 - 1] {
+                    Stmt::Assign { dst: Expr::Var(t), src } if lit_word(src).is_some_and(|(s, _)| s == g) => {
+                        temps.insert(*t, lit_word(src).unwrap().1);
+                        removable.push(k0 - 1);
+                        k0 -= 1;
+                    }
+                    _ => break,
+                }
+            }
+            for k in i..b.len() {
+                let s = &b[k];
+                let as_word_store = match s {
+                    Stmt::Assign { dst, src } => word_dst(dst, vars).filter(|(w, _)| *w == v).map(|(_, o)| (o, src)),
+                    _ => None,
+                };
+                if let Some((o, src)) = as_word_store {
+                    if o < 0 || o >= size || o % 4 != 0 {
+                        ok = false;
+                        break;
+                    }
+                    let from_tpl = match lit_word(src) {
+                        Some((s2, so)) => s2 == g && so == o,
+                        None => matches!(src, Expr::Var(t) if temps.get(t) == Some(&o)),
+                    };
+                    if from_tpl && !copied.contains(&o) && !patched.iter().any(|p| p.0 == o) {
+                        copied.push(o);
+                    } else if copied.contains(&o) && !patched.iter().any(|p| p.0 == o) && !stmt_uses_var(src, v) {
+                        // (a pointer stored as a word: the pointer)
+                        let val = match src {
+                            Expr::Cast { e, .. } if is_ptr(&types::ty_of(e, vars)) => (**e).clone(),
+                            e => e.clone(),
+                        };
+                        patched.push((o, val, k));
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                    removable.push(k);
+                    continue;
+                }
+                // a temp holding a template word
+                if let Stmt::Assign { dst: Expr::Var(t), src } = s {
+                    if let Some((s2, so)) = lit_word(src) {
+                        if s2 == g {
+                            temps.insert(*t, so);
+                            removable.push(k);
+                            continue;
+                        }
+                    }
+                }
+                if stmt_uses(s, v) || !matches!(s, Stmt::Assign { dst: Expr::Var(_), .. }) {
+                    break;
+                }
+            }
+            if !ok || copied.len() as i32 * 4 != size || patched.is_empty() {
+                i += 1;
+                continue;
+            }
+            // the temps only serve the copies
+            let temp_used_elsewhere = temps.keys().any(|t| b.iter().enumerate().any(|(k, s)| !removable.contains(&k) && stmt_uses(s, *t)));
+            if temp_used_elsewhere {
+                i += 1;
+                continue;
+            }
+            // (a template in a zero-initialized section has no bytes: zeros)
+            let Some(bytes) = mwdec_obj::data_bytes(obj, &g, 0, size as usize).map(|x| if x.is_empty() { vec![0u8; size as usize] } else { x.to_vec() }).filter(|x| x.len() == size as usize) else {
+                i += 1;
+                continue;
+            };
+            let ptr = patched.iter().all(|(_, e, _)| is_ptr(&types::ty_of(e, vars)));
+            let float = patched.iter().all(|(_, e, _)| matches!(types::ty_of(e, vars), Type::Float { size: 4 }));
+            let elem = if ptr {
+                Type::Ptr(Box::new(Type::Const(Box::new(Type::Void))))
+            } else if float {
+                Type::Float { size: 4 }
+            } else if patched.iter().all(|(_, e, _)| matches!(types::ty_of(e, vars), Type::Int { .. } | Type::Unknown { size: 4 })) {
+                Type::Int { size: 4, signed: true }
+            } else {
+                i += 1;
+                continue;
+            };
+            let mut args = vec![];
+            let mut good = true;
+            for w in 0..size / 4 {
+                let o = w * 4;
+                if let Some((_, e, _)) = patched.iter().find(|p| p.0 == o) {
+                    args.push(e.clone());
+                    continue;
+                }
+                let raw = bytes[o as usize..o as usize + 4].iter().fold(0u64, |a, x| (a << 8) | *x as u64);
+                match &elem {
+                    Type::Ptr(_) if raw == 0 => args.push(Expr::Int { value: 0, ty: elem.clone() }),
+                    Type::Float { .. } => args.push(Expr::Float { bits: raw, double: false }),
+                    Type::Int { .. } => args.push(Expr::int(raw as u32 as i32 as i64)),
+                    _ => {
+                        good = false;
+                        break;
+                    }
+                }
+            }
+            if !good {
+                i += 1;
+                continue;
+            }
+            let at = patched.iter().map(|p| p.2).max().unwrap_or(i);
+            let arr = Type::Array(Box::new(elem), (size / 4) as u32);
+            let init = Stmt::Assign { dst: Expr::Var(v), src: Expr::Construct { class: arr.clone(), ctor: None, args } };
+            removable.sort_unstable();
+            removable.dedup();
+            let insert_at = at - removable.iter().filter(|k| **k < at).count();
+            for k in removable.iter().rev() {
+                b.remove(*k);
+            }
+            b.insert(insert_at, init);
+            retyped.push((v, arr));
+            i = insert_at + 1;
+        }
+    });
+    for (v, t) in retyped {
+        vars[v].ty = t;
+    }
+}
+
+fn stmt_uses_var(e: &Expr, v: VarId) -> bool {
+    let mut found = false;
+    e.walk(&mut |x| {
+        if matches!(x, Expr::Var(w) if *w == v) {
+            found = true;
+        }
+    });
+    found
+}

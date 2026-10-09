@@ -1190,6 +1190,18 @@ pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) 
         return vec![];
     }
     let name = |b: u32| format!("__hwregs_{b:08X}");
+    // variant: registers whose whole address the target folds into the access are read through a
+    // constant pointer (asked only when there is such an access)
+    let folded_at = |base: &Expr, offset: i32| konst(base).is_some_and(|k| k & 0xffff == 0) && offset as u32 & 0xffff >= 0x400;
+    let mut any_folded = false;
+    Stmt::walk_exprs(body, &mut |e| {
+        if let Expr::Load { base, offset, .. } = e {
+            if let Some((None, _, a)) = split(base, *offset) {
+                any_folded |= blocks.contains_key(&(a & !0x3ff)) && folded_at(base, *offset);
+            }
+        }
+    });
+    let const_ptr = any_folded && crate::variants::alt(crate::variants::HW_CONST_POINTER);
     let arr = |es: u32| Type::Array(Box::new(Type::Volatile(Box::new(Type::Int { size: es as u8, signed: false }))), 0x400 / es);
     Stmt::rewrite_exprs(body, &mut |e| {
         let Expr::Load { base, offset, ty } = e else { return };
@@ -1199,6 +1211,7 @@ pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) 
             return;
         }
         let b = a & !0x3ff;
+        let folded = const_ptr && x.is_none() && folded_at(base, *offset);
         let it = Type::Int { size: 4, signed: true };
         let k = Expr::int(((a - b) / es) as i64);
         let idx = match x {
@@ -1214,7 +1227,15 @@ pub fn synth_hw_arrays(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>) 
         };
         // (the element type itself: a cast would drop the volatile access)
         let et = Type::Int { size: es as u8, signed: false };
-        *e = Expr::Index { base: Box::new(Expr::Global { symbol: name(b), ty: arr(es) }), index: Box::new(idx), ty: et };
+        // (variant: the register's whole address folded into the load, `lis 0xcc00; lwz r,
+        // 0x6438(r)`: a constant pointer indexed, `((vu32*)0xCC006400)[14]`; an array at the
+        // address may make the compiler form the block's address first and use small offsets)
+        let arr_base = if folded {
+            Expr::Cast { ty: Type::Ptr(Box::new(Type::Volatile(Box::new(et.clone())))), e: Box::new(Expr::Int { value: b as i64, ty: Type::Int { size: 4, signed: false } }) }
+        } else {
+            Expr::Global { symbol: name(b), ty: arr(es) }
+        };
+        *e = Expr::Index { base: Box::new(arr_base), index: Box::new(idx), ty: et };
     });
     blocks
         .into_iter()

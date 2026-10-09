@@ -71,3 +71,66 @@ pub fn merge_register_webs(body: &mut Vec<Stmt>, vars: &mut [Var]) -> bool {
     }
     changed
 }
+
+/// Register a variable is named after, any GPR (`temp_r0` -> `r0`).
+fn any_reg_of(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("temp_").or_else(|| name.strip_prefix("var_"))?;
+    let reg = rest.split('_').next()?;
+    let n: u32 = reg.strip_prefix('r')?.parse().ok()?;
+    (n <= 31).then_some(reg)
+}
+
+/// `t = x; v = t & m; ...; return t;` with `t` and `v` in one register: the register was updated
+/// in place after a copy of its old value was taken (`mr rB, rA` right after the load), so the
+/// source updated one variable and kept the old value in another (`cpr = x; prev = cpr; cpr &=
+/// m; ... return prev;`). Draft variant [`crate::variants::UPDATE_AFTER_COPY`].
+pub fn update_after_copy(body: &mut Vec<Stmt>, vars: &mut Vec<Var>) -> bool {
+    let n = body.len();
+    for i in 0..n {
+        let Stmt::Assign { dst: Expr::Var(t), src: _ } = &body[i] else { continue };
+        let t = *t;
+        if vars[t].kind != VarKind::Local {
+            continue;
+        }
+        let Some(rt) = any_reg_of(&vars[t].name).map(str::to_string) else { continue };
+        // the next statement: `v = <expr of t>` with v in the same register, a new variable
+        let Some(Stmt::Assign { dst: Expr::Var(v), src: vsrc }) = body.get(i + 1) else { continue };
+        let v = *v;
+        if v == t || vars[v].kind != VarKind::Local || any_reg_of(&vars[v].name) != Some(rt.as_str()) || !vsrc.uses_var(t) || vsrc.uses_var(v) {
+            continue;
+        }
+        // t is read again after v's assignment (at top level, outside nested blocks: kept simple)
+        let later: Vec<usize> = (i + 2..n).filter(|&k| stmt_uses(&body[k], t)).collect();
+        if later.is_empty() || later.iter().any(|&k| !matches!(body[k], Stmt::Assign { .. } | Stmt::Expr(_) | Stmt::Return(_))) {
+            continue;
+        }
+        // v isn't defined before i (it starts here)
+        if (0..=i).any(|k| stmt_uses(&body[k], v)) {
+            continue;
+        }
+        let p = vars.len();
+        vars.push(Var { name: format!("{}_old", vars[t].name), ty: vars[t].ty.clone(), kind: VarKind::Local });
+        for k in later {
+            Stmt::rewrite_exprs(std::slice::from_mut(&mut body[k]), &mut |e| {
+                if matches!(e, Expr::Var(x) if *x == t) {
+                    *e = Expr::Var(p);
+                }
+            });
+        }
+        // v becomes t (one variable updated in place)
+        Stmt::rewrite_exprs(&mut body[i + 1..], &mut |e| {
+            if matches!(e, Expr::Var(x) if *x == v) {
+                *e = Expr::Var(t);
+            }
+        });
+        body.insert(i + 1, Stmt::Assign { dst: Expr::Var(p), src: Expr::Var(t) });
+        return true;
+    }
+    false
+}
+
+fn stmt_uses(s: &Stmt, v: VarId) -> bool {
+    let mut found = false;
+    Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| found |= matches!(e, Expr::Var(x) if *x == v));
+    found
+}

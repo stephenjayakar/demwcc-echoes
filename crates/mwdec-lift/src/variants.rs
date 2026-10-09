@@ -67,6 +67,10 @@ pub const SDK_WORD_SHARED_INLINE: &str = "sdk.word_shared_inline";
 /// took the object's address first: `T& s = a[i]; u32 f = ...;`).
 pub const ORDER_ADDRESS_FIRST: &str = "order.address_first";
 
+/// Right-nested integer sums `a + (b + c)` (the compiler's reassociation of the source sum)
+/// written left to right `a + b + c` (`mwdec_lift::assoc`).
+pub const ARITH_LEFT_ASSOC: &str = "arith.left_assoc";
+
 /// A guessed struct return whose class nothing names takes the only class of the context whose
 /// layout and constructor fit the stores into it (`return T(args);`).
 pub const SRET_CLASS_BY_LAYOUT: &str = "sret.class_by_layout";
@@ -151,6 +155,14 @@ pub const EXPR_MASK_SELECT: &str = "expr.mask_select";
 /// Read-only pointer parameters of a function without a prototype declared pointer-to-const.
 pub const PARAM_CONST_POINTERS: &str = "param.const_pointers";
 
+/// Hardware registers accessed at folded addresses through a constant pointer instead of an
+/// array at the address.
+pub const HW_CONST_POINTER: &str = "hw.const_pointer";
+
+/// A value updated in place after a copy of its old value was taken: one variable updated, the
+/// old value in another (`cpr = x; prev = cpr; cpr &= m; ... return prev;`).
+pub const UPDATE_AFTER_COPY: &str = "vars.update_after_copy";
+
 /// Registered decision points: (name, what the alternative does).
 pub const POINTS: &[(&str, &str)] = &[
     (EXPLICIT_DEFAULT_ARGS, "trailing arguments equal to their declared defaults are passed explicitly"),
@@ -181,6 +193,8 @@ pub const POINTS: &[(&str, &str)] = &[
     (EXPR_BYTE_FIELDS, "byte/halfword fields packed into a word are narrowing conversions, not masks"),
     (CONST_READ_ONLY_EXTERNS, "scalar externs the function only reads are declared const"),
     (EXPR_MASK_SELECT, "a value masked by a 0/-1 select is a select between the value and zero"),
+    (HW_CONST_POINTER, "hardware registers at folded addresses are read through a constant pointer, not an array at the address"),
+    (UPDATE_AFTER_COPY, "a register updated in place after a copy of its old value: one variable updated, the copy in another"),
     (PARAM_CONST_POINTERS, "parameters only loaded through are declared pointer-to-const (their loads ignore stores)"),
     (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),
@@ -191,6 +205,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (FLOAT_UNFUSED_PRODUCTS, "float products the compiler did not fuse into an add stay locals"),
     (ASSIGN_COMPOUND_NARROW, "narrow destinations updated from themselves use compound assignment"),
     (LOCALS_NARROW_BY_DEFS, "int locals written only narrowed take the narrow type"),
+    (ARITH_LEFT_ASSOC, "right-nested integer sums are written left to right (a + b + c)"),
     (SRET_CLASS_BY_LAYOUT, "an unnamed struct return takes the one context class whose layout and constructor fit its stores"),
 ];
 

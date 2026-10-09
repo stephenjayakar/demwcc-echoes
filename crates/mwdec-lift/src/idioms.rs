@@ -127,6 +127,21 @@ pub fn standin_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
     }
     let first = body.iter().position(|s| stmt_mentions(s, sret)).unwrap_or(body.len());
     let mut fields: Vec<(i32, Type, Expr)> = vec![];
+    // the first word already folded into `return x;` after the other stores: member 0
+    if first < body.len() {
+        if let Some(Stmt::Return(Some(e))) = body.last() {
+            let t = types::ty_of(e, &ir.vars);
+            let t = match strip_cv(&t) {
+                Type::Unknown { size: 4 } => Some(Type::Int { size: 4, signed: true }),
+                Type::Int { size: 4, .. } | Type::Float { size: 4 } | Type::Ptr(_) => Some(strip_cv(&t).clone()),
+                _ => None,
+            };
+            if let Some(t) = t.filter(|_| !e.uses_var(sret) && !e.has_call()) {
+                fields.push((0, t, e.clone()));
+                body.pop();
+            }
+        }
+    }
     // a single word stored whole (already folded into `return x;`): a one-member object
     if first == body.len() {
         if let Some(Stmt::Return(Some(e))) = body.last() {

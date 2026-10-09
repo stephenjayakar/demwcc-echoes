@@ -465,8 +465,13 @@ pub fn drop_trailing_return(body: &mut Vec<Stmt>) {
         body.pop();
     }
     if let Some(Stmt::If { then, els, .. }) = body.last_mut() {
-        drop_trailing_return(then);
-        drop_trailing_return(els);
+        // (`if (c) return;` alone stays: MWCC keeps the test of an arm that only returns, an
+        // empty arm loses it)
+        let alone = |b: &Vec<Stmt>| matches!(b.as_slice(), [Stmt::Return(None)]);
+        if !(alone(then) && els.is_empty()) {
+            drop_trailing_return(then);
+            drop_trailing_return(els);
+        }
     }
 }
 
@@ -1432,7 +1437,13 @@ fn fold_logical_list(b: &mut Vec<Stmt>, vars: &[Var]) -> bool {
             }
         };
         let ok = matches!(&b[j], Stmt::Assign { dst: Expr::Var(x), src } if *x == v && zero(src, j, b));
-        if !ok {
+        // (zeroed before a call: a named local initialised at its declaration, kept as `if`)
+        let call_between = {
+            let mut c = false;
+            Stmt::walk_exprs(&b[j + 1..i], &mut |e| c |= e.is_real_call());
+            c
+        };
+        if !ok || call_between {
             i += 1;
             continue;
         }

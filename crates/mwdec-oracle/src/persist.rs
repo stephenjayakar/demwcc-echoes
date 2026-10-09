@@ -555,8 +555,12 @@ impl PersistentCompiler {
                 // loaded machine), so the instance is replaced by a fresh one and the candidate
                 // compiled once more; if that fails too, the instance ends (callers fall back to a
                 // normal compile)
-                if r.as_ref().is_err_and(|e2| format!("{e2:#}").matches("compiler exception").count() >= 2) && !self.exited {
-                    unsafe { self.terminate() };
+                // (or the process died: exited, or not stopped at its snapshot any more)
+                let dead = |m: &str| m.matches("compiler exception").count() >= 2 || m.contains("exited") || m.contains("not stopped");
+                if r.as_ref().is_err_and(|e2| dead(&format!("{e2:#}"))) {
+                    if !self.exited {
+                        unsafe { self.terminate() };
+                    }
                     if let Some((c, ctx, cap, fname)) = self.restart.clone() {
                         if let Ok(fresh) = Self::start_as(&c, &ctx, cap, fname.as_deref()) {
                             let (compiles, retries) = (self.compiles, self.retries);
@@ -569,6 +573,20 @@ impl PersistentCompiler {
                 }
                 r
             }
+            // the process ended under the candidate (killed, out of memory): a fresh instance
+            Err(e) if format!("{e:#}").contains("exited") && body.len() <= self.capacity => match self.restart.clone() {
+                Some((c, ctx, cap, fname)) => match Self::start_as(&c, &ctx, cap, fname.as_deref()) {
+                    Ok(fresh) => {
+                        let (compiles, retries) = (self.compiles, self.retries);
+                        *self = fresh;
+                        self.compiles = compiles;
+                        self.retries = retries + 1;
+                        self.compile_once(body).map_err(|e3| e3.context(format!("after a restart: {e:#}")))
+                    }
+                    Err(_) => Err(e),
+                },
+                None => Err(e),
+            },
             Err(e) => Err(e),
         }
     }

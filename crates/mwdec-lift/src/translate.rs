@@ -170,9 +170,9 @@ pub struct Lifter<'a> {
     in_stack: HashMap<i32, Expr>,
     /// outgoing stack argument slots (r1 offsets), captured as values for the call
     out_stack: HashSet<i32>,
-    /// every store into an outgoing argument slot: offset -> (instruction, value), for a call in
-    /// a later block (the slots were filled before a branch)
-    out_stack_stores: HashMap<i32, Vec<(usize, Expr)>>,
+    /// every store into an outgoing argument slot or a conversion slot: offset -> (instruction,
+    /// size, value), for a reader in a later block (the slot was filled before a branch)
+    slot_stores: HashMap<i32, Vec<(usize, u32, Expr)>>,
     /// Pure return blocks (epilogue + `blr`) whose return-value phi is split: every predecessor
     /// returns its own value (`return this; ... return w; ... return nullptr;`)
     pub split_returns: HashSet<usize>,
@@ -327,7 +327,7 @@ impl<'a> Lifter<'a> {
             stack_params: vec![],
             in_stack: HashMap::new(),
             out_stack: HashSet::new(),
-            out_stack_stores: HashMap::new(),
+            slot_stores: HashMap::new(),
             mfcr_vals: HashMap::new(),
             str_origin: HashMap::new(),
             empty_str_origin: None,
@@ -616,7 +616,22 @@ impl<'a> Lifter<'a> {
                 s.params.push(mwdec_core::Param { name: None, ty: t_s32() });
             }
         }
-        let sret = !sig::ret_unknown(&s) && types::is_aggregate(self.db, &s.ret);
+        let mut sret = !sig::ret_unknown(&s) && types::is_aggregate(self.db, &s.ret);
+        // a function of the unit the context doesn't declare (a mangled name has no return
+        // type), called with one argument register more than its parameters and a frame
+        // address in r3: an object returned by value into that frame object
+        if !sret && sig::ret_unknown(&s) && sig::demangle(&r.target).is_some() && s.this_class.is_none() && !self.db.map_or(false, |db| db.decls.contains_key(&s.qualified_name) || db.functions.contains_key(&r.target)) {
+            let lay0 = layout(&s, false, false, self.db);
+            let gpr_params = lay0.params.iter().all(|l| matches!(l, ArgLoc::Gpr(_)));
+            let next = 3 + lay0.params.len() as u8;
+            // (the next register set up for the call, or still holding this function's argument
+            // when the frame object is fresh: nothing wrote or took its address before)
+            if let Some(off) = self.frame_addr_in(k, gpr(3)).filter(|_| gpr_params && next <= 10) {
+                if self.reg_set_for_call(k, gpr(next)) || (self.entry_val_intact(k, gpr(next)) && self.fresh_frame_object(k, off)) {
+                    sret = true;
+                }
+            }
+        }
         let mut has_this = s.this_class.is_some() && !s.is_static;
         if has_this && self.db.map_or(true, |db| crate::sig::find_class(db, s.this_class.as_deref().unwrap()).is_none()) {
             // guess: member if the register after the last explicit param was set in this block
@@ -831,6 +846,44 @@ impl<'a> Lifter<'a> {
             && !self.insns[..k].iter().enumerate().any(|(j, i)| {
                 !self.frame.skip.contains(&j) && (i.is_call() || i.is_bctrl() || defs_uses(i).0.contains(&reg))
             })
+    }
+
+    /// `reg` holds a frame address at call `k` (`addi reg, r1, off` its last definition in the
+    /// block, no call between).
+    fn frame_addr_in(&self, k: usize, reg: Reg) -> Option<i32> {
+        let b = self.cfg.block_of[k];
+        let start = self.cfg.blocks[b].start;
+        let mut j = k;
+        while j > start {
+            j -= 1;
+            let i = &self.insns[j];
+            if i.is_call() || i.is_bctrl() {
+                return None;
+            }
+            let (d, _) = defs_uses(i);
+            if d.contains(&reg) {
+                return (i.op() == Opcode::Addi && i.ra() == 1 && i.reloc.is_none()).then(|| i.simm() as i32);
+            }
+        }
+        None
+    }
+
+    /// The frame object at `off` is untouched before instruction `k`: no store to it and no
+    /// other instruction takes its address.
+    fn fresh_frame_object(&self, k: usize, off: i32) -> bool {
+        let mut addr_takes = 0;
+        for (j, i) in self.insns.iter().enumerate().take(k) {
+            if self.frame.skip.contains(&j) || i.ra() != 1 || i.reloc.is_some() {
+                continue;
+            }
+            use ppc750cl::Opcode::*;
+            match i.op() {
+                Addi if i.simm() as i32 == off => addr_takes += 1,
+                Stw | Sth | Stb | Stfs | Stfd if i.disp() >= off && i.disp() < off + 4 => return false,
+                _ => {}
+            }
+        }
+        addr_takes == 1
     }
 
     fn reg_set_for_call(&self, k: usize, reg: Reg) -> bool {
@@ -2862,6 +2915,10 @@ impl<'a> Lifter<'a> {
                     Term::Return => {
                         if let Some(r) = self.ret_reg {
                             ret = Some(self.ret_value(&st, r));
+                        } else if let Some(c) = self.dead_tail_test(&st, start, k) {
+                            // a test nothing branches on before a void return: the source's
+                            // `if (c) return;` whose branch MWCC dropped (both arms return)
+                            st.out.push(Stmt::If { cond: c, then: vec![Stmt::Return(None)], els: vec![] });
                         }
                         continue;
                     }
@@ -2884,6 +2941,25 @@ impl<'a> Lifter<'a> {
         }
         let switch = self.switch_index.get(&b).cloned();
         BlockOut { stmts: st.out, cond, switch, ret }
+    }
+
+    /// The condition of a cr0 test (a record form or a compare) in `start..end` that nothing reads
+    /// before the block's return (no branch, call or other cr0 use after it).
+    fn dead_tail_test(&self, st: &St, start: usize, end: usize) -> Option<Expr> {
+        let cr0 = crf(0);
+        let j = (start..end).rev().find(|&j| !self.frame.skip.contains(&j) && defs_uses(&self.insns[j]).0.contains(&cr0))?;
+        let i = &self.insns[j];
+        if i.is_call() || i.is_bctrl() {
+            return None;
+        }
+        if (j + 1..=end).any(|q| {
+            let x = &self.insns[q];
+            x.is_call() || x.is_bctrl() || (!x.is_blr() && defs_uses(x).1.contains(&cr0))
+        }) {
+            return None;
+        }
+        let eq = st.cr[2].clone()?;
+        Some(eq.negate(&self.vars))
     }
 
     /// Branch condition including CTR-decrementing forms (`bdnz`): the decrement becomes an
@@ -3035,6 +3111,9 @@ impl<'a> Lifter<'a> {
         }
         let ret_ty = if !sig::ret_unknown(&sig) {
             sig.ret.clone()
+        } else if lay.sret.is_some() {
+            // (an object returned into a frame object: its type comes from how it is used)
+            Type::Unknown { size: 0 }
         } else {
             let r3 = self.use_count.get(&(k as u32, gpr(3))).copied().unwrap_or(0);
             let f1 = self.use_count.get(&(k as u32, fpr(1))).copied().unwrap_or(0);
@@ -3116,7 +3195,7 @@ impl<'a> Lifter<'a> {
                 other => Expr::Load { base: Box::new(other), offset: 0, ty: ret_ty.clone() },
             };
             if let Expr::Var(v) = &lv {
-                if matches!(self.vars[*v].ty, Type::Unknown { .. }) {
+                if matches!(self.vars[*v].ty, Type::Unknown { .. }) && !matches!(ret_ty, Type::Unknown { .. }) {
                     self.vars[*v].ty = ret_ty.clone();
                 }
             }
@@ -3339,10 +3418,16 @@ impl<'a> Lifter<'a> {
     /// The value stored into outgoing argument slot `o` by the last store before call `k` in a
     /// block dominating the call's (the slots set up before a branch the call follows).
     fn dominating_out_store(&self, o: i32, k: usize) -> Option<Expr> {
+        self.dominating_slot_store(o, k).map(|x| x.1)
+    }
+
+    /// (size, value) of the last store into frame slot `o` before instruction `k` in a block
+    /// dominating `k`'s.
+    fn dominating_slot_store(&self, o: i32, k: usize) -> Option<(u32, Expr)> {
         let cb = self.cfg.block_of[k];
-        let stores = self.out_stack_stores.get(&o)?;
-        let (_, v) = stores.iter().filter(|(j, _)| *j < k && self.cfg.dominates(self.cfg.block_of[*j], cb)).max_by_key(|(j, _)| *j)?;
-        Some(v.clone())
+        let stores = self.slot_stores.get(&o)?;
+        let (_, sz, v) = stores.iter().filter(|(j, _, _)| *j < k && self.cfg.dominates(self.cfg.block_of[*j], cb)).max_by_key(|(j, _, _)| *j)?;
+        Some((*sz, v.clone()))
     }
 
     fn layout_args(&mut self, st: &mut St, lay: &Layout, sig: &FuncSig) -> Vec<Expr> {
@@ -3744,7 +3829,7 @@ impl<'a> Lifter<'a> {
             Lwz | Lhz | Lha | Lbz => {
                 let ty = Self::load_ty(ins.op);
                 if i.ra() == 1 && self.stack.conv.contains(&i.disp()) {
-                    let v = self.conv_read(st, i.disp(), &ty);
+                    let v = self.conv_read(st, i.disp(), &ty, k);
                     self.def(st, k, gpr(i.rd()), v);
                     return;
                 }
@@ -3782,7 +3867,7 @@ impl<'a> Lifter<'a> {
                     }
                 }
                 if i.ra() == 1 && self.stack.conv.contains(&i.disp()) {
-                    let v = self.conv_read(st, i.disp(), &ty);
+                    let v = self.conv_read(st, i.disp(), &ty, k);
                     self.def(st, k, fpr(ins.field_frd()), v);
                     return;
                 }
@@ -3813,7 +3898,7 @@ impl<'a> Lifter<'a> {
                     // int -> float through a quantized load of a value stored for it (as wide as
                     // the quantized type: a wider store is an object's bytes read back)
                     let qsize = quant_type(q).and_then(|t| scalar_size(&t));
-                    if let Some((sz, v)) = st.mem.get(&off).cloned().filter(|(sz, _)| qsize.map_or(true, |q| q == *sz)) {
+                    if let Some((sz, v)) = st.mem.get(&off).cloned().or_else(|| self.dominating_slot_store(off, k)).filter(|(sz, _)| qsize.map_or(true, |q| q == *sz)) {
                         let _ = sz;
                         self.def(st, k, fpr(ins.field_frd()), Expr::cast(t_f32(), v));
                         return;
@@ -3866,9 +3951,7 @@ impl<'a> Lifter<'a> {
                 let src = if matches!(ins.op, Stfs | Stfd) { self.get(st, fpr(ins.field_frs())) } else { self.get(st, gpr(i.rs())) };
                 if i.ra() == 1 && i.reloc.is_none() && (self.stack.conv.contains(&i.disp()) || self.out_stack.contains(&i.disp())) {
                     let sz = scalar_size(&ty).unwrap_or(4);
-                    if self.out_stack.contains(&i.disp()) {
-                        self.out_stack_stores.entry(i.disp()).or_default().push((k, src.clone()));
-                    }
+                    self.slot_stores.entry(i.disp()).or_default().push((k, sz, src.clone()));
                     st.mem.insert(i.disp(), (sz, src));
                     return;
                 }
@@ -4560,7 +4643,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    fn conv_read(&mut self, st: &St, off: i32, ty: &Type) -> Expr {
+    fn conv_read(&mut self, st: &St, off: i32, ty: &Type, k: usize) -> Expr {
         match ty {
             Type::Float { size: 8 } => {
                 // int -> double magic: hi word 0x43300000, lo word x (^0x80000000 for signed)
@@ -4599,7 +4682,7 @@ impl<'a> Lifter<'a> {
                 if let Some((8, v)) = st.mem.get(&(off - 4)).cloned() {
                     return v;
                 }
-                if let Some((_, v)) = st.mem.get(&off).cloned() {
+                if let Some((_, v)) = st.mem.get(&off).cloned().or_else(|| self.dominating_slot_store(off, k)) {
                     // float stored quantized (`psq_st f, off, 1, qrN`) and read back as an
                     // integer: a float -> u8/u16/s16 conversion
                     if is_float(&ty_of(&v, &self.vars)) && !is_float(ty) {

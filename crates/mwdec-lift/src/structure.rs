@@ -604,6 +604,15 @@ impl<'a> Structurer<'a> {
             if pre != 1 - *k {
                 return None;
             }
+            // a flag set before a call (kept in a callee-saved register across it) was a named
+            // local initialised at its declaration: `bool r = false; f(); if (a && b) r = true;`
+            let stmts = &self.blocks[s].stmts;
+            let at = stmts.iter().rposition(|st| matches!(st, Stmt::Assign { dst: Expr::Var(x), .. } if x == v))?;
+            let mut after_call = false;
+            Stmt::walk_exprs(&stmts[at + 1..], &mut |e| after_call |= e.is_real_call());
+            if after_call {
+                return None;
+            }
             map.insert(*sb, if *k != 0 { T } else { F });
             map.insert(*j, if *k != 0 { F } else { T });
             variant = 2;
@@ -2413,7 +2422,7 @@ pub fn loop_exit_returns_after(body: &mut Vec<Stmt>, vars: &[Var]) {
 /// or a value the lifter lost (a register read with nothing in it, `/* uninit r4 */`; a
 /// condition-register bit no compare set, `/* cr bit 6 */`)?
 pub fn draft_wrong_meaning(src: &str) -> bool {
-    src.contains(WARN_INVARIANT_LOOP) || src.contains("/* uninit r") || src.contains("/* uninit f") || src.contains("/* cr bit")
+    src.contains(WARN_INVARIANT_LOOP) || ["/* uninit r", "/* uninit f", "/* cr bit", "/* psq */", "/* conv 0x", "/* stack arg */"].iter().any(|m| src.contains(m))
 }
 
 /// Warning text of `invariant_loop_conditions` (eval rows flag drafts carrying it).

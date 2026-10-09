@@ -703,6 +703,11 @@ impl Expr {
     }
 
     /// A call of a side-effect-free intrinsic on its operands (`__rlwimi`, `__cntlzw`): an operator, not a call.
+    /// A call of a function (not a compiler builtin like `__fabs`, `__cntlzw`, `__rlwimi`).
+    pub fn is_real_call(&self) -> bool {
+        matches!(self, Expr::Call { .. }) && !matches!(self, Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if matches!(symbol.as_str(), "__rlwimi" | "__cntlzw" | "__fabs"))
+    }
+
     pub fn is_pure_call(&self) -> bool {
         matches!(self, Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if symbol == "__rlwimi" || symbol == "__cntlzw")
     }

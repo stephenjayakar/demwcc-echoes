@@ -1047,6 +1047,8 @@ pub struct EvalArgs {
     /// compile stage would see (default, plain, raw, alternatives, variants). Two binaries with
     /// equal hashes on a function produce the same eval result for it (`tools/drafts_diff.py`).
     pub drafts_only: bool,
+    /// With `list`: listed functions not in the dataset too (not matched yet).
+    pub unmatched: bool,
 }
 
 #[derive(Default, Clone)]
@@ -1187,12 +1189,22 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
         .collect();
     if let Some(l) = &a.list {
         let text = std::fs::read_to_string(l).with_context(|| format!("reading {}", l.display()))?;
-        let want: std::collections::HashSet<(String, String)> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter_map(|v| Some((v.get("unit")?.as_str()?.to_string(), v.get("symbol")?.as_str()?.to_string())))
-            .collect();
+        let rows: Vec<serde_json::Value> = text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).collect();
+        let want: std::collections::HashSet<(String, String)> =
+            rows.iter().filter_map(|v| Some((v.get("unit")?.as_str()?.to_string(), v.get("symbol")?.as_str()?.to_string()))).collect();
         ds.retain(|e| want.contains(&(e.unit.clone(), e.symbol.clone())));
+        if a.unmatched {
+            let have: std::collections::HashSet<(String, String)> = ds.iter().map(|e| (e.unit.clone(), e.symbol.clone())).collect();
+            for v in &rows {
+                let (Some(unit), Some(symbol)) = (v.get("unit").and_then(|x| x.as_str()), v.get("symbol").and_then(|x| x.as_str())) else { continue };
+                let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let split = mwdec_project::split_of(unit);
+                if have.contains(&(unit.to_string(), symbol.to_string())) || split != a.split || a.max_size.is_some_and(|m| size > m) || size < a.min_size {
+                    continue;
+                }
+                ds.push(DatasetEntry { unit: unit.to_string(), symbol: symbol.to_string(), size, split: split.to_string() });
+            }
+        }
     }
     shuffle(&mut ds, a.seed);
     if let Some(k) = a.limit {

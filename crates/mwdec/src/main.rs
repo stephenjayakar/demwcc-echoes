@@ -256,6 +256,10 @@ enum Cmd {
         /// between two binaries, `tools/drafts_diff.py`).
         #[arg(long)]
         drafts_only: bool,
+        /// With --list: also listed functions that are not matched yet (not in the dataset; the
+        /// row's `size`, the split from the unit name), e.g. harvest attempts.
+        #[arg(long)]
+        unmatched: bool,
     },
     /// Inline-fold diagnostics: header inline templates that nearly match what a function's
     /// draft leaves unfolded, and why (one function, or a --list with a ranked summary).
@@ -330,11 +334,11 @@ fn real_main() -> Result<()> {
             }
             harvest::cmd_verify_units(&root, &units)
         }
-        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, exclude_implicit, mem_report, list, drafts_only } => {
+        Cmd::Eval { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit, exclude_implicit, mem_report, list, drafts_only, unmatched } => {
             search_cmds::cmd_eval(
                 &root,
                 &cli.work.clone().unwrap_or_else(search_cmds::search_work),
-                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit: include_implicit || !exclude_implicit, mem_report, list, drafts_only },
+                search_cmds::EvalArgs { split, max_size, min_size, limit, seed, budget_secs, max_compiles, jobs, workers, no_db, unit, out, no_locate, disable_ops, include_implicit: include_implicit || !exclude_implicit, mem_report, list, drafts_only, unmatched },
             )
         }
     }

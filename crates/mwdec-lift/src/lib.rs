@@ -12,8 +12,10 @@
 //!
 //! The resulting [`ir::IrFunction`] is plain owned data the search stage can rewrite.
 
+pub mod accum;
 pub mod aggregates;
 pub mod arrays;
+pub mod assoc;
 pub mod asmonly;
 pub mod bitfields;
 pub mod byval;
@@ -104,8 +106,12 @@ pub fn lift_function_with(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, o
     // argument registers read with nothing passed in them: one more register than the declared
     // parameters is the hidden struct-return pointer (the declaration has no return type)
     if reads_uninit_arg_reg(&ir) {
-        if let Ok(ir2) = lift_once(obj, f, db, opts, Some(true)) {
+        if let Ok(mut ir2) = lift_once(obj, f, db, opts, Some(true)) {
             if !reads_uninit_arg_reg(&ir2) {
+                // (its class unknown: the class every return returns, else the stand-in class)
+                if !return_class_from_returns(&mut ir2) {
+                    idioms::standin_sret(&mut ir2, db);
+                }
                 return Ok(ir2);
             }
         }
@@ -131,6 +137,48 @@ pub fn lift_function_with(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, o
         }
     }
     Ok(ir)
+}
+
+/// A struct return of unknown class whose every `return` returns an object of one named class
+/// (`return box.GetTransformedAABox(xf);`, the callee's struct return forwarded): that class.
+fn return_class_from_returns(ir: &mut IrFunction) -> bool {
+    let Some(sret) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return false };
+    if !matches!(pointee(&ir.vars[sret].ty), Some(mwdec_core::Type::Unknown { .. })) {
+        return false;
+    }
+    let mut cls: Option<mwdec_core::Type> = None;
+    let mut ok = true;
+    let mut seen = false;
+    let vars = ir.vars.clone();
+    fn returns(b: &[ir::Stmt], f: &mut dyn FnMut(&ir::Stmt)) {
+        for s in b {
+            match s {
+                ir::Stmt::Return(_) => f(s),
+                ir::Stmt::If { then, els, .. } => {
+                    returns(then, f);
+                    returns(els, f);
+                }
+                ir::Stmt::While { body, .. } | ir::Stmt::DoWhile { body, .. } | ir::Stmt::For { body, .. } => returns(body, f),
+                ir::Stmt::Switch { cases, .. } => cases.iter().for_each(|c| returns(&c.body, f)),
+                _ => {}
+            }
+        }
+    }
+    returns(&ir.body, &mut |s| match s {
+        ir::Stmt::Return(Some(e)) if !e.uses_var(sret) => {
+            let t = types::ty_of(e, &vars);
+            seen = true;
+            match (&cls, strip_cv(&t)) {
+                (_, mwdec_core::Type::Named(_)) if cls.as_ref().map_or(true, |c| c == strip_cv(&t)) => cls = Some(strip_cv(&t).clone()),
+                _ => ok = false,
+            }
+        }
+        _ => ok = false,
+    });
+    let Some(c) = cls.filter(|_| ok && seen) else { return false };
+    ir.vars[sret].ty = mwdec_core::Type::Ptr(Box::new(c.clone()));
+    ir.sig.ret = c;
+    true
 }
 
 /// Does the body read an argument register (r3..r10) nothing defined (`uninit rN`)?
@@ -195,6 +243,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     // fold, drop dead temps, and fold again: a dead read (the vtable load of a virtual call)
     // can keep a temp at two uses in the first round
     fpcopy::keep_copy_runs_named(&lists, &l.vars, &mut l.is_temp);
+    accum::name_accumulators(&mut lists, &l.vars, &mut l.is_temp);
     for round in 0..2 {
         if opts.inline_temps {
             let mut uses = count_all(&lists);
@@ -303,6 +352,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         byval::named_result_copies(&mut body, &mut l.vars, &mut dead_stores, db);
         byval::member_built_args(&mut body, &l.vars, db);
         aggregates::literal_inits(&mut body, &l.vars, db, obj);
+        aggregates::patched_literal_arrays(&mut body, &mut l.vars, obj);
         byval::forward_ptmf_args(&mut body, &l.vars, db);
         construct::fold(&mut body, &l.vars, db);
         arrays::recover(&mut body, &l.vars, Some(db));
@@ -326,6 +376,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     localtypes::bit_copies(&mut body, &l.vars);
     localtypes::drop_redundant_masks(&mut body, &l.vars, db);
     localtypes::cast_intrinsic_args(&mut body, &l.vars);
+    assoc::left_assoc_sums(&mut body);
     debug::stage("aggregates/bitfields", &body, &l.vars);
     objcmp::object_compares(&mut body, &l.vars, db);
     unroll::reroll_const(&mut body);
@@ -415,10 +466,29 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
             body = probe;
         }
     }
+    {
+        let mut probe = body.clone();
+        let mut pvars = l.vars.clone();
+        if samereg::update_after_copy(&mut probe, &mut pvars) && variants::alt(variants::UPDATE_AFTER_COPY) {
+            body = probe;
+            l.vars = pvars;
+        }
+    }
 
     if sig::ret_unknown(&l.sig) || matches!(l.sig.ret, mwdec_core::Type::Unknown { .. }) {
         localtypes::pointer_returns(&mut body, &mut l.vars, &mut l.ret_ty);
     }
+    // objects returned by value into frame objects by functions the context doesn't declare:
+    // the call returns the type the object turned out to have
+    let vars_now = l.vars.clone();
+    Stmt::for_each_block_mut(&mut body, &mut |b| for s in b.iter_mut() {
+        if let Stmt::Assign { dst: Expr::Var(v), src: Expr::Call { callee: Callee::Direct { sig: cs, .. }, ret, .. } } = s {
+            if matches!(ret, mwdec_core::Type::Unknown { size: 0 }) && sig::ret_unknown(cs) && matches!(vars_now[*v].ty, mwdec_core::Type::Named(_)) {
+                *ret = vars_now[*v].ty.clone();
+                cs.ret = vars_now[*v].ty.clone();
+            }
+        }
+    });
     let mut sig = l.sig.clone();
     sig.ret = l.ret_ty.clone();
     let string_pool = l.string_pool_prefix();

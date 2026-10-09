@@ -1242,6 +1242,10 @@ impl<'a> Em<'a> {
 
     /// A class that can take a brace initializer: no constructors, virtuals or bases.
     fn pod_aggregate(&self, t: &Type) -> bool {
+        // (an array of scalars or pointers)
+        if let Type::Array(el, n) = t {
+            return *n > 0 && (is_ptr(el) || matches!(strip_cv(el), Type::Int { .. } | Type::Float { .. } | Type::Bool | Type::Char));
+        }
         let Some(db) = self.db else { return false };
         let r = mwdec_lift::types::resolve(Some(db), t).into_owned();
         let Some(cls) = named(&r) else { return false };
@@ -1792,6 +1796,24 @@ impl<'a> Em<'a> {
                     let v = self.expr(&value, 0);
                     let _ = writeln!(self.out, "{ind}(({tname}*)&{d})->f = {v};");
                     return;
+                }
+                // a value accumulated in one callee-saved register (`temp_r31 = temp_r31 + x`):
+                // a compound update, which keeps the variable (`x = x + e` lets the compiler
+                // forward the sum into its use)
+                if let (Expr::Var(v), Expr::Binary { op: op @ (BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::And | BinOp::Xor), l, r, .. }) = (dst, src) {
+                    let callee_saved = self.vars()[*v].name.strip_prefix("temp_r").and_then(|n| n.split('_').next()?.parse::<u32>().ok()).is_some_and(|n| (14..=31).contains(&n));
+                    if callee_saved && **l == *dst && !r.uses_var(*v) && strip_cv(&ty_of(dst, self.vars())).int_info().is_some() {
+                        let o = match op {
+                            BinOp::Add => "+",
+                            BinOp::Sub => "-",
+                            BinOp::Or => "|",
+                            BinOp::And => "&",
+                            _ => "^",
+                        };
+                        let rv = self.expr(r, 1);
+                        let _ = writeln!(self.out, "{ind}{d} {o}= {rv};");
+                        return;
+                    }
                 }
                 // `m = (e + m) + k` (`add t, e, m; addi t, t, k`): the compiler builds that from
                 // `m += e + k` (it computes `m + (e + k)` as `(e + m) + k`, while `e + m + k`
