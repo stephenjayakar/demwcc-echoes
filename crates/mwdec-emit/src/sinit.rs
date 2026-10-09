@@ -91,6 +91,9 @@ impl<'a> Em<'a> {
         if let Some(d) = self.sinit_string_object() {
             return Some(d);
         }
+        if let Some(d) = self.sinit_pooled_objects() {
+            return Some(d);
+        }
         // single-definition register locals are inlined into the values
         let mut defs: HashMap<VarId, Expr> = HashMap::new();
         let mut ndefs: HashMap<VarId, usize> = HashMap::new();
@@ -258,6 +261,120 @@ impl<'a> Em<'a> {
             }
             out.push_str(&d);
             out.push('\n');
+        }
+        Some(out)
+    }
+
+    /// File-local static objects the compiler pools into one local block (`@N`: a destructor
+    /// chain node before each object): each registered object `static T x;`, its class from the
+    /// registered destructor (stand-ins for classes of the unit's anonymous namespace), built by
+    /// its default constructor (whose inlined stores the body holds).
+    fn sinit_pooled_objects(&mut self) -> Option<String> {
+        let ir = self.ir;
+        let db = self.db?;
+        let mut defs: HashMap<VarId, Expr> = HashMap::new();
+        for s in &ir.body {
+            if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+                if defs.insert(*v, src.clone()).is_some() {
+                    return None;
+                }
+            }
+        }
+        // (pooled symbol, byte offset) a pointer expression points at
+        fn ptr(e: &Expr, defs: &HashMap<VarId, Expr>, depth: u32) -> Option<(String, i32)> {
+            if depth > 8 {
+                return None;
+            }
+            match e {
+                Expr::Var(v) => ptr(defs.get(v)?, defs, depth + 1),
+                Expr::Cast { e, .. } => ptr(e, defs, depth + 1),
+                Expr::Binary { op: BinOp::Add, l, r, .. } => {
+                    let (s, o) = ptr(l, defs, depth + 1)?;
+                    Some((s, o + i32::try_from(r.as_int()?).ok()?))
+                }
+                Expr::Global { symbol, .. } => Some((symbol.clone(), 0)),
+                Expr::AddrOf(x) => lval(x, defs, depth + 1),
+                _ => None,
+            }
+        }
+        fn lval(e: &Expr, defs: &HashMap<VarId, Expr>, depth: u32) -> Option<(String, i32)> {
+            match e {
+                Expr::Global { symbol, .. } => Some((symbol.clone(), 0)),
+                Expr::Member { base, offset, .. } => lval(base, defs, depth + 1).map(|(s, o)| (s, o + offset)),
+                Expr::Load { base, offset, .. } => ptr(base, defs, depth + 1).map(|(s, o)| (s, o + offset)),
+                _ => None,
+            }
+        }
+        fn func_addr(e: &Expr) -> Option<&str> {
+            match e {
+                Expr::FuncAddr { symbol } => Some(symbol),
+                Expr::Cast { e, .. } => func_addr(e),
+                _ => None,
+            }
+        }
+        let mut pool: Option<String> = None;
+        let mut objs: Vec<(i32, String)> = vec![];
+        for s in &ir.body {
+            match s {
+                Stmt::Assign { dst: Expr::Var(_), .. } | Stmt::Return(None) | Stmt::Comment(_) => {}
+                Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }) if symbol == "__register_global_object" && args.len() == 3 => {
+                    let (sym, off) = ptr(&args[0], &defs, 0)?;
+                    let (nsym, noff) = ptr(&args[2], &defs, 0)?;
+                    let dtor = func_addr(&args[1]).filter(|d| d.starts_with("__dt__"))?;
+                    let cls = sig::sig_of(dtor, Some(db)).this_class?;
+                    // (the chain node right before the object)
+                    if !sym.starts_with('@') || nsym != sym || noff >= off || pool.as_ref().is_some_and(|p| *p != sym) {
+                        return None;
+                    }
+                    pool = Some(sym);
+                    objs.push((off, cls));
+                }
+                // the inlined default constructors' stores
+                Stmt::Assign { dst, .. } => {
+                    let (sym, _) = lval(dst, &defs, 0)?;
+                    if pool.as_ref().is_some_and(|p| *p != sym) || !sym.starts_with('@') {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let pool = pool?;
+        // every store lands in a registered object
+        for s in &ir.body {
+            if let Stmt::Assign { dst, .. } = s {
+                if matches!(dst, Expr::Var(_)) {
+                    continue;
+                }
+                let (sym, off) = lval(dst, &defs, 0)?;
+                if sym != pool || !objs.iter().any(|(o, _)| off >= *o) {
+                    return None;
+                }
+            }
+        }
+        objs.sort_by_key(|o| o.0);
+        // classes of the unit's anonymous namespace the context can't name: empty stand-ins
+        let mut standins: Vec<String> = vec![];
+        for (_, cls) in &objs {
+            let mut rest = cls.as_str();
+            while let Some(p) = rest.find("@unnamed@") {
+                let after = &rest[p + 9..];
+                let Some(e) = after.find("@::") else { break };
+                let name: String = after[e + 3..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if !name.is_empty() && sig::find_class(db, &name).is_none() && !standins.contains(&name) {
+                    standins.push(name);
+                }
+                rest = &after[e + 3..];
+            }
+        }
+        let mut out = String::new();
+        for n in &standins {
+            out.push_str(&format!("namespace {{ struct {n} {{ }}; }}
+"));
+        }
+        for (k, (_, cls)) in objs.iter().enumerate() {
+            out.push_str(&format!("static {} sObject{k};
+", strip_unnamed_ns(cls)));
         }
         Some(out)
     }

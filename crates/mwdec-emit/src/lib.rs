@@ -1873,6 +1873,11 @@ impl<'a> Em<'a> {
     /// `accessor_decl` on an object that is const when `obj_const`: of a const/non-const
     /// overload pair, the const one (returning a pointer/reference to const) is what's called.
     fn accessor_decl_c(&self, owner: &str, field: &str, obj_const: bool) -> Option<(String, Type)> {
+        self.accessor_decl_k(owner, field, obj_const).map(|(m, t, _)| (m, t))
+    }
+
+    /// `accessor_decl_c` with whether the accessor is a const method.
+    fn accessor_decl_k(&self, owner: &str, field: &str, obj_const: bool) -> Option<(String, Type, bool)> {
         let db = self.db?;
         let key = strip_template_args(owner);
         let prefix = format!("{key}::");
@@ -1897,7 +1902,7 @@ impl<'a> Em<'a> {
                 _ => true,
             }
         };
-        let mut best: Option<(u8, String, Type)> = None;
+        let mut best: Option<(u8, String, Type, bool)> = None;
         for (name, ds) in db.decls.range(prefix.clone()..) {
             if !name.starts_with(&prefix) {
                 break;
@@ -1912,14 +1917,28 @@ impl<'a> Em<'a> {
                     // prefer named const getters over operators
                     let rank = if m.starts_with("operator") { 2 } else if d.is_const { 0 } else { 1 };
                     let const_ret = |t: &Type| matches!(pointee(strip_cv(t)), Some(Type::Const(_))) || matches!(strip_cv(t), Type::Ref(x) if matches!(**x, Type::Const(_)));
-                    let const_tie = obj_const && const_ret(&d.ret) && best.as_ref().is_some_and(|(r, bm, bt)| rank == *r && bm == m && !const_ret(bt));
-                    if const_tie || best.as_ref().map_or(true, |(r, _, _)| rank < *r) {
-                        best = Some((rank, m.to_string(), d.ret.clone()));
+                    let const_tie = obj_const && const_ret(&d.ret) && best.as_ref().is_some_and(|(r, bm, bt, _)| rank == *r && bm == m && !const_ret(bt));
+                    if const_tie || best.as_ref().map_or(true, |(r, _, _, _)| rank < *r) {
+                        best = Some((rank, m.to_string(), d.ret.clone(), d.is_const));
                     }
                 }
             }
         }
-        best.map(|(_, m, t)| (m, t))
+        best.map(|(_, m, t, c)| (m, t, c))
+    }
+
+    /// A read of `path` goes through a non-const getter first (an inaccessible member whose only
+    /// inline getter is non-const): on a const object, the object is cast non-const.
+    fn path_needs_nonconst(&self, path: &[PathElem]) -> bool {
+        for p in path {
+            if let PathElem::Field(n, owner) = p {
+                if self.field_accessible(owner, n) {
+                    return false;
+                }
+                return self.accessor_decl_k(owner, n, false).is_some_and(|(_, _, c)| !c);
+            }
+        }
+        false
     }
 
     /// `obj.GetX(i)` for `obj.mX[i]` when `mX` is inaccessible here and the class declares an
@@ -2991,6 +3010,12 @@ impl<'a> Em<'a> {
                                 }
                                 return self.raw_access(base, off, ty, true);
                             }
+                            // (a non-const getter first on a pointer to const)
+                            let b = if read && self.path_needs_nonconst(&path) && (matches!(pointee(strip_cv(&bd)), Some(Type::Const(_))) || matches!(pointee(&ty_of(base, self.vars())), Some(Type::Const(_)))) {
+                                format!("const_cast<{}*>({})", types::split_closers(cls), self.expr(base, 0))
+                            } else {
+                                b
+                            };
                             let m = format!("{}->{}", b, self.path_str(&path, read));
                             // a reference member read as the pointer it is stored as
                             if read && matches!(strip_cv(&ft), Type::Ref(_)) && is_ptr(ty) {
@@ -3095,6 +3120,7 @@ impl<'a> Em<'a> {
                             if !self.reachable(&path, read) {
                                 return self.raw_access(base, off, ty, false);
                             }
+                            let b = if read && self.path_needs_nonconst(&path) && self.const_lvalue(base) { format!("const_cast<{}&>({b})", types::split_closers(cls)) } else { b };
                             let m = format!("{}.{}", b, self.path_str(&path, read));
                             // a reference member read as the pointer it is stored as
                             if read && matches!(strip_cv(&ft), Type::Ref(_)) && is_ptr(ty) {
@@ -3441,7 +3467,7 @@ impl<'a> Em<'a> {
                     }
                 }
                 // a const object (a reference-to-const parameter, a const local)
-                if !is_const_method && matches!(&**inner, Expr::Var(v) if matches!(self.ir.vars[*v].ty, Type::Const(_))) {
+                if !is_const_method && matches!(&**inner, Expr::Var(v) if matches!(self.ir.vars[*v].ty, Type::Const(_)) || matches!(&self.ir.vars[*v].ty, Type::Ref(r) if matches!(**r, Type::Const(_)))) {
                     if let Some(n) = named(strip_cv(&it)) {
                         let n = n.to_string();
                         return format!("const_cast<{n}&>({}).", self.expr(inner, 0));

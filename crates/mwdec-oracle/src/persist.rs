@@ -546,7 +546,13 @@ impl PersistentCompiler {
             Err(e) if self.stopped.is_some() && body.len() <= self.capacity && !e.to_string().starts_with(COMPILE_FAILED) => {
                 self.retries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(20));
-                self.compile_once(body).map_err(|e2| e2.context(format!("first attempt: {e:#}")))
+                let r = self.compile_once(body).map_err(|e2| e2.context(format!("first attempt: {e:#}")));
+                // crashed again from the restored snapshot: the snapshot itself may be bad, so the
+                // instance ends (the cache restarts it; callers fall back to a normal compile)
+                if r.as_ref().is_err_and(|e2| format!("{e2:#}").matches("compiler exception").count() >= 2) && !self.exited {
+                    unsafe { self.terminate() };
+                }
+                r
             }
             Err(e) => Err(e),
         }

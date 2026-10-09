@@ -70,6 +70,46 @@ pub struct Effects {
     pub reads_ref: bool,
     /// non-temp vars read
     pub vars: HashSet<VarId>,
+    /// memory read other than through a pointer-to-const parameter
+    pub other_mem: bool,
+}
+
+/// A pointer parameter declared pointer-to-const (directly, cast, or plus an offset): loads
+/// through it don't depend on stores for MWCC's scheduler.
+fn const_param_base(e: &Expr, vars: &[Var]) -> bool {
+    match e {
+        Expr::Var(v) => {
+            matches!(vars[*v].kind, VarKind::Param { .. })
+                && matches!(vars[*v].ty.unqualified(), mwdec_core::Type::Ptr(t) if matches!(**t, mwdec_core::Type::Const(_)))
+        }
+        Expr::Cast { e, .. } => const_param_base(e, vars),
+        Expr::Binary { op: BinOp::Add, l, r, .. } => {
+            (const_param_base(l, vars) && r.as_int().is_some()) || (const_param_base(r, vars) && l.as_int().is_some())
+        }
+        _ => false,
+    }
+}
+
+/// An assignment to a frame variable (by name, through its address, or a member of it) whose
+/// value has no calls: it can't change memory a parameter points to.
+fn frame_store(s: &Stmt, is_temp: &[bool], vars: &[Var]) -> bool {
+    let Stmt::Assign { dst, src } = s else { return false };
+    fn frame_root(e: &Expr, vars: &[Var]) -> bool {
+        match e {
+            Expr::Var(v) => matches!(vars[*v].kind, VarKind::Stack { .. }),
+            Expr::AddrOf(x) => frame_root(x, vars),
+            Expr::Cast { e, .. } => frame_root(e, vars),
+            Expr::Binary { op: BinOp::Add, l, r, .. } => (frame_root(l, vars) && r.as_int().is_some()) || (frame_root(r, vars) && l.as_int().is_some()),
+            _ => false,
+        }
+    }
+    let lv = match dst {
+        Expr::Var(v) => matches!(vars[*v].kind, VarKind::Stack { .. }),
+        Expr::Load { base, .. } => matches!(&**base, Expr::AddrOf(_) | Expr::Cast { .. } | Expr::Binary { .. }) && frame_root(base, vars),
+        Expr::Member { base, .. } => matches!(&**base, Expr::Var(v) if matches!(vars[*v].kind, VarKind::Stack { .. })),
+        _ => false,
+    };
+    lv && !effects(src, is_temp, vars).calls
 }
 
 pub fn effects(e: &Expr, is_temp: &[bool], vars: &[Var]) -> Effects {
@@ -86,6 +126,7 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
                 // address-taken stack aggregates behave like memory
                 if !addr && matches!(vars[*v].kind, VarKind::Stack { .. }) && matches!(vars[*v].ty, mwdec_core::Type::Named(_) | mwdec_core::Type::Unknown { .. }) {
                     fx.reads_mem = true;
+                    fx.other_mem = true;
                 }
             }
         }
@@ -93,12 +134,16 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
         Expr::Load { base, .. } => {
             if !addr {
                 fx.reads_mem = true;
+                if !const_param_base(base, vars) {
+                    fx.other_mem = true;
+                }
             }
             effects_into(base, is_temp, vars, fx, false);
         }
         Expr::Index { base, index, .. } => {
             if !addr {
                 fx.reads_mem = true;
+                fx.other_mem = true;
             }
             effects_into(base, is_temp, vars, fx, false);
             effects_into(index, is_temp, vars, fx, false);
@@ -108,6 +153,7 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
                 if let Expr::Var(v) = &**base {
                     if matches!(vars[*v].kind, VarKind::Stack { .. }) {
                         fx.reads_mem = true;
+                        fx.other_mem = true;
                     }
                     // reference / by-value aggregate parameters are vars of the object type: their
                     // members are memory a call may change (stores are left unordered: MWCC
@@ -117,6 +163,7 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
                     }
                 } else {
                     fx.reads_mem = true;
+                    fx.other_mem = true;
                 }
             }
             effects_into(base, is_temp, vars, fx, addr);
@@ -124,6 +171,7 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
         Expr::Global { .. } => {
             if !addr {
                 fx.reads_mem = true;
+                fx.other_mem = true;
             }
         }
         Expr::Call { args, .. } if e.is_pure_call() => {
@@ -134,6 +182,7 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
         Expr::Call { callee, args, .. } => {
             fx.calls = true;
             fx.reads_mem = true;
+            fx.other_mem = true;
             match callee {
                 Callee::Method { this, .. } | Callee::Virtual { this, .. } => effects_into(this, is_temp, vars, fx, false),
                 Callee::Indirect(e) => effects_into(e, is_temp, vars, fx, false),
@@ -147,15 +196,18 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
             // a write: order it like a call
             fx.calls = true;
             fx.reads_mem = true;
+            fx.other_mem = true;
             effects_into(e, is_temp, vars, fx, false);
         }
         Expr::BitField { base, .. } => {
             fx.reads_mem = true;
+            fx.other_mem = true;
             effects_into(base, is_temp, vars, fx, true);
         }
         Expr::Construct { args, .. } => {
             fx.calls = true;
             fx.reads_mem = true;
+            fx.other_mem = true;
             for a in args {
                 effects_into(a, is_temp, vars, fx, false);
             }
@@ -163,6 +215,7 @@ fn effects_into(e: &Expr, is_temp: &[bool], vars: &[Var], fx: &mut Effects, addr
         Expr::New { placement, args, .. } => {
             fx.calls = true;
             fx.reads_mem = true;
+            fx.other_mem = true;
             for a in placement.iter().chain(args.iter()) {
                 effects_into(a, is_temp, vars, fx, false);
             }
@@ -221,6 +274,7 @@ fn stmt_writes(s: &Stmt, is_temp: &[bool], vars: &[Var]) -> (HashSet<VarId>, boo
             wmem = true;
             fx.calls = true;
             fx.reads_mem = true;
+            fx.other_mem = true;
         }
     }
     if fx.calls {
@@ -234,7 +288,8 @@ fn conflicts(fx_e: &Effects, s: &Stmt, is_temp: &[bool], vars: &[Var]) -> bool {
     if wv.iter().any(|v| fx_e.vars.contains(v)) {
         return true;
     }
-    if wmem && (fx_e.reads_mem || fx_e.calls) {
+    // (loads through pointer-to-const parameters are not ordered with a frame variable store)
+    if wmem && (fx_e.reads_mem || fx_e.calls) && (fx_e.calls || fx_e.other_mem || !frame_store(s, is_temp, vars)) {
         return true;
     }
     if fx_e.reads_ref && fx_s.calls {

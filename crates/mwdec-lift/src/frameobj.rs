@@ -522,3 +522,126 @@ fn literal_value_is(lit: &str, e: &Expr) -> bool {
         _ => false,
     }
 }
+
+/// Constant stores into the returned object right before `return;` that are exactly what an
+/// inline constructor callable without arguments sets (`vector(const Alloc& a = Alloc()) :
+/// mAllocator(a), mCount(0), mCapacity(0), mItems(nullptr)`): `return R();`.
+pub fn fold_default_constructed_return(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    let Some(rv) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return };
+    let rt = strip_cv(&ir.sig.ret).clone();
+    let resolved = crate::types::resolve(Some(db), &rt).into_owned();
+    let Some(rcls) = named(strip_cv(&resolved)).map(|s| s.to_string()) else { return };
+    let Some(c) = crate::sig::find_class(db, &rcls) else { return };
+    let base = strip_template_args(&rcls);
+    let last = crate::sig::split_scope(&base).1.to_string();
+    let Some(decls) = db.decls.get(&format!("{base}::{last}")) else { return };
+    // (member offset, constant) of the first argument-free inline constructor with constants
+    let mut consts: Option<Vec<(i32, String)>> = None;
+    'd: for d in decls {
+        let callable = d.params.is_empty() || (d.defaults.len() == d.params.len() && d.defaults.iter().all(|x| x.is_some()));
+        if !callable || !d.is_inline_defined || d.access != mwdec_core::Access::Public {
+            continue;
+        }
+        let Some(init) = &d.init_list else { continue };
+        let names: Vec<String> = d.params.iter().map(|p| p.name.clone().unwrap_or_default()).collect();
+        let mut cs = vec![];
+        for part in crate::sig::split_top(init, ',') {
+            let toks: Vec<&str> = part.split_whitespace().collect();
+            if toks.len() < 4 || toks[1] != "(" || toks.last() != Some(&")") {
+                continue 'd;
+            }
+            let Some(f) = c.fields.iter().find(|f| f.name == toks[0]) else { continue 'd };
+            let inner = toks[2..toks.len() - 1].join(" ");
+            if names.iter().any(|n| *n == inner) {
+                // a parameter (its default) into an empty member: no store
+                if crate::types::size_of(Some(db), &f.ty).unwrap_or(0) > 1 || crate::types::is_aggregate(Some(db), &f.ty) && !c.fields.is_empty() && crate::types::size_of(Some(db), &f.ty) != Some(1) {
+                    continue 'd;
+                }
+                continue;
+            }
+            cs.push((f.offset as i32, inner));
+        }
+        if !cs.is_empty() {
+            consts = Some(cs);
+            break;
+        }
+    }
+    let Some(consts) = consts else { return };
+    let ctor = mwdec_core::FuncSig {
+        qualified_name: format!("{base}::{last}"),
+        mangled: None,
+        ret: Type::Void,
+        params: vec![],
+        this_class: Some(rcls.clone()),
+        is_const: false,
+        is_static: false,
+        is_virtual: false,
+        variadic: false,
+        runs_code: false,
+    };
+    let matches_all = |stores: &[Stmt]| -> bool {
+        let mut seen: Vec<i32> = vec![];
+        for st in stores {
+            match st {
+                Stmt::Assign { dst: Expr::Load { base, offset, .. }, src } if matches!(**base, Expr::Var(w) if w == rv) && consts.iter().any(|(o, lit)| o == offset && literal_value_is(lit, src)) => seen.push(*offset),
+                _ => return false,
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len() == consts.len() && stores.len() == seen.len()
+    };
+    // an `if` arm made of exactly those stores, the function returning right after the `if`
+    let n = ir.body.len();
+    if n >= 2 && matches!(ir.body[n - 1], Stmt::Return(None)) {
+        if let Stmt::If { then, els, .. } = &mut ir.body[n - 2] {
+            // one arm the constants, the other constructing the returned object in place
+            // (`__return->R(args)`): both become returns; anything else is left alone
+            let in_place = |arm: &[Stmt]| -> Option<Expr> {
+                if let [Stmt::Expr(Expr::Call { callee: Callee::Method { sig: cs, this, .. }, args, .. })] = arm {
+                    if crate::sig::is_ctor(cs) && matches!(**this, Expr::Var(w) if w == rv) {
+                        return Some(Expr::Construct { class: rt.clone(), ctor: Some(cs.clone()), args: args.clone() });
+                    }
+                }
+                None
+            };
+            let dflt = Stmt::Return(Some(Expr::Construct { class: rt.clone(), ctor: Some(ctor.clone()), args: vec![] }));
+            if !then.is_empty() && matches_all(then) {
+                if let Some(c2) = in_place(els) {
+                    *then = vec![dflt];
+                    *els = vec![Stmt::Return(Some(c2))];
+                }
+            } else if !els.is_empty() && matches_all(els) {
+                if let Some(c2) = in_place(then) {
+                    *els = vec![dflt];
+                    *then = vec![Stmt::Return(Some(c2))];
+                }
+            }
+        }
+        // both arms return now: the trailing `return;` is unreachable
+        if matches!(&ir.body[n - 2], Stmt::If { then, els, .. } if matches!(then.last(), Some(Stmt::Return(Some(_)))) && matches!(els.last(), Some(Stmt::Return(Some(_))))) {
+            ir.body.pop();
+        }
+    }
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        let Some(r) = b.iter().position(|s| matches!(s, Stmt::Return(None))) else { return };
+        let mut k = r;
+        let mut seen: Vec<i32> = vec![];
+        while k > 0 {
+            match &b[k - 1] {
+                Stmt::Assign { dst: Expr::Load { base, offset, .. }, src } if matches!(**base, Expr::Var(w) if w == rv) && consts.iter().any(|(o, lit)| o == offset && literal_value_is(lit, src)) => {
+                    seen.push(*offset);
+                    k -= 1;
+                }
+                _ => break,
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() != consts.len() || r - k != seen.len() {
+            return;
+        }
+        b.splice(k..=r, std::iter::once(Stmt::Return(Some(Expr::Construct { class: rt.clone(), ctor: Some(ctor.clone()), args: vec![] }))));
+    });
+}

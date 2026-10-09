@@ -1036,6 +1036,7 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     reset_memos();
     TARGET_DEAD.with(|d| *d.borrow_mut() = ir.dead_stores.iter().map(|x| (x.size, x.value.clone())).collect());
     LITERALS.with(|d| *d.borrow_mut() = ir.literal_bytes.iter().cloned().collect());
+    crate::walkptr::apply(ir, lib, db);
     let n = apply_inner(ir, lib, db);
     TARGET_DEAD.with(|d| d.borrow_mut().clear());
     LITERALS.with(|d| d.borrow_mut().clear());
@@ -1081,6 +1082,8 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     let stripped = stripped + crate::defctor::copy_ctor_inits(ir, db, &lib.copy_ctors);
     // stack buffers filled as a default construction and passed by reference: `T()`
     let stripped = stripped + crate::defctor::default_temps(ir, db, &lib.default_ctors);
+    // stack buffers built as a default construction and used as a named object: `T v;`
+    let stripped = stripped + crate::defctor::default_locals(ir, db, &lib.default_ctors);
     // list loops, before folding can merge the walking pointer with its first value
     let stash = if std::env::var("MWDI_NO_ITERLOOPS").is_err() { crate::iterloops::lists_prefold(ir, db) } else { vec![] };
     let stripped = stripped + stash.len();
@@ -1140,9 +1143,14 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         crate::post::forward_cond_temps(&mut ir.body, &ir.vars);
         crate::post::return_values(&mut ir.body, &ir.vars);
         crate::post::forward_temps_into_folded(&mut ir.body, &ir.vars);
+        // explicit calls of inline destructors test their objects themselves
+        crate::defctor::inline_destructor_tests(&mut ir.body);
+        // (a destructor folded only now anchors a default-constructed local)
+        crate::defctor::default_locals(ir, db, &lib.default_ctors);
         crate::post::fold_flag_chains(&mut ir.body, &ir.vars);
     }
     crate::stmtinl::finish(ir);
+    total += crate::walkptr::constructed_buffers(ir, db);
     total
 }
 

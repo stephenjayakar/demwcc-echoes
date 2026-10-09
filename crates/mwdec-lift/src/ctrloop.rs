@@ -517,8 +517,48 @@ fn has_own_jump(b: &[Stmt], in_switch: bool) -> bool {
     })
 }
 
+/// Does `part` contain a label that some `goto` of `whole` jumps to?
+fn has_targeted_label(part: &[Stmt], whole: &[Stmt]) -> bool {
+    fn labels(b: &[Stmt], gotos: bool, out: &mut Vec<LabelId>) {
+        for s in b {
+            match s {
+                Stmt::Label(l) if !gotos => out.push(*l),
+                Stmt::Goto(l) if gotos => out.push(*l),
+                Stmt::If { then, els, .. } => {
+                    labels(then, gotos, out);
+                    labels(els, gotos, out);
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => labels(body, gotos, out),
+                Stmt::For { init, step, body, .. } => {
+                    labels(init, gotos, out);
+                    labels(step, gotos, out);
+                    labels(body, gotos, out);
+                }
+                Stmt::Switch { cases, .. } => {
+                    for c in cases {
+                        labels(&c.body, gotos, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut ls = vec![];
+    labels(part, false, &mut ls);
+    if ls.is_empty() {
+        return false;
+    }
+    let mut gs = vec![];
+    labels(whole, true, &mut gs);
+    ls.iter().any(|l| gs.contains(l))
+}
+
 /// Returns Some(new var to add (if any)) when the loop at b[j] was rerolled.
 fn try_reroll(b: &mut Vec<Stmt>, j: usize, vars: &[Var], is_temp: &[bool], whole: &[Stmt], next_var: VarId) -> Option<Option<Var>> {
+    // a label inside the loop that a goto targets would be lost with the copies dropped
+    if has_targeted_label(std::slice::from_ref(&b[j]), whole) {
+        return None;
+    }
     let shape = loop_shape(&b[j], vars, b.get(j + 1))?;
     let c = shape.ctr;
     // the counter: `c = K` earlier in this list, read only by the loop's decrement and test

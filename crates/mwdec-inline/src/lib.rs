@@ -32,6 +32,7 @@ pub mod stmts;
 pub mod template;
 pub mod util;
 pub mod walk;
+pub mod walkptr;
 
 use mwdec_core::{ObjectFile, TypeDb};
 use mwdec_lift::IrFunction;

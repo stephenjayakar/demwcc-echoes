@@ -222,6 +222,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     }
 
     rematerialize_loop_headers(&mut l);
+    fold_header_counter_updates(&mut l);
     early_returns(&mut l);
     let ret_void = matches!(strip_cv(&l.ret_ty), mwdec_core::Type::Void);
     let mut body = {
@@ -412,6 +413,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     frameobj::unknown_callee_byval(&mut ir, db);
     frameobj::fold_converting_return(&mut ir, db);
     frameobj::drop_default_construction_stores(&mut ir, db);
+    frameobj::fold_default_constructed_return(&mut ir, db);
     localtypes::float_word_copies(&mut ir.body, &ir.vars);
     idioms::apply(&mut ir, db);
     idioms::narrow_float_stores(&mut ir, db);
@@ -466,6 +468,63 @@ fn bool_return(body: &[Stmt], vars: &[ir::Var], ret: &mut mwdec_core::Type) {
     }
     if real && all {
         *ret = mwdec_core::Type::Bool;
+    }
+}
+
+/// A loop's exit test that only steps a counter and tests it (`n = n - 1; if (n >= 0)`) is the
+/// source's `while (--n >= 0)`: the update moves into the test, so the loop is test-first
+/// (MWCC lays it out bottom-tested) instead of `while (true) { n--; if (n < 0) break; ... }`.
+fn fold_header_counter_updates(l: &mut Lifter) {
+    use ir::*;
+    // (the loop's exit test: its header, or the latch of a bottom-tested loop)
+    let tests: Vec<usize> = l
+        .cfg
+        .loops()
+        .iter()
+        .flat_map(|lp| {
+            lp.body
+                .iter()
+                .copied()
+                .filter(|&b| matches!(l.cfg.blocks[b].term, cfg::Term::Cond { taken, fall } if lp.body.contains(&taken) != lp.body.contains(&fall)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for h in tests {
+        let bo = &l.blocks_out[h];
+        let Some(cond) = bo.cond.clone() else { continue };
+        let [Stmt::Assign { dst: Expr::Var(v), src }] = bo.stmts.as_slice() else { continue };
+        let v = *v;
+        // (the CTR count of a `bdnz` loop is recovered as a counted loop elsewhere)
+        if l.is_temp.get(v).copied().unwrap_or(true) || l.vars[v].name.starts_with("var_ctr") || !matches!(strip_cv(&l.vars[v].ty), mwdec_core::Type::Int { size: 4, .. } | mwdec_core::Type::Long { .. }) {
+            continue;
+        }
+        let uncast = |e: &Expr| -> Expr {
+            let mut e = e;
+            while let Expr::Cast { e: x, .. } = e {
+                e = x;
+            }
+            e.clone()
+        };
+        let d = match uncast(src) {
+            Expr::Binary { op: BinOp::Add, l: a, r, .. } if uncast(&a) == Expr::Var(v) => r.as_int(),
+            Expr::Binary { op: BinOp::Sub, l: a, r, .. } if uncast(&a) == Expr::Var(v) => r.as_int().map(|k| -k),
+            _ => None,
+        };
+        let Some(d @ (1 | -1)) = d else { continue };
+        let mut n = 0;
+        cond.walk(&mut |e| n += matches!(e, Expr::Var(x) if *x == v) as usize);
+        if n != 1 {
+            continue;
+        }
+        let mut c = cond;
+        c.rewrite(&mut |e| {
+            if matches!(e, Expr::Var(x) if *x == v) {
+                *e = Expr::IncDec { e: Box::new(Expr::Var(v)), delta: d, post: false };
+            }
+        });
+        let bo = &mut l.blocks_out[h];
+        bo.cond = Some(c);
+        bo.stmts.clear();
     }
 }
 

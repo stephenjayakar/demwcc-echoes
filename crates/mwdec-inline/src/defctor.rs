@@ -1821,6 +1821,173 @@ pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usiz
     moved
 }
 
+// ---------------------------------------------------------------- default-constructed locals
+
+/// The stack buffer a pointer to a whole object designates (`(T*)buf`, `&buf`).
+fn stack_buffer(vars: &[mwdec_lift::Var], e: &Expr) -> Option<VarId> {
+    match e {
+        Expr::Cast { e, .. } | Expr::AddrOf(e) => stack_buffer(vars, e),
+        Expr::Var(v) if matches!(vars[*v].kind, VarKind::Stack { .. }) => Some(*v),
+        _ => None,
+    }
+}
+
+/// An untyped stack buffer built as a class's default construction and then destroyed by that
+/// class's destructor (`T v;` the source never used), or passed to a `T&` parameter and read
+/// afterwards (`T v; f(v); ... v ...`): the named local `T v;`, its construction and
+/// destruction implicit. The buffer's stores before must be the class's default construction
+/// (the probe's, or all zero when the class has no probe).
+pub fn default_locals(ir: &mut IrFunction, db: &TypeDb, dc: &DefCtors) -> usize {
+    let mut n = 0;
+    'next: loop {
+        // anchor: a destructor call on a buffer, or a buffer passed by reference
+        let mut found: Option<(VarId, String, usize, bool)> = None;
+        for (j, s) in ir.body.iter().enumerate() {
+            if let Stmt::Expr(Expr::Call { callee: Callee::Method { sig, this, .. }, args, .. }) = s {
+                if mwdec_lift::sig::is_dtor(sig) && args.iter().all(|a| a.as_int().is_some()) {
+                    if let (Some(v), Some(c)) = (stack_buffer(&ir.vars, this), sig.this_class.clone()) {
+                        if !matches!(ir.vars[v].ty, Type::Named(_)) {
+                            found = Some((v, c, j, true));
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut refs = vec![];
+            Stmt::walk_exprs(std::slice::from_ref(s), &mut |e| {
+                let (params, args, skip) = match e {
+                    Expr::Call { callee: Callee::Direct { sig, .. }, args, .. } => (&sig.params, args, usize::from(sig.this_class.is_some() && !sig.is_static)),
+                    Expr::Call { callee: Callee::Method { sig, .. }, args, .. } => (&sig.params, args, 0),
+                    _ => return,
+                };
+                for (k, a) in args.iter().enumerate() {
+                    let Some(p) = k.checked_sub(skip).and_then(|k| params.get(k)) else { continue };
+                    let Type::Ref(x) = strip_cv(&p.ty) else { continue };
+                    let Some(c) = crate::util::class_name(strip_cv(x), db) else { continue };
+                    let arg = match a {
+                        Expr::Load { base, offset: 0, .. } => &**base,
+                        x => x,
+                    };
+                    if let Some(v) = stack_buffer(&ir.vars, arg) {
+                        refs.push((v, c));
+                    }
+                }
+            });
+            for (v, c) in refs {
+                // (a temporary when nothing reads it later: `default_temps`)
+                if !matches!(ir.vars[v].ty, Type::Named(_)) && ir.body[j + 1..].iter().any(|t| mentions(t, v)) {
+                    found = Some((v, c, j, false));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some((sv, cls, j, is_dtor)) = found else { break };
+        // the stores before the anchor: the default construction
+        let pick: Vec<usize> = (0..j).filter(|&i| mentions(&ir.body[i], sv)).collect();
+        let defs = temp_defs(&ir.body, &ir.vars);
+        let c = Canon { this: Some(sv), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
+        let run: Vec<(usize, &Stmt)> = pick.iter().map(|&i| (i, &ir.body[i])).collect();
+        let size = mwdec_lift::sig::find_class(db, &cls).map(|k| k.size as i32);
+        let ok = match (run_stores(&c, &run, &ir.vars), dc.get(&cls)) {
+            (Some((stores, _)), Some(want)) => same_stores(want, &stores) || same_stores(&forward_stores(want), &stores),
+            (Some((stores, _)), None) => {
+                !stores.is_empty()
+                    && stores.iter().all(|s| matches!(s.val, CE::Int(0) | CE::Float(0)) && matches!(s.addr, CE::This(k) if k >= 0 && size.map_or(false, |z| k + s.size as i32 <= z)))
+            }
+            _ => false,
+        };
+        // (the destructor last: nothing mentions the buffer after it)
+        if !ok || (is_dtor && ir.body[j + 1..].iter().any(|t| mentions(t, sv))) {
+            // mark it typed-off so the search moves on
+            break 'next;
+        }
+        ir.vars[sv].ty = Type::Named(cls.clone());
+        if is_dtor {
+            // (a local mentioned nowhere else still has to be declared: `v;`)
+            let used = ir.body.iter().enumerate().any(|(k, t)| k != j && !pick.contains(&k) && mentions(t, sv));
+            if used {
+                ir.body.remove(j);
+            } else {
+                ir.body[j] = Stmt::Expr(Expr::Var(sv));
+                // `t = f(); v; return t;` is `v; return f();` (destroyed after the call either way)
+                if j >= 1 && j + 1 < ir.body.len() {
+                    if let (Stmt::Assign { dst: Expr::Var(t), src }, Stmt::Return(Some(Expr::Var(t2)))) = (&ir.body[j - 1], &ir.body[j + 1]) {
+                        let (t, src) = (*t, src.clone());
+                        let uses: usize = ir.body.iter().filter(|x| mentions(x, t)).count();
+                        if t == *t2 && uses == 2 && matches!(ir.vars[t].kind, VarKind::Local) {
+                            ir.body[j - 1] = Stmt::Expr(Expr::Var(sv));
+                            ir.body[j] = Stmt::Return(Some(src));
+                            ir.body.remove(j + 1);
+                        }
+                    }
+                }
+            }
+        }
+        for &i in pick.iter().rev() {
+            ir.body.remove(i);
+        }
+        n += 1;
+    }
+    n
+}
+
+// ---------------------------------------------------------------- inline destructors
+
+/// `if (... && p) p->~T();` with `~T` a folded inline destructor: the explicit call tests its
+/// object itself, so the last test of `p` in the condition is the call's own.
+pub fn inline_destructor_tests(body: &mut Vec<Stmt>) -> usize {
+    fn bare(e: &Expr) -> &Expr {
+        match e {
+            Expr::Cast { e, .. } => bare(e),
+            e => e,
+        }
+    }
+    fn conj<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match bare(e) {
+            Expr::Binary { op: BinOp::LogAnd, l, r, .. } => {
+                conj(l, out);
+                conj(r, out);
+            }
+            x => out.push(x),
+        }
+    }
+    let tests = |c: &Expr, p: &Expr| -> bool {
+        let t = match bare(c) {
+            Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) => bare(l),
+            x => x,
+        };
+        t == bare(p)
+    };
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            let Stmt::If { cond, then, els } = s else { continue };
+            if !els.is_empty() {
+                continue;
+            }
+            let [Stmt::Expr(Expr::Call { callee: Callee::Method { sig, this, .. }, args, .. })] = then.as_slice() else { continue };
+            if !mwdec_lift::sig::is_dtor(sig) || sig.mangled.is_some() || !args.is_empty() {
+                continue;
+            }
+            let mut parts = vec![];
+            conj(cond, &mut parts);
+            let Some(k) = parts.iter().rposition(|c| tests(c, this)) else { continue };
+            parts.remove(k);
+            let rest: Vec<Expr> = parts.into_iter().cloned().collect();
+            let call = then[0].clone();
+            *s = match rest.into_iter().reduce(|a, b| Expr::Binary { op: BinOp::LogAnd, l: Box::new(a), r: Box::new(b), ty: Type::Bool }) {
+                Some(c) => Stmt::If { cond: c, then: vec![call], els: vec![] },
+                None => call,
+            };
+            n += 1;
+        }
+    });
+    n
+}
+
 // ---------------------------------------------------------------- default-constructed arguments
 
 /// Classes passed by `const T&` to the functions `obj` calls (candidates for `T()` arguments).
@@ -1833,9 +2000,9 @@ pub fn wanted_arg_classes(obj: &ObjectFile, db: &TypeDb) -> Vec<String> {
             }
             let sig = mwdec_lift::sig::sig_of(&r.target, Some(db));
             for p in &sig.params {
+                // (by const reference: `T()` temporaries; by reference: named locals)
                 let Type::Ref(x) = strip_cv(&p.ty) else { continue };
-                let Type::Const(inner) = &**x else { continue };
-                let Some(c) = crate::util::class_name(inner, db) else { continue };
+                let Some(c) = crate::util::class_name(strip_cv(x), db) else { continue };
                 if !out.contains(&c) && out.len() < 48 && mwdec_lift::sig::find_class(db, &c).is_some_and(|k| !k.is_declaration && k.vptr_offset.is_none()) {
                     out.push(c);
                 }

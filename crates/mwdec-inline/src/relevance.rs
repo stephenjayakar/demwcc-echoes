@@ -45,6 +45,34 @@ fn seeds_of(syms: &mut dyn Iterator<Item = &str>, db: &TypeDb) -> Vec<String> {
     seeds
 }
 
+/// Top-level template arguments of a class name that name a type (cv, pointer and reference
+/// marks stripped): `V<unsigned int, const C*>` -> [`unsigned int`, `C`].
+fn class_template_args(name: &str) -> Vec<String> {
+    let Some(open) = name.find('<') else { return vec![] };
+    let Some(close) = name.rfind('>') else { return vec![] };
+    if close <= open {
+        return vec![];
+    }
+    let inner = &name[open + 1..close];
+    let (mut out, mut depth, mut start) = (vec![], 0i32, 0usize);
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(inner[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(inner[start..].to_string());
+    out.into_iter()
+        .map(|a| a.trim().trim_start_matches("const ").trim_end_matches(['*', '&', ' ']).trim_end_matches(" const").trim().to_string())
+        .filter(|a| a.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+        .collect()
+}
+
 /// Seeds closed over bases and member types, breadth-first up to `depth`.
 fn close(seeds: Vec<String>, db: &TypeDb, depth: u32) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
@@ -56,6 +84,13 @@ fn close(seeds: Vec<String>, db: &TypeDb, depth: u32) -> HashSet<String> {
         let Some(k) = mwdec_lift::sig::find_class(db, &c) else { continue };
         for b in &k.bases {
             frontier.push_back((b.name.clone(), d + 1));
+            // the class types a template base is instantiated with (a class that is a
+            // container of its elements: its methods walk them with the element's inlines)
+            for a in class_template_args(&b.name) {
+                if mwdec_lift::sig::find_class(db, &a).is_some() {
+                    frontier.push_back((a, d + 1));
+                }
+            }
         }
         let mut fs = vec![];
         for f in &k.fields {

@@ -313,6 +313,7 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
     if let Some(db) = db {
         constructed_arg_temporaries(&mut ir.body, &vars);
         drop_frame_object_dtor_calls(&mut ir.body, &vars, db);
+        base_destructor_calls(&mut ir.body, &vars, db);
         // a value kept in a register across the destructor call is returned directly
         return_kept_values(&mut ir.body, &vars);
     }
@@ -1721,6 +1722,169 @@ fn inline_dtor_callees(db: &TypeDb, cls: &str) -> Vec<String> {
     out
 }
 
+/// A class destroyed by its own destructor whose whole work is its base's destructor: one
+/// base `base` at offset 0, no members with destructors, an implicit or empty inline destructor
+/// (`TToken<T>` over `CToken`). Shortest name first (any such class compiles the same).
+fn trivially_derived(db: &TypeDb, base: &str) -> Option<String> {
+    trivially_derived_n(db, base, 1)
+}
+
+/// [`trivially_derived`] `depth` levels down (`TLockedToken<T>` over `TToken<T>` over `CToken`:
+/// each level's inline destructor tests its object once).
+fn trivially_derived_n(db: &TypeDb, base: &str, depth: usize) -> Option<String> {
+    if depth == 0 {
+        return Some(base.to_string());
+    }
+    let mut best: Option<String> = None;
+    for (name, c) in &db.classes {
+        if c.is_declaration || c.vptr_offset.is_some() || !matches!(c.bases.as_slice(), [b] if b.offset == 0 && !b.is_virtual && sig::norm_name(&b.name) == sig::norm_name(base)) {
+            continue;
+        }
+        if c.fields.iter().any(|f| named(strip_cv(&types::resolve(Some(db), &f.ty))).is_some()) {
+            continue;
+        }
+        let last = sig::split_scope(name).1;
+        let dkey = format!("{}::~{}", name, last.split('<').next().unwrap_or(last));
+        let dkey2 = format!("{name}::~{last}");
+        let decls: Vec<&mwdec_core::DeclInfo> = db.decls.get(&dkey).or_else(|| db.decls.get(&dkey2)).map(|v| v.iter().collect()).unwrap_or_default();
+        if decls.iter().any(|d| !d.is_inline_defined || d.inline_body.as_deref().is_some_and(|b| !b.trim().is_empty())) {
+            continue;
+        }
+        let Some(full) = trivially_derived_n(db, name, depth - 1) else { continue };
+        if best.as_ref().map_or(true, |b| full.len() < b.len() || (full.len() == b.len() && full < *b)) {
+            best = Some(full);
+        }
+    }
+    best
+}
+
+/// The destructor of `cls` when it is inline, its whole body a call of the non-public method `m`.
+fn dtor_body_of(db: &TypeDb, cls: &str, m: &mwdec_core::FuncSig) -> Option<mwdec_core::FuncSig> {
+    let key = strip_tmpl(cls);
+    let last = sig::split_scope(&key).1.to_string();
+    let name = sig::split_scope(&m.qualified_name).1.to_string();
+    let dt = db.decls.get(&format!("{key}::~{last}"))?;
+    if !dt.iter().any(|d| d.inline_body.as_deref().map(str::trim) == Some(&format!("{name} ( ) ;"))) {
+        return None;
+    }
+    let private = db.decls.get(&format!("{key}::{name}")).is_some_and(|ds| ds.iter().all(|d| d.access != mwdec_core::Access::Public));
+    if !private {
+        return None;
+    }
+    let cl = sig::split_scope(cls).1.to_string();
+    Some(mwdec_core::FuncSig { qualified_name: format!("{cls}::~{}", cl.split('<').next().unwrap_or(&cl)), mangled: None, ret: Type::Void, params: vec![], this_class: Some(cls.to_string()), is_const: false, is_static: false, is_virtual: false, variadic: false, runs_code: false })
+}
+
+/// Is `d` a class `depth` trivial levels above `base` (see [`trivially_derived`])?
+fn derives_trivially(db: &TypeDb, d: &str, base: &str, depth: usize) -> bool {
+    if depth == 0 {
+        return sig::norm_name(d) == sig::norm_name(base);
+    }
+    let Some(c) = sig::find_class(db, d) else { return false };
+    match c.bases.as_slice() {
+        [b] if b.offset == 0 && !b.is_virtual && c.vptr_offset.is_none() => derives_trivially(db, &b.name, base, depth - 1),
+        _ => false,
+    }
+}
+
+/// Destructor calls behind null tests of their object:
+/// - `if (p) Base::~Base(p, 0);`: MWCC passes 0 only from a derived class's destructor, so this
+///   is the inline destructor of a class whose only work is its base's, null test included:
+///   `((D*)p)->~D();` (an explicit `p->~Base()` would pass -1);
+/// - `if (p) p->~T();` with `T`'s destructor inline: the explicit call tests `p` itself.
+/// Other tests of the condition (`a && p`) stay.
+fn base_destructor_calls(body: &mut Vec<Stmt>, vars: &[Var], db: &TypeDb) {
+    fn bare(e: &Expr) -> &Expr {
+        match e {
+            Expr::Cast { e, .. } => bare(e),
+            e => e,
+        }
+    }
+    fn conj<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match bare(e) {
+            Expr::Binary { op: BinOp::LogAnd, l, r, .. } => {
+                conj(l, out);
+                conj(r, out);
+            }
+            x => out.push(x),
+        }
+    }
+    let tests = |c: &Expr, p: &Expr| -> bool {
+        let t = match bare(c) {
+            Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) => bare(l),
+            x => x,
+        };
+        t == bare(p)
+    };
+    let inline_dtor = |cls: &str| -> bool {
+        let last = sig::split_scope(cls).1;
+        let lb = last.split('<').next().unwrap_or(last);
+        let keys = [format!("{cls}::~{lb}"), format!("{cls}::~{last}"), format!("{}::~{lb}", strip_tmpl(cls))];
+        keys.iter().find_map(|k| db.decls.get(k)).is_some_and(|ds| !ds.is_empty() && ds.iter().all(|d| d.is_inline_defined))
+    };
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            let Stmt::If { cond, then, els } = s else { continue };
+            if !els.is_empty() {
+                continue;
+            }
+            let [Stmt::Expr(Expr::Call { callee: Callee::Method { sig: ds0, this, qualified, .. }, args, ret })] = then.as_slice() else { continue };
+            if !args.is_empty() {
+                continue;
+            }
+            let Some(cls) = ds0.this_class.clone() else { continue };
+            // (a non-public method that is an inline destructor's whole body is written as that
+            // destructor: `internal_dereference()` as `~basic_string()`)
+            let ds = if sig::is_dtor(ds0) {
+                ds0.clone()
+            } else {
+                match dtor_body_of(db, &cls, ds0) {
+                    Some(d) => d,
+                    None => continue,
+                }
+            };
+            let ds = &ds;
+            let mut parts = vec![];
+            conj(cond, &mut parts);
+            let call = if *qualified {
+                // every test of the object goes: each derived level's destructor makes its own
+                let n = parts.iter().filter(|c| tests(c, this)).count();
+                if n == 0 {
+                    continue;
+                }
+                // (the object's own class when it is such a class, else any)
+                let own = match types::ty_of(bare(this), vars) {
+                    Type::Ptr(t) => named(strip_cv(&t)).map(str::to_string),
+                    _ => None,
+                };
+                let found = trivially_derived_n(db, &cls, n);
+                // (an instance the type database lacks, of the same template as the one found)
+                let stem = |x: &str| x.split('<').next().unwrap_or(x).to_string();
+                let own = own.filter(|o| derives_trivially(db, o, &cls, n) || (sig::find_class(db, o).is_none() && o.contains('<') && found.as_deref().is_some_and(|f| stem(f) == stem(o))));
+                let Some(d) = own.or(found) else { continue };
+                parts.retain(|c| !tests(c, this));
+                let last = sig::split_scope(&d).1.to_string();
+                let sig = mwdec_core::FuncSig { qualified_name: format!("{d}::~{last}"), mangled: None, ret: Type::Void, params: vec![], this_class: Some(d.clone()), is_const: false, is_static: false, is_virtual: false, variadic: false, runs_code: false };
+                let obj = Expr::Cast { ty: Type::Ptr(Box::new(Type::Named(d))), e: Box::new(bare(this).clone()) };
+                Expr::Call { callee: Callee::Method { symbol: String::new(), sig, this: Box::new(obj), qualified: false }, args: vec![], ret: Type::Void }
+            } else if inline_dtor(&cls) {
+                // the last test of the object is the explicit call's own
+                let Some(k) = parts.iter().rposition(|c| tests(c, this)) else { continue };
+                parts.remove(k);
+                Expr::Call { callee: Callee::Method { symbol: String::new(), sig: ds.clone(), this: this.clone(), qualified: false }, args: vec![], ret: ret.clone() }
+            } else {
+                continue;
+            };
+            let rest: Vec<Expr> = parts.into_iter().cloned().collect();
+            let stmt = Stmt::Expr(call);
+            *s = match rest.into_iter().reduce(|a, b| Expr::Binary { op: BinOp::LogAnd, l: Box::new(a), r: Box::new(b), ty: Type::Bool }) {
+                Some(c) => Stmt::If { cond: c, then: vec![stmt], els: vec![] },
+                None => stmt,
+            };
+        }
+    });
+}
+
 /// `T::T(&t, args); f(..., &t, ...); T::~T(&t, -1);` with `t` a frame object passed by
 /// reference and mentioned nowhere else: the temporary `f(..., T(args), ...)` (destroyed at the
 /// end of the full expression, right after the call).
@@ -1736,22 +1900,45 @@ fn constructed_arg_temporaries(body: &mut Vec<Stmt>, vars: &[Var]) {
             _ => None,
         }
     };
+    // the object (or one of its members) a destructor call is on
+    fn root(e: &Expr) -> Option<VarId> {
+        match e {
+            Expr::Cast { e, .. } | Expr::AddrOf(e) => root(e),
+            Expr::Member { base, .. } => root(base),
+            Expr::Var(w) => Some(*w),
+            _ => None,
+        }
+    }
+    // destructor calls of `v` or of its members, possibly behind tests of their addresses
+    fn destroys(s: &Stmt, v: VarId) -> bool {
+        match s {
+            Stmt::Expr(Expr::Call { callee: Callee::Method { sig: ds, this, .. }, args, .. }) => sig::is_dtor(ds) && args.iter().all(|a| a.as_int().is_some()) && root(this) == Some(v),
+            Stmt::If { cond, then, els } => els.is_empty() && !then.is_empty() && then.iter().all(|t| destroys(t, v)) && !cond.has_call() && root(match cond {
+                Expr::Binary { l, .. } => l,
+                c => c,
+            }) == Some(v),
+            _ => false,
+        }
+    }
     Stmt::for_each_block_mut(body, &mut |b| {
         let mut i = 0;
         while i + 2 < b.len() {
+            // built by a constructor call, or assigned a constructed value (`v = T(args)`)
             let ctor = match &b[i] {
-                Stmt::Expr(Expr::Call { callee: Callee::Method { sig: cs, this, .. }, args, .. }) if sig::is_ctor(cs) => on(this).map(|v| (v, cs.clone(), args.clone())),
+                Stmt::Expr(Expr::Call { callee: Callee::Method { sig: cs, this, .. }, args, .. }) if sig::is_ctor(cs) => on(this).map(|v| (v, Expr::Construct { class: Type::Named(cs.this_class.clone().unwrap_or_default()), ctor: Some(cs.clone()), args: args.clone() })),
+                Stmt::Assign { dst: Expr::Var(v), src: e @ Expr::Construct { .. } } if matches!(vars[*v].kind, VarKind::Stack { .. }) => Some((*v, e.clone())),
                 _ => None,
             };
-            let dtor = match &b[i + 2] {
-                Stmt::Expr(Expr::Call { callee: Callee::Method { sig: ds, this, .. }, args, .. }) if sig::is_dtor(ds) && args.iter().all(|a| a.as_int().is_some()) => on(this),
-                _ => None,
-            };
-            let Some((v, cs, cargs)) = ctor else {
+            let Some((v, temp)) = ctor else {
                 i += 1;
                 continue;
             };
-            if dtor != Some(v) || total(v) != 3 || mentions(&b[i + 1], v) != 1 || cargs.iter().any(|a| a.uses_var(v)) {
+            let defm = match &b[i] {
+                Stmt::Assign { src, .. } => usize::from(src.uses_var(v)),
+                Stmt::Expr(Expr::Call { args, .. }) => usize::from(args.iter().any(|a| a.uses_var(v))),
+                _ => 0,
+            };
+            if !destroys(&b[i + 2], v) || defm != 0 || mentions(&b[i + 1], v) != 1 || total(v) != mentions(&b[i], v) + 1 + mentions(&b[i + 2], v) {
                 i += 1;
                 continue;
             }
@@ -1792,7 +1979,6 @@ fn constructed_arg_temporaries(body: &mut Vec<Stmt>, vars: &[Var]) {
                 i += 1;
                 continue;
             }
-            let temp = Expr::Construct { class: Type::Named(cs.this_class.clone().unwrap_or_default()), ctor: Some(cs), args: cargs };
             if let Stmt::Expr(Expr::Call { args, .. }) = &mut b[i + 1] {
                 for a in args.iter_mut() {
                     if on(a) == Some(v) {
@@ -2324,7 +2510,8 @@ pub fn untype_undeclarable(body: &[Stmt], vars: &mut [Var], db: Option<&TypeDb>)
         }
         let key = format!("{}::{}", strip_tmpl(&cls), strip_tmpl(sig::split_scope(&cls).1));
         let has_default = match db.decls.get(&key) {
-            Some(ds) => ds.iter().any(|d| d.params.is_empty()),
+            // (or every parameter defaulted: `vector(const Alloc& = Alloc())`)
+            Some(ds) => ds.iter().any(|d| d.params.is_empty() || (d.defaults.len() == d.params.len() && d.defaults.iter().all(|x| x.is_some()))),
             // (an instance of a class template the context never instantiates: nothing says
             // it can be default-constructed)
             None => !(cls.contains('<') && sig::find_class(db, &cls).is_none()),

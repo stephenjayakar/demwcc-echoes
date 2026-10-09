@@ -759,6 +759,11 @@ impl<'a> Lifter<'a> {
         if read {
             return 0;
         }
+        // (arguments only go on the stack once the argument registers of a kind are used up)
+        let full = |r: &dyn Fn(u8) -> Reg, n: u8| (1..=n).all(|q| self.reg_set_for_call(k, r(q)) || self.entry_val_intact(k, r(q)));
+        if !full(&|q| gpr(q + 2), 8) && !full(&|q| fpr(q), 8) {
+            return 0;
+        }
         offs.len()
     }
 
@@ -2518,7 +2523,8 @@ impl<'a> Lifter<'a> {
                 self.sig.params.push(mwdec_core::Param { name: None, ty: t_f32() });
             }
         }
-        let (early, read_only) = self.const_pointer_params();
+        // (MWDEC_NO_CONST_PARAMS: off, to measure the rule)
+        let (early, read_only) = if std::env::var_os("MWDEC_NO_CONST_PARAMS").is_some() { (vec![], vec![]) } else { self.const_pointer_params() };
         let chosen = if read_only.len() > early.len() && crate::variants::alt(crate::variants::PARAM_CONST_POINTERS) {
             read_only
         } else {
@@ -2949,7 +2955,10 @@ impl<'a> Lifter<'a> {
                 st.out.push(Stmt::Expr(call));
                 return None;
             }
-            Callee::Method { symbol: sym.clone(), sig: sig.clone(), this: Box::new(this), qualified: false }
+            // (a destructor called with flag 0 destroys a base subobject: marked as the qualified
+            // base call, see `idioms::base_destructor_calls`)
+            let base_dtor = sig::is_dtor(&sig) && !tail && lay.this == Some(3) && self.reg_written_in_block(k, gpr(4)) && self.get(st, gpr(4)).as_int() == Some(0) && !matches!(&this, Expr::Var(v) if Some(*v) == self.this_var);
+            Callee::Method { symbol: sym.clone(), sig: sig.clone(), this: Box::new(this), qualified: base_dtor }
         } else {
             Callee::Direct { symbol: sym.clone(), sig: sig.clone() }
         };
