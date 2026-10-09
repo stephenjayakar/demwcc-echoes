@@ -146,8 +146,11 @@ pub fn standin_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
         }
         return false;
     }
+    // (pure temp definitions between the stores, `t = *p; ret->x = t;`, go before the return)
+    let mut pre: Vec<Stmt> = vec![];
     for s in &body[first..] {
         match s {
+            Stmt::Assign { dst: Expr::Var(_), src } if !src.uses_var(sret) && !src.has_call() && fields.len() < 64 => pre.push(s.clone()),
             Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } if matches!(&**base, Expr::Var(v) if *v == sret) && !src.uses_var(sret) && !src.has_call() => {
                 if fields.iter().any(|f| f.0 == *offset) {
                     return false;
@@ -171,6 +174,10 @@ pub fn standin_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
         }
         at += sz as i32;
     }
+    let mut body = body;
+    body.truncate(first);
+    body.extend(pre);
+    let first = body.len();
     finish_standin(ir, body, first, fields)
 }
 

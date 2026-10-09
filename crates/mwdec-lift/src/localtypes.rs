@@ -1103,3 +1103,88 @@ pub fn pointer_returns(body: &mut Vec<Stmt>, vars: &mut [Var], ret: &mut Type) {
         }
     });
 }
+
+/// MWCC's branch-free signed compare as a value: `t = x ^ y; (u32)((t >> 1) - (t & x)) >> 31` is
+/// `x > y` (the `xor; srawi 1; and; subf; srwi 31` sequence). The xor temp goes when unused.
+pub fn signed_compare_values(body: &mut Vec<Stmt>, vars: &mut [Var]) {
+    let mut defs: HashMap<VarId, (usize, Expr)> = HashMap::new();
+    {
+        let mut snap = body.clone();
+        Stmt::for_each_block_mut(&mut snap, &mut |b| {
+            for s in b.iter() {
+                if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+                    let e = defs.entry(*v).or_insert((0, src.clone()));
+                    e.0 += 1;
+                }
+            }
+        });
+    }
+    let strip = |e: &Expr| -> Expr {
+        let mut e = e;
+        while let Expr::Cast { e: i, .. } = e {
+            e = i;
+        }
+        e.clone()
+    };
+    let resolve = |e: &Expr| -> Expr {
+        let e = strip(e);
+        if let Expr::Var(v) = &e {
+            if let Some((1, d)) = defs.get(v) {
+                if matches!(vars[*v].kind, VarKind::Local) {
+                    return strip(d);
+                }
+            }
+        }
+        e
+    };
+    let mut changed = false;
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Binary { op: BinOp::Shr, l, r, .. } = &*e else { return };
+        if r.as_int() != Some(31) {
+            return;
+        }
+        // logical: an unsigned operand
+        if !matches!(types::ty_of(l, vars), Type::Int { signed: false, .. }) {
+            return;
+        }
+        let Expr::Binary { op: BinOp::Sub, l: a, r: b, .. } = strip(l) else { return };
+        let Expr::Binary { op: BinOp::Shr, l: t1, r: one, .. } = strip(&a) else { return };
+        if one.as_int() != Some(1) || matches!(types::ty_of(&t1, vars), Type::Int { signed: false, .. }) {
+            return;
+        }
+        let Expr::Binary { op: BinOp::And, l: t2, r: z, .. } = strip(&b) else { return };
+        let (t2, z) = if resolve(&t2) == resolve(&t1) { (t2, z) } else if resolve(&z) == resolve(&t1) { (z, t2) } else { return };
+        let _ = t2;
+        let Expr::Binary { op: BinOp::Xor, l: x, r: y, .. } = resolve(&t1) else { return };
+        let zr = strip(&z);
+        let (big, small) = if strip(&x) == zr { (x, y) } else if strip(&y) == zr { (y, x) } else { return };
+        *e = Expr::cmp(BinOp::Gt, (*big).clone(), (*small).clone());
+        changed = true;
+    });
+    if !changed {
+        return;
+    }
+    // a word local holding only such a compare is a bool (returned without normalisation)
+    let mut snap = body.clone();
+    let mut only_cmp: HashMap<VarId, bool> = HashMap::new();
+    Stmt::for_each_block_mut(&mut snap, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+                let c = matches!(src, Expr::Binary { op, .. } if op.is_bool());
+                *only_cmp.entry(*v).or_insert(true) &= c;
+            }
+        }
+    });
+    for (v, c) in only_cmp {
+        if c && matches!(vars[v].kind, VarKind::Local) && matches!(strip_cv(&vars[v].ty), Type::Int { size: 4, .. } | Type::Unknown { size: 4 }) {
+            vars[v].ty = Type::Bool;
+        }
+    }
+    let vars: &[Var] = vars;
+    // xor temps no longer read
+    let mut uses = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    Stmt::for_each_block_mut(body, &mut |b| {
+        b.retain(|s| !matches!(s, Stmt::Assign { dst: Expr::Var(v), src: Expr::Binary { op: BinOp::Xor, .. } } if matches!(vars[*v].kind, VarKind::Local) && uses.get(v).copied().unwrap_or(0) == 0));
+    });
+}

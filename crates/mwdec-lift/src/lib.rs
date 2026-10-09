@@ -101,6 +101,15 @@ pub fn lift_function_with(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, o
     // the address): a draft must not depend on what was drafted before it in the process
     sig::reset_memos();
     let ir = lift_once(obj, f, db, opts, Some(false))?;
+    // argument registers read with nothing passed in them: one more register than the declared
+    // parameters is the hidden struct-return pointer (the declaration has no return type)
+    if reads_uninit_arg_reg(&ir) {
+        if let Ok(ir2) = lift_once(obj, f, db, opts, Some(true)) {
+            if !reads_uninit_arg_reg(&ir2) {
+                return Ok(ir2);
+            }
+        }
+    }
     if idioms::constructs_into_param0(&ir) {
         // the "first parameter" is really the hidden struct-return pointer
         if let Ok(ir2) = lift_once(obj, f, db, opts, Some(true)) {
@@ -113,11 +122,29 @@ pub fn lift_function_with(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, o
         return Ok(ir);
     }
     if ir.vars.iter().any(|v| v.kind == VarKind::StructRet && matches!(pointee(&v.ty), Some(mwdec_core::Type::Unknown { .. }))) {
+        // (not when that leaves the register after the parameters read with nothing in it: the
+        // guess was right, only the class is unknown)
         if let Ok(ir2) = lift_once(obj, f, db, opts, None) {
-            return Ok(ir2);
+            if !reads_uninit_arg_reg(&ir2) {
+                return Ok(ir2);
+            }
         }
     }
     Ok(ir)
+}
+
+/// Does the body read an argument register (r3..r10) nothing defined (`uninit rN`)?
+pub fn reads_uninit_arg_reg(ir: &IrFunction) -> bool {
+    let mut hit = false;
+    let mut check = |e: &ir::Expr| {
+        if let ir::Expr::Unknown { text, .. } = e {
+            if let Some(n) = text.strip_prefix("uninit r").and_then(|n| n.parse::<u8>().ok()) {
+                hit |= (3..=10).contains(&n);
+            }
+        }
+    };
+    ir::Stmt::walk_exprs(&ir.body, &mut check);
+    hit
 }
 
 /// `force_sret`: Some(true) = r3 is the struct-return pointer, Some(false) = guess, None = never.
@@ -243,6 +270,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::refine_bool_vars(&body, &mut l.vars);
     simplify::simplify_body(&mut body, &l.vars);
     simplify::fold_virtual_delete_checks(&mut body);
+    localtypes::signed_compare_values(&mut body, &mut l.vars);
     simplify::fold_return_values(&mut body, &l.vars);
     if sig::demangle(&f.name).is_some() {
         bool_return(&body, &l.vars, &mut l.ret_ty);
@@ -439,6 +467,13 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     structure::guard_not_swap(&mut ir.body);
     for w in structure::invariant_loop_conditions(&ir.body) {
         ir.warnings.push(w);
+    }
+    // a variadic function's float-register save test (`bne cr1` over the `stfd` saves of the
+    // prologue) is no statement of the source (also when no declaration says it is variadic)
+    {
+        Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+            b.retain(|s| !matches!(s, Stmt::If { cond: ir::Expr::Unknown { text, .. }, then, els } if text == "cr bit 6" && then.iter().all(|t| matches!(t, Stmt::Label(_))) && els.is_empty()));
+        });
     }
     ir.warnings.extend(fuel::since(fuel_mark));
     Ok(ir)

@@ -927,6 +927,113 @@ impl<'a> Em<'a> {
                 }
             }
         }
+        // members of those classes the function reaches through a typed pointer: their layout
+        // (a file-local struct copied, built or destroyed by a header template's instance), and
+        // the pointer's step (its size)
+        {
+            let vars = &ir.vars;
+            let class_of = |e: &Expr| -> Option<String> {
+                let mut e = e;
+                while let Expr::Cast { e: x, .. } = e {
+                    e = x;
+                }
+                let t = ty_of(e, vars);
+                pointee(&t).and_then(|p| named(strip_cv(p)).map(|n| strip_unnamed_ns(n))).filter(|n| wanted.contains(n))
+            };
+            let mut found: Vec<(String, i32, Type)> = vec![];
+            let mut steps: Vec<(String, u32)> = vec![];
+            Stmt::walk_exprs(&ir.body, &mut |e| match e {
+                Expr::Load { base, offset, ty } if matches!(ty, Type::Unknown { size: 1 | 2 | 4 }) || (!matches!(ty, Type::Unknown { .. }) && scalar_size(ty).is_some()) => {
+                    if let Some(c) = class_of(base) {
+                        let t = match ty {
+                            Type::Unknown { size } => Type::Int { size: *size as u8, signed: true },
+                            t => value_type(t),
+                        };
+                        found.push((c, *offset, t));
+                    }
+                }
+                Expr::Call { callee: Callee::Method { sig: s, this, .. }, .. } if sig::is_ctor(s) => {
+                    let Some(k) = s.this_class.as_ref() else { return };
+                    let mut x = &**this;
+                    while let Expr::Cast { e, .. } = x {
+                        x = e;
+                    }
+                    let at = match x {
+                        Expr::AddrOf(y) => match &**y {
+                            Expr::Load { base, offset, .. } => Some((&**base, *offset)),
+                            _ => None,
+                        },
+                        Expr::Binary { op: BinOp::Add, l, r, .. } => r.as_int().map(|o| {
+                            let mut b = &**l;
+                            while let Expr::Cast { e, .. } = b {
+                                b = e;
+                            }
+                            (b, o as i32)
+                        }),
+                        _ => None,
+                    };
+                    if let Some((base, off)) = at {
+                        if let Some(c) = class_of(base) {
+                            found.push((c, off, Type::Named(k.clone())));
+                        }
+                    }
+                }
+                _ => {}
+            });
+            for st in &ir.body {
+                fn steps_in(b: &[Stmt], vars: &[Var], out: &mut Vec<(VarId, i64)>) {
+                    for s in b {
+                        match s {
+                            Stmt::Assign { dst: Expr::Var(v), src } => {
+                                let mut x = src;
+                                while let Expr::Cast { e, .. } = x {
+                                    x = e;
+                                }
+                                if let Expr::Binary { op: BinOp::Add, l, r, .. } = x {
+                                    let mut l = &**l;
+                                    while let Expr::Cast { e, .. } = l {
+                                        l = e;
+                                    }
+                                    if let (Expr::Var(w), Some(k)) = (l, r.as_int()) {
+                                        if w == v {
+                                            out.push((*v, k));
+                                        }
+                                    }
+                                }
+                            }
+                            Stmt::If { then, els, .. } => {
+                                steps_in(then, vars, out);
+                                steps_in(els, vars, out);
+                            }
+                            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => steps_in(body, vars, out),
+                            Stmt::For { init, step, body, .. } => {
+                                steps_in(init, vars, out);
+                                steps_in(step, vars, out);
+                                steps_in(body, vars, out);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let mut out = vec![];
+                steps_in(std::slice::from_ref(st), vars, &mut out);
+                for (v, k) in out {
+                    if let Some(c) = class_of(&Expr::Var(v)).filter(|_| k > 0) {
+                        steps.push((c, k as u32));
+                    }
+                }
+            }
+            for (c, off, t) in found {
+                let e = self.synth.entry(c).or_default();
+                if !e.fields.iter().any(|f| f.0 == off) {
+                    e.fields.push((off, t));
+                }
+            }
+            for (c, k) in steps {
+                let e = self.synth.entry(c).or_default();
+                e.size = e.size.max(k);
+            }
+        }
         // nested names (`A::B` with `A` synthesized) live inside their parent
         let all: Vec<String> = wanted.iter().cloned().collect();
         let is_nested = |n: &str| sig::split_scope(n).0.map_or(false, |sc| all.iter().any(|a| a == sc));
@@ -1189,7 +1296,26 @@ impl<'a> Em<'a> {
         if !s.methods.iter().any(|(k, _)| k.starts_with('~')) && self.db.is_some_and(|db| db.object_dtors.contains(n) || db.object_dtors.iter().any(|d| strip_unnamed_ns(d) == n)) {
             let _ = write!(body, " ~{last}();");
         }
-        if s.size > 0 && s.base.is_none() {
+        if s.base.is_none() && !s.fields.is_empty() && s.methods.iter().all(|(k, _)| !k.starts_with('~')) {
+            // the members its uses show, padded to their offsets (and to its size)
+            let mut fields = s.fields.clone();
+            fields.sort_by_key(|f| f.0);
+            let mut at = 0i64;
+            for (off, t) in &fields {
+                let z = mwdec_lift::types::size_of(self.db, t).unwrap_or(0) as i64;
+                if (*off as i64) < at || z == 0 {
+                    continue;
+                }
+                if (*off as i64) > at {
+                    let _ = write!(body, " unsigned char __mwdec_pad{at:x}[{}];", *off as i64 - at);
+                }
+                let _ = write!(body, " {};", decl(t, &format!("m{off:x}")));
+                at = *off as i64 + z;
+            }
+            if (s.size as i64) > at {
+                let _ = write!(body, " unsigned char __mwdec_pad{at:x}[{}];", s.size as i64 - at);
+            }
+        } else if s.size > 0 && s.base.is_none() {
             let _ = write!(body, " unsigned char __mwdec_data[{}];", s.size);
         }
         let b = s.base.map(|b| format!(" : public {b}")).unwrap_or_default();
@@ -4028,6 +4154,15 @@ impl<'a> Em<'a> {
             });
             // (the count-leading-zeros intrinsic takes an `unsigned int`: a pointer is converted)
             let clz_ptr = sig.is_some_and(|s| s.qualified_name == "__cntlzw") && is_ptr(&ty_of(a, self.vars()));
+            // a float converted to a narrow integer parameter converts directly (`fctiwz`, the low
+            // bits passed as they are): `(int)` first would truncate again (`clrlwi`/`extsb`)
+            let float_to_narrow = match (&pt, a) {
+                (Some(t), Expr::Cast { ty, e }) => {
+                    let narrow = matches!(mwdec_lift::types::resolve(self.db, strip_cv(t)).as_ref(), Type::Int { size: 1 | 2, .. } | Type::Char);
+                    narrow && matches!(ty, Type::Int { size: 4, .. }) && matches!(value_type(&ty_of(e, self.vars())), Type::Float { .. })
+                }
+                _ => false,
+            };
             // a function with overloads: a scalar argument of another arithmetic type than the
             // called overload's parameter is converted explicitly (passed as is, it may convert
             // to several overloads equally well: `f(unsigned)` against `f(int)` and `f(float)`)
@@ -4035,6 +4170,10 @@ impl<'a> Em<'a> {
             let s = match pt {
                 Some(t) if other_arith => format!("({}){}", type_str(strip_cv(&t)), self.expr(a, 14)),
                 Some(_) if same_int => self.expr(a, 0),
+                Some(_) if float_to_narrow => {
+                    let Expr::Cast { e, .. } = a else { unreachable!() };
+                    self.expr(e, 0)
+                }
                 Some(t) => self.coerce(a, &t),
                 None if clz_ptr => format!("(unsigned int){}", self.expr(a, 14)),
                 None => self.expr(a, 0),
@@ -4939,6 +5078,8 @@ struct Synth {
     /// (signature key, declaration)
     methods: Vec<(String, String)>,
     size: u32,
+    /// members the function reads, writes or constructs: (offset, type)
+    fields: Vec<(i32, Type)>,
 }
 
 impl Synth {

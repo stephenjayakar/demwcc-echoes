@@ -2409,6 +2409,13 @@ pub fn loop_exit_returns_after(body: &mut Vec<Stmt>, vars: &[Var]) {
     });
 }
 
+/// Does a draft text say its meaning is wrong or incomplete: a loop whose condition never changes,
+/// or a value the lifter lost (a register read with nothing in it, `/* uninit r4 */`; a
+/// condition-register bit no compare set, `/* cr bit 6 */`)?
+pub fn draft_wrong_meaning(src: &str) -> bool {
+    src.contains(WARN_INVARIANT_LOOP) || src.contains("/* uninit r") || src.contains("/* uninit f") || src.contains("/* cr bit")
+}
+
 /// Warning text of `invariant_loop_conditions` (eval rows flag drafts carrying it).
 pub const WARN_INVARIANT_LOOP: &str = "condition never changes in the loop";
 

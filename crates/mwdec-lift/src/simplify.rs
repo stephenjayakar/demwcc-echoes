@@ -384,10 +384,35 @@ fn simp(e: &mut Expr, vars: &[Var]) {
     }
 }
 
+/// A narrow parameter extended again (`clrlwi`/`extsb`/`extsh` of the incoming register) and
+/// passed as a call argument: MWCC re-extends a narrow parameter passed on only for an explicit
+/// cast, so that cast stays (simplification would drop it as a cast to the type it has). Marked
+/// as a volatile-qualified cast while simplifying, restored after.
+fn mark_reextended_args(body: &mut Vec<Stmt>, vars: &[Var], mark: bool) {
+    Stmt::rewrite_exprs(body, &mut |e| {
+        let Expr::Call { args, .. } = e else { return };
+        for a in args.iter_mut() {
+            let Expr::Cast { ty, e: inner } = a else { continue };
+            if mark {
+                let param = matches!(&**inner, Expr::Var(v) if matches!(vars[*v].kind, VarKind::Param { .. }) && ty_of(inner, vars) == *ty);
+                if param && matches!(ty, Type::Int { size: 1 | 2, .. }) {
+                    *ty = Type::Volatile(Box::new(ty.clone()));
+                }
+            } else if let Type::Volatile(t) = ty {
+                if matches!(**t, Type::Int { size: 1 | 2, .. }) {
+                    *ty = (**t).clone();
+                }
+            }
+        }
+    });
+}
+
 pub fn simplify_body(body: &mut Vec<Stmt>, vars: &[Var]) {
+    mark_reextended_args(body, vars, true);
     for _ in 0..3 {
         Stmt::rewrite_exprs(body, &mut |e| simp(e, vars));
     }
+    mark_reextended_args(body, vars, false);
     // conditions: `x != 0` for ints stays explicit only when x isn't boolish
     Stmt::for_each_block_mut(body, &mut |blk| {
         for s in blk.iter_mut() {

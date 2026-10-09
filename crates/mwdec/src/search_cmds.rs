@@ -446,9 +446,33 @@ fn instantiation_drafts_in(ui: &UnitInputs, f: &Function) -> Vec<String> {
         return mwdec_emit::instantiate::triggers_c(&sig);
     }
     let t = mwdec_emit::instantiate::triggers(&f.name, Some(&sig.ret), &is_class);
+    let Some(db) = db else { return t };
+    // classes of the instance's template arguments the context lacks (a file-local struct the
+    // unit's source defines): the stand-ins the full draft synthesizes from their uses (members
+    // and size), before each instantiation
+    let demangled = mwdec_lift::sig::demangle(&f.name).unwrap_or_default();
+    let mut t = t;
+    if demangled.contains('<') {
+        if let Ok(full) = draft_once(ui, f, false, false, false, 0) {
+            let defs: Vec<&str> = full
+                .lines()
+                .filter(|l| {
+                    let l = l.trim_start_matches("namespace { ");
+                    let name = l.strip_prefix("struct ").map(|r| r.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or(""));
+                    name.is_some_and(|n| !n.is_empty() && demangled.contains(n) && mwdec_lift::sig::find_class(db, n).is_none_or(|k| k.is_declaration))
+                })
+                .collect();
+            if !defs.is_empty() {
+                let pre = defs.join("
+") + "
+";
+                let with: Vec<String> = t.iter().map(|x| format!("{pre}{x}")).collect();
+                t.extend(with);
+            }
+        }
+    }
     // classes the context only declares whose destructor the function calls: a definition with
     // that destructor declared (`delete p` then calls it instead of freeing directly)
-    let Some(db) = db else { return t };
     let mut stand_ins = String::new();
     let mut seen = std::collections::HashSet::new();
     for r in f.relocs.iter().filter(|r| r.target.starts_with("__dt__")) {
@@ -1062,8 +1086,8 @@ struct Row {
     draft_hash: Option<String>,
     /// The final source seeds the unit's string pool (needs the real file's other strings).
     needs_string_context: bool,
-    /// The draft carries the lifter's "loop condition never changes" warning: a wrong-meaning
-    /// structure (counted across lists).
+    /// The draft says its meaning is wrong (`mwdec_lift::structure::draft_wrong_meaning`: a loop
+    /// condition that never changes, a lost value) (counted across lists).
     wrong_meaning: bool,
     /// Exact result whose object defines data the target unit lacks (`Scorer::extra_data`).
     extra_data: Vec<String>,
@@ -1252,7 +1276,7 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                             let text: String = parts.iter().map(|(k, v)| format!("// --- {k}\n{v}\n")).collect();
                             let _ = std::fs::write(Path::new(&dir).join(format!("{}__{}.cpp", sanitize(&e.unit), sanitize(&e.symbol))), text);
                         }
-                        row.wrong_meaning = d.src.as_deref().is_some_and(|s| s.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP));
+                        row.wrong_meaning = d.src.as_deref().is_some_and(mwdec_lift::structure::draft_wrong_meaning);
                         row.seconds = t.elapsed().as_secs_f64();
                         let mut f = out_file.lock().unwrap();
                         let _ = writeln!(f, "{}", row.json());
@@ -1464,7 +1488,7 @@ fn run_one(
     row.best_profile = r.best.as_ref().map(|f| f.profile);
     row.traces = r.traces;
     row.nat_draft = Some(mwdec_emit::tidy::measure(&src).summary());
-    row.wrong_meaning = src.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP);
+    row.wrong_meaning = mwdec_lift::structure::draft_wrong_meaning(&src);
     let fin = if r.exact && std::env::var("MWDEC_EVAL_POLISH").is_ok() { polish_exact(ui, &scorer, &r.best_src) } else { r.best_src.clone() };
     row.nat_final = Some(mwdec_emit::tidy::measure(&fin).summary());
     row.needs_string_context = fin.contains(mwdec_emit::STRING_CONTEXT_MARKER);
@@ -1546,7 +1570,7 @@ fn print_table(rows: &[Row]) {
     line("all", &tot);
     let wrong: Vec<&Row> = rows.iter().filter(|r| r.wrong_meaning).collect();
     if !wrong.is_empty() {
-        println!("wrong-meaning drafts (loop condition never changes): {}", wrong.len());
+        println!("wrong-meaning drafts (loop condition never changes, or a lost value): {}", wrong.len());
         for r in wrong.iter().take(20) {
             println!("  {} {}", r.unit, r.symbol);
         }

@@ -170,6 +170,9 @@ pub struct Lifter<'a> {
     in_stack: HashMap<i32, Expr>,
     /// outgoing stack argument slots (r1 offsets), captured as values for the call
     out_stack: HashSet<i32>,
+    /// every store into an outgoing argument slot: offset -> (instruction, value), for a call in
+    /// a later block (the slots were filled before a branch)
+    out_stack_stores: HashMap<i32, Vec<(usize, Expr)>>,
     /// Pure return blocks (epilogue + `blr`) whose return-value phi is split: every predecessor
     /// returns its own value (`return this; ... return w; ... return nullptr;`)
     pub split_returns: HashSet<usize>,
@@ -324,6 +327,7 @@ impl<'a> Lifter<'a> {
             stack_params: vec![],
             in_stack: HashMap::new(),
             out_stack: HashSet::new(),
+            out_stack_stores: HashMap::new(),
             mfcr_vals: HashMap::new(),
             str_origin: HashMap::new(),
             empty_str_origin: None,
@@ -2973,6 +2977,7 @@ impl<'a> Lifter<'a> {
                     let offs = self.stack_arg_offsets(&sig, &lay);
                     let o = offs.iter().find(|x| x.0 == n).map(|x| 8 + x.1).unwrap_or(0);
                     let found = (o..o + 8).find_map(|q| st.mem.get(&q).map(|x| x.1.clone()));
+                    let found = found.or_else(|| self.dominating_out_store(o, k));
                     found.unwrap_or(Expr::Unknown { text: "stack arg".into(), ty: pt.clone() })
                 }
             };
@@ -3331,6 +3336,15 @@ impl<'a> Lifter<'a> {
     }
 
     /// Argument values at a call for the parameter locations of `lay`.
+    /// The value stored into outgoing argument slot `o` by the last store before call `k` in a
+    /// block dominating the call's (the slots set up before a branch the call follows).
+    fn dominating_out_store(&self, o: i32, k: usize) -> Option<Expr> {
+        let cb = self.cfg.block_of[k];
+        let stores = self.out_stack_stores.get(&o)?;
+        let (_, v) = stores.iter().filter(|(j, _)| *j < k && self.cfg.dominates(self.cfg.block_of[*j], cb)).max_by_key(|(j, _)| *j)?;
+        Some(v.clone())
+    }
+
     fn layout_args(&mut self, st: &mut St, lay: &Layout, sig: &FuncSig) -> Vec<Expr> {
         let mut a2 = vec![];
         let offs = self.stack_arg_offsets(sig, lay);
@@ -3852,6 +3866,9 @@ impl<'a> Lifter<'a> {
                 let src = if matches!(ins.op, Stfs | Stfd) { self.get(st, fpr(ins.field_frs())) } else { self.get(st, gpr(i.rs())) };
                 if i.ra() == 1 && i.reloc.is_none() && (self.stack.conv.contains(&i.disp()) || self.out_stack.contains(&i.disp())) {
                     let sz = scalar_size(&ty).unwrap_or(4);
+                    if self.out_stack.contains(&i.disp()) {
+                        self.out_stack_stores.entry(i.disp()).or_default().push((k, src.clone()));
+                    }
                     st.mem.insert(i.disp(), (sz, src));
                     return;
                 }
@@ -4140,6 +4157,9 @@ impl<'a> Lifter<'a> {
                         }
                     }
                     s
+                } else if matches!(ins.op, Xor | Andc) && i.rs() == i.rb() {
+                    // `xor rD, rX, rX`: zero whatever rX holds (an uninitialised register too)
+                    Expr::int(0)
                 } else {
                     match ins.op {
                         Or => arith(BinOp::Or, s, b, &self.vars),

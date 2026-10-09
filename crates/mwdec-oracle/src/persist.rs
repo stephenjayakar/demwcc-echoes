@@ -161,6 +161,9 @@ pub struct PersistentCompiler {
     pub restore_time: std::time::Duration,
     /// bytes restored per compile
     pub snapshot_bytes: usize,
+    /// How it was started (compiler, context, slot size, file name): a fresh instance replaces
+    /// one whose snapshot keeps crashing.
+    restart: Option<(Compiler, String, usize, Option<String>)>,
 }
 
 impl PersistentCompiler {
@@ -267,6 +270,7 @@ impl PersistentCompiler {
             marks: Default::default(),
             restore_time: std::time::Duration::ZERO,
             snapshot_bytes: 0,
+            restart: Some((comp.clone(), context.to_string(), capacity, file_name.map(|s| s.to_string()))),
         };
         pc.run_to_marker().context("persistent compiler: start")?;
         Ok(pc)
@@ -547,10 +551,21 @@ impl PersistentCompiler {
                 self.retries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 let r = self.compile_once(body).map_err(|e2| e2.context(format!("first attempt: {e:#}")));
-                // crashed again from the restored snapshot: the snapshot itself may be bad, so the
-                // instance ends (the cache restarts it; callers fall back to a normal compile)
+                // crashed again from the restored snapshot: the snapshot itself may be bad (a
+                // loaded machine), so the instance is replaced by a fresh one and the candidate
+                // compiled once more; if that fails too, the instance ends (callers fall back to a
+                // normal compile)
                 if r.as_ref().is_err_and(|e2| format!("{e2:#}").matches("compiler exception").count() >= 2) && !self.exited {
                     unsafe { self.terminate() };
+                    if let Some((c, ctx, cap, fname)) = self.restart.clone() {
+                        if let Ok(fresh) = Self::start_as(&c, &ctx, cap, fname.as_deref()) {
+                            let (compiles, retries) = (self.compiles, self.retries);
+                            *self = fresh;
+                            self.compiles = compiles;
+                            self.retries = retries + 1;
+                            return self.compile_once(body).map_err(|e3| e3.context("after a restart"));
+                        }
+                    }
                 }
                 r
             }
