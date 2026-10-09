@@ -717,7 +717,11 @@ pub fn refresh_access_types(body: &mut Vec<Stmt>, vars: &[Var], db: &mwdec_core:
 /// already extended, so the caller doesn't extend it again).
 pub fn undeclared_returns(body: &mut Vec<Stmt>, ret: &Type, db: Option<&mwdec_core::TypeDb>) {
     let undeclared = |sym: &str, s: &mwdec_core::FuncSig| -> bool {
-        crate::sig::ret_unknown(s) && crate::sig::demangle(sym).is_none() && !db.map_or(false, |d| d.decls.contains_key(sym) || d.functions.contains_key(sym))
+        let known = |d: &mwdec_core::TypeDb| d.decls.contains_key(sym) || d.functions.contains_key(sym) || d.decls.contains_key(&s.qualified_name);
+        // (also a C++ function called without an object that the context doesn't declare,
+        // `ns::f()` or a static member of an unknown class: its mangled name has no return type)
+        let free = crate::sig::demangle(sym).is_none() || (!crate::sig::is_ctor(s) && !crate::sig::is_dtor(s) && !s.qualified_name.contains('<'));
+        crate::sig::ret_unknown(s) && free && !db.map_or(false, known)
     };
     let narrow = |t: &Type| -> Option<Type> {
         let r = types::resolve(db, t).into_owned();

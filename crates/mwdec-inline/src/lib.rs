@@ -56,9 +56,24 @@ pub struct InlineLib {
     pub copy_ctors: defctor::CopyCtors,
 }
 
-/// Template libraries of other lifter builds untouched for two days are deleted (each build
-/// has its own directory; the compiled probe objects they derive from are kept).
+/// Template libraries of other lifter builds unused for a day are deleted (each build has its own
+/// directory; the compiled probe objects they derive from are kept).
+/// Marker file a template generation's directory gets on every use (its mtime = last use).
+const LAST_USED: &str = "last_used";
+
 fn prune_generations(root: &std::path::Path, gen: &str, keep: &std::path::Path) {
+    // once per process, in the background (deleting a generation can take minutes; a draft
+    // request must not wait for it)
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let (root, gen, keep) = (root.to_path_buf(), gen.to_string(), keep.to_path_buf());
+    ONCE.call_once(move || {
+        // (marks this generation as in use: a generation only read from is pruned by its last use)
+        let _ = std::fs::create_dir_all(&keep).and_then(|_| std::fs::write(keep.join(LAST_USED), b""));
+        let _ = std::thread::Builder::new().name("tcache-prune".into()).spawn(move || prune_old(&root, &gen, &keep));
+    });
+}
+
+fn prune_old(root: &std::path::Path, gen: &str, keep: &std::path::Path) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     let prefix = format!("{gen}_");
     for e in rd.flatten() {
@@ -67,7 +82,8 @@ fn prune_generations(root: &std::path::Path, gen: &str, keep: &std::path::Path) 
         if !name.starts_with(&prefix) || p == keep {
             continue;
         }
-        let old = std::fs::metadata(p.join("packs")).or_else(|_| e.metadata()).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d.as_secs() > 2 * 86400);
+        // unused for a day (each lifter / context change starts a generation; disk is tight)
+        let old = std::fs::metadata(p.join(LAST_USED)).or_else(|_| std::fs::metadata(p.join("packs"))).or_else(|_| e.metadata()).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d.as_secs() > 86400);
         if old {
             let _ = std::fs::remove_dir_all(&p);
         }

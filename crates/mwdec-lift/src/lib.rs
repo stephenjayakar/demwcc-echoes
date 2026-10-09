@@ -270,7 +270,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         arrays::container_members(&mut body, &l.vars, db);
         arrays::absolute_globals(&mut body, &l.vars, db);
         bitfields::recover(&mut body, &l.vars, db);
-        byval::forward(&mut body, &mut l.vars, db);
+        byval::forward(&mut body, &mut l.vars, db, &dead_stores);
         byval::copy_temporaries(&mut body, &mut dead_stores, db);
         byval::member_built_args(&mut body, &l.vars, db);
         aggregates::literal_inits(&mut body, &l.vars, db, obj);
@@ -416,6 +416,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     };
     debug::stage("late simplify", &ir.body, &ir.vars);
     frameobj::fold_single_reads(&mut ir);
+    frameobj::conditional_temporaries(&mut ir);
     frameobj::frame_object_copied_back(&mut ir, db);
     frameobj::fold_block_copies(&mut ir, db);
     frameobj::whole_object_copies(&mut ir, db);

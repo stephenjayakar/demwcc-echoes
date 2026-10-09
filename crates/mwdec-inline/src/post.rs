@@ -114,15 +114,21 @@ fn stmt_replace_arg(s: &mut Stmt, v: VarId, with: &Expr, only_folded: bool, real
     }
 }
 
-pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var], dead: &[mwdec_lift::DeadStackStore]) -> usize {
     let counts = mentions_body(body);
+    // a by-value argument copy with the same value stored, dead, just above it: the copy of a
+    // named local the source declared before the call (`T id = f(); g(id);`), not a temporary
+    let named_copy = |v: VarId| match vars[v].kind {
+        VarKind::Stack { offset, size } => dead.iter().any(|d| d.offset > offset && d.offset <= offset + 16 && d.size == size),
+        _ => false,
+    };
     let mut n = 0;
     Stmt::for_each_block_mut(body, &mut |b| {
         let mut i = 0;
         while i < b.len() {
             let (v, val, only_folded, real_call) = match &b[i] {
                 Stmt::Assign { dst: Expr::Var(v), src }
-                    if matches!(vars[*v].kind, VarKind::Stack { .. } | VarKind::Local) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && folded_value(src) && counts.get(v) == Some(&2) =>
+                    if matches!(vars[*v].kind, VarKind::Stack { .. } | VarKind::Local) && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_)) && folded_value(src) && counts.get(v) == Some(&2) && !named_copy(*v) =>
                 {
                     (*v, src.clone(), false, false)
                 }

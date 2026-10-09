@@ -577,8 +577,8 @@ impl Mwcc {
         }
         let mut fast_failed = None;
         // Test hook: a persistent compiler that wrongly reports (and trusts) a compile failure
-        // for candidates containing this text.
-        if allow_fast && std::env::var("MWDEC_TEST_TRUSTED_FAIL").is_ok_and(|t| !t.is_empty() && code.contains(t.as_str())) {
+        // for candidates containing this text (`*`: for every candidate).
+        if allow_fast && std::env::var("MWDEC_TEST_TRUSTED_FAIL").is_ok_and(|t| t == "*" || (!t.is_empty() && code.contains(t.as_str()))) {
             return Err(MwccError::Compile { status: Some(1), messages: UNCONFIRMED_FAILURE.into() });
         }
         if allow_fast {

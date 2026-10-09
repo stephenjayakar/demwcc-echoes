@@ -304,7 +304,7 @@ fn stable(x: &Expr, vars: &[Var]) -> bool {
     }
 }
 
-pub fn forward(body: &mut Vec<Stmt>, vars: &mut [Var], db: &TypeDb) {
+pub fn forward(body: &mut Vec<Stmt>, vars: &mut [Var], db: &TypeDb, dead: &[DeadStackStore]) {
     type_copy_sources(body, vars, db);
     // total mentions of every stack var
     let mut total: HashMap<VarId, usize> = HashMap::new();
@@ -407,6 +407,15 @@ pub fn forward(body: &mut Vec<Stmt>, vars: &mut [Var], db: &TypeDb) {
     let mut drop_src: Vec<VarId> = vec![];
     Stmt::for_each_block_mut(body, &mut |b| {
         for (_, _, v, l) in pairs_in(b, vars, db, &defs) {
+            // the value also stored, dead, just above the argument copy: a named local the
+            // source declared before the call (`T id = x; f(id);`: the local's slot comes first),
+            // kept as the object it is copied from
+            if let VarKind::Stack { offset, size } = vars[v].kind {
+                if dead.iter().any(|d| d.offset > offset && d.offset <= offset + 16 && d.size == size && same_place(&d.value, &l)) {
+                    drop_src.push(v);
+                    continue;
+                }
+            }
             if let Expr::Var(lv) = l {
                 if local_bad.contains(&lv) {
                     drop_src.push(v);

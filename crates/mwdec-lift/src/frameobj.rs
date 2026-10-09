@@ -1226,3 +1226,55 @@ pub fn frame_object_copied_back(ir: &mut IrFunction, db: Option<&mwdec_core::Typ
         d.order = i;
     }
 }
+
+/// `if (c) { A = f(); p = &A; } else { B = g(); p = &B; } use(p)`: each arm's by-value call
+/// result in its own frame temporary, the joined pointer read once: the conditional expression
+/// `use(&(c ? f() : g()))` (the compiler makes the arm temporaries again).
+pub fn conditional_temporaries(ir: &mut IrFunction) {
+    let mut total: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *total.entry(*v).or_default() += 1;
+        }
+    });
+    let vars = ir.vars.clone();
+    let arm = |b: &[Stmt]| -> Option<(VarId, Expr, VarId)> {
+        let [Stmt::Assign { dst: Expr::Var(a), src: call @ Expr::Call { .. } }, Stmt::Assign { dst: Expr::Var(p), src: Expr::AddrOf(x) }] = b else { return None };
+        (matches!(**x, Expr::Var(y) if y == *a) && matches!(vars[*a].kind, VarKind::Stack { .. }) && named(&vars[*a].ty).is_some() && matches!(vars[*p].kind, VarKind::Local)).then(|| (*a, call.clone(), *p))
+    };
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let Stmt::If { cond, then, els } = &b[i] else {
+                i += 1;
+                continue;
+            };
+            let (Some((a, ca, p)), Some((bv, cb, p2))) = (arm(then), arm(els)) else {
+                i += 1;
+                continue;
+            };
+            let same_ty = types_eq(&vars[a].ty, &vars[bv].ty);
+            if p != p2 || !same_ty || total.get(&p) != Some(&3) || total.get(&a) != Some(&2) || total.get(&bv) != Some(&2) {
+                i += 1;
+                continue;
+            }
+            let t = Expr::Ternary { c: Box::new(cond.clone()), t: Box::new(ca), f: Box::new(cb), ty: vars[a].ty.clone() };
+            let with = Expr::AddrOf(Box::new(t));
+            let mut n = 0;
+            Stmt::rewrite_exprs(std::slice::from_mut(&mut b[i + 1]), &mut |e| {
+                if matches!(e, Expr::Var(y) if *y == p) {
+                    *e = with.clone();
+                    n += 1;
+                }
+            });
+            if n == 1 {
+                b.remove(i);
+            }
+            i += 1;
+        }
+    });
+}
+
+fn types_eq(a: &Type, b: &Type) -> bool {
+    named(a).map(crate::sig::norm_name) == named(b).map(crate::sig::norm_name)
+}

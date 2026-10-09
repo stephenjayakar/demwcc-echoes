@@ -399,7 +399,37 @@ pub fn apply(ir: &mut IrFunction, db: Option<&TypeDb>) {
         // a value kept in a register across the destructor call is returned directly
         return_kept_values(&mut ir.body, &vars);
     }
-    let kept = forward_stack_objects(&mut ir.body, &vars, db);
+    // a frame object next to a dead frame store is a named local, not forwarded so it stays
+    // declared: passed by value with the value stored, dead, just above (`T id = x; f(id);`, the
+    // local's slot first, the argument copy below), or a method's receiver with a dead store
+    // just below (`T d = GetX(); d.F();`, the inline's returned temporary below the local)
+    let mut receivers: HashSet<VarId> = HashSet::new();
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Call { callee: Callee::Method { this, .. }, .. } = e {
+            if let Expr::AddrOf(x) = &**this {
+                if let Expr::Var(v) = **x {
+                    receivers.insert(v);
+                }
+            }
+        }
+    });
+    let fwd_vars: Vec<Var> = vars
+        .iter()
+        .enumerate()
+        .map(|(n, v)| match v.kind {
+            VarKind::Stack { offset, size } if named(&v.ty).is_some() => {
+                let above = ir.dead_stores.iter().any(|d| d.offset > offset && d.offset <= offset + 16 && d.size == size);
+                let below = ir.dead_stores.iter().any(|d| d.offset < offset && d.offset >= offset - size as i32 && d.offset + d.size as i32 <= offset);
+                if (above && !receivers.contains(&n)) || (below && receivers.contains(&n)) {
+                    Var { kind: VarKind::Local, ..v.clone() }
+                } else {
+                    v.clone()
+                }
+            }
+            _ => v.clone(),
+        })
+        .collect();
+    let kept = forward_stack_objects(&mut ir.body, &fwd_vars, db);
     for &v in &kept {
         // bound to a reference instead: its temporary is created before the objects of the
         // statement that uses it (see `forward_breaks_layout`)

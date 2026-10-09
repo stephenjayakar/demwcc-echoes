@@ -42,6 +42,9 @@ pub const REREAD_TEMPS: &str = "temps.reread";
 /// An address computed before a branch and used only in its arms spelled again at each use
 /// (by default it is a local assigned before the branch).
 pub const ARMS_ADDRESS_INLINE: &str = "temps.arms_address_inline";
+/// A call result held in a scratch register across another argument's setup folds into its use
+/// (by default it is a named local).
+pub const HELD_CALL_RESULT_INLINE: &str = "temps.held_call_result_inline";
 /// A counted loop entered under a signed `n != 0` guard counts `for (i = 0; i != n; i++)`
 /// (by default `for (i = 0; i < (unsigned)n; i++)`).
 pub const LOOP_NE_COUNT: &str = "loops.ne_count";
@@ -160,6 +163,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (LOOP_EXIT_AFTER, "a loop whose only exit returns is written with the exit code after it"),
     (LOOP_NE_COUNT, "a counted loop under a signed `n != 0` guard tests `i != n`"),
     (ARMS_ADDRESS_INLINE, "an address computed before a branch and read only in its arms is spelled at each use"),
+    (HELD_CALL_RESULT_INLINE, "a call result held in a scratch register across another argument's setup folds into its use"),
     (STRUCTCOPY_WORDS_LL, "a run of word copies between two objects becomes 64-bit copies (one per word pair)"),
     (STRUCTCOPY_WORDS_BLOCK, "a run of word copies between two objects becomes one block copy (helper struct)"),
     (STRUCTCOPY_RETURN_WHOLE, "a returned object filled from one object behind flag checks becomes `return x;`"),

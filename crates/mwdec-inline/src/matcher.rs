@@ -2428,10 +2428,10 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     // members built explicitly, now that their values are folded calls
     total += crate::defctor::finish(ir, db, &pending);
     if total > 0 {
-        crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
+        crate::post::forward_stack_temps(&mut ir.body, &ir.vars, &ir.dead_stores);
         crate::post::name_shared_objects(&mut ir.body, &mut ir.vars);
         dce(&mut ir.body, &ir.vars);
-        crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
+        crate::post::forward_stack_temps(&mut ir.body, &ir.vars, &ir.dead_stores);
         crate::post::forward_cond_temps(&mut ir.body, &ir.vars);
         crate::post::return_values(&mut ir.body, &ir.vars);
         crate::post::forward_temps_into_folded(&mut ir.body, &ir.vars);

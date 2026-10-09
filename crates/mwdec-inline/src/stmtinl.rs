@@ -524,7 +524,7 @@ fn stream_ctors(body: &mut Vec<Stmt>, lib: &InlineLib, db: &TypeDb, apply: bool)
 pub fn finish(ir: &mut IrFunction) {
     // (by-value results of real calls read once: also when nothing else folded, so the post
     // passes didn't run)
-    crate::post::forward_stack_temps(&mut ir.body, &ir.vars);
+    crate::post::forward_stack_temps(&mut ir.body, &ir.vars, &ir.dead_stores);
     let on = CONTAINER_LOCALS.with(|c| c.get());
     let mut new_vars: Vec<Var> = vec![];
     let base = ir.vars.len();

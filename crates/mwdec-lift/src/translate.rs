@@ -477,6 +477,31 @@ impl<'a> Lifter<'a> {
         false
     }
 
+    /// `mr rB, rX` at `k` whose source was set in this block by `mr rX, r3` right after a call
+    /// (r3 its result), with r3 written again in between and rX a scratch register other
+    /// than rB: the call result held across another argument's setup.
+    fn call_result_held(&self, k: usize) -> bool {
+        let i = &self.insns[k];
+        let (rb, rx) = (i.ra(), i.rs());
+        if rx == rb || rx == 3 || !(rx == 0 || (4..=12).contains(&rx)) || !(3..=10).contains(&rb) {
+            return false;
+        }
+        let start = self.cfg.blocks[self.cfg.block_of[k]].start;
+        // the copy into rX
+        let Some(j) = (start..k).rev().find(|&j| defs_uses(&self.insns[j]).0.contains(&gpr(rx))) else { return false };
+        let c = &self.insns[j];
+        if !(c.op() == Opcode::Or && c.rs() == c.rb() && c.rs() == 3 && c.ra() == rx) {
+            return false;
+        }
+        // r3 from a call just before it, and refilled after it
+        let is_call = |q: usize| self.insns[q].is_call() || self.insns[q].is_bctrl();
+        let call = (start..j).rev().find(|&q| is_call(q) || defs_uses(&self.insns[q]).0.contains(&gpr(3)));
+        if !call.is_some_and(is_call) {
+            return false;
+        }
+        (j + 1..k).any(|q| defs_uses(&self.insns[q]).0.contains(&gpr(3)) && !is_call(q))
+    }
+
     /// Without a TypeDb we can't tell static members from methods; guess static when the last
     /// GPR parameter register under the "member" layout is never read before being written.
     fn guess_static(&self) -> bool {
@@ -4133,6 +4158,16 @@ impl<'a> Lifter<'a> {
                         }
                     }
                 };
+                // a call result copied into a scratch register, the result register refilled
+                // for another argument, then copied on into an argument register: the source held
+                // it in a named local (`T* d = f(); return R(d);`), a temp goes there directly
+                if ins.op == Or && i.rs() == i.rb() && self.call_result_held(k) {
+                    if let Some(Expr::Var(t)) = &st.regs[gpr(i.rs()) as usize] {
+                        if self.is_temp.get(*t).copied().unwrap_or(false) && !crate::variants::alt(crate::variants::HELD_CALL_RESULT_INLINE) {
+                            self.is_temp[*t] = false;
+                        }
+                    }
+                }
                 self.def(st, k, gpr(i.ra()), v);
                 if i.rc() {
                     self.record(st, k, gpr(i.ra()));
