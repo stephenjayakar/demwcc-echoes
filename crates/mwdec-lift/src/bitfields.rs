@@ -996,3 +996,66 @@ fn stored_chains(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bo
     is_temp.resize(base_id + new_vars.len(), false);
     vars.extend(new_vars);
 }
+
+/// The values of a run of register-field inserts computed into named locals before the run
+/// (`bm = tp + ht - 1; ... r = __rlwimi(r, bm, ...)`): the SDK's GX macros insert locals the
+/// function computed first (draft variant [`crate::variants::INSERT_VALUES_FIRST`]).
+pub fn insert_values_first(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool>) -> bool {
+    fn insert_value(s: &Stmt) -> Option<&Expr> {
+        let Stmt::Assign { src: Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }, .. } = s else { return None };
+        (symbol == "__rlwimi" && args.len() == 5).then(|| &args[1])
+    }
+    let mut changed = false;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            if insert_value(&b[i]).is_none() {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < b.len() && insert_value(&b[j]).is_some() {
+                j += 1;
+            }
+            // values worth a name: arithmetic of locals and parameters (no memory, no calls)
+            let mut inits = vec![];
+            for k in i..j {
+                let v = insert_value(&b[k]).unwrap().clone();
+                let mut plain = true;
+                v.walk(&mut |e| plain &= !matches!(e, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. } | Expr::Call { .. } | Expr::BitField { .. }));
+                if !plain || !matches!(v, Expr::Binary { .. }) {
+                    continue;
+                }
+                let n = vars.len();
+                vars.push(Var { name: format!("ins_{}", inits.len()), ty: Type::Int { size: 4, signed: false }, kind: VarKind::Local });
+                is_temp.push(false);
+                if let Stmt::Assign { src: Expr::Call { args, .. }, .. } = &mut b[k] {
+                    args[1] = Expr::Var(n);
+                }
+                // (`a + (b - k)` is the compiler's reading of `a + b - k`)
+                let v = match &v {
+                    Expr::Binary { op: BinOp::Add, l: a, r: bk, ty } => match &**bk {
+                        Expr::Binary { op: BinOp::Sub, l: bb, r: k, .. } if k.as_int().is_some() => Expr::Binary {
+                            op: BinOp::Sub,
+                            l: Box::new(Expr::Binary { op: BinOp::Add, l: a.clone(), r: bb.clone(), ty: ty.clone() }),
+                            r: k.clone(),
+                            ty: ty.clone(),
+                        },
+                        _ => v.clone(),
+                    },
+                    _ => v.clone(),
+                };
+                inits.push(Stmt::Assign { dst: Expr::Var(n), src: v });
+            }
+            if inits.is_empty() {
+                i = j;
+                continue;
+            }
+            changed = true;
+            let len = inits.len();
+            b.splice(i..i, inits);
+            i = j + len;
+        }
+    });
+    changed
+}

@@ -244,6 +244,15 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     // can keep a temp at two uses in the first round
     fpcopy::keep_copy_runs_named(&lists, &l.vars, &mut l.is_temp);
     accum::name_accumulators(&mut lists, &l.vars, &mut l.is_temp);
+    // variant: a single in-place update of a callee-saved register (`s = x << 16; s |= y << 8;`)
+    {
+        let mut probe = lists.clone();
+        let mut ptemp = l.is_temp.clone();
+        if accum::name_accumulators_with(&mut probe, &l.vars, &mut ptemp, 2, true) && variants::alt(variants::ACCUM_SINGLE_UPDATE) {
+            lists = probe;
+            l.is_temp = ptemp;
+        }
+    }
     for round in 0..2 {
         if opts.inline_temps {
             let mut uses = count_all(&lists);
@@ -410,6 +419,15 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::fold_ternary_constants(&mut body);
     simplify::inline_ternary_results(&mut body);
     bitfields::insert_chains(&mut body, &mut l.vars, &mut l.is_temp, l.param_home_slots);
+    {
+        let mut probe = body.clone();
+        let (mut pvars, mut ptemp) = (l.vars.clone(), l.is_temp.clone());
+        if bitfields::insert_values_first(&mut probe, &mut pvars, &mut ptemp) && variants::alt(variants::INSERT_VALUES_FIRST) {
+            body = probe;
+            l.vars = pvars;
+            l.is_temp = ptemp;
+        }
+    }
     namedindex::name_scaled_index(&mut body, &mut l.vars, &mut l.is_temp);
     selects::typed_select_args(&mut body);
     arglocals::args_to_locals(&mut body, &mut l.vars, &mut l.is_temp, db);

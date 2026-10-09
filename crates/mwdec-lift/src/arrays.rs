@@ -581,7 +581,9 @@ fn forward_address_temps(body: &mut Vec<Stmt>, vars: &[Var], db: Option<&TypeDb>
                 };
                 let mut m = false;
                 src.walk(&mut |e| {
-                    m |= matches!(e, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. } | Expr::BitField { .. } | Expr::New { .. } | Expr::IncDec { .. })
+                    // (the forwarded location itself, read again: one of its uses)
+                    let own = matches!(e, Expr::Load { base, .. } if matches!(**base, Expr::Var(v) if v == t));
+                    m |= (!own && matches!(e, Expr::Load { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Global { .. } | Expr::BitField { .. } | Expr::New { .. } | Expr::IncDec { .. }))
                         || (matches!(e, Expr::Call { .. }) && !e.is_pure_call());
                 });
                 m

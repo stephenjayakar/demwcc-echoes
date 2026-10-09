@@ -167,6 +167,13 @@ pub const UPDATE_AFTER_COPY: &str = "vars.update_after_copy";
 /// (`__GXFifoObj* realFifo = (__GXFifoObj*)fifo;`).
 pub const SDK_PARAM_VIEW: &str = "sdk.param_view";
 
+/// A single in-place update of a callee-saved register is a variable updated in place
+/// (`s = x << 16; s |= y << 8;`, `s = x >> 24 & 0xf0; s = g & ~s;`).
+pub const ACCUM_SINGLE_UPDATE: &str = "vars.accum_single_update";
+
+/// The values of a run of register-field inserts are named locals computed before the run.
+pub const INSERT_VALUES_FIRST: &str = "bitfield.insert_values_first";
+
 /// Registered decision points: (name, what the alternative does).
 pub const POINTS: &[(&str, &str)] = &[
     (EXPLICIT_DEFAULT_ARGS, "trailing arguments equal to their declared defaults are passed explicitly"),
@@ -200,6 +207,8 @@ pub const POINTS: &[(&str, &str)] = &[
     (HW_CONST_POINTER, "hardware registers at folded addresses are read through a constant pointer, not an array at the address"),
     (UPDATE_AFTER_COPY, "a register updated in place after a copy of its old value: one variable updated, the copy in another"),
     (SDK_PARAM_VIEW, "accesses through a pointer parameter go through a named local copy of it"),
+    (ACCUM_SINGLE_UPDATE, "a value updated once in its callee-saved register is one variable updated in place"),
+    (INSERT_VALUES_FIRST, "values inserted by a run of register-field inserts are named locals computed before it"),
     (PARAM_CONST_POINTERS, "parameters only loaded through are declared pointer-to-const (their loads ignore stores)"),
     (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),

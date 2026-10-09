@@ -733,6 +733,37 @@ pub fn form_incdec_with(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool], db
                     }
                 }
             }
+            // post-increment of a memory lvalue whose old value the next statement tests:
+            // `t = g; g = t + 1; if (t == 0)` -> `if (g++ == 0)`
+            if let (Stmt::Assign { dst: Expr::Var(t), src: lv }, Stmt::Assign { dst: l2, src: step }) = (&b[i], &b[i + 1]) {
+                let t = *t;
+                let strip = |e: &Expr| -> Expr {
+                    let mut e = e;
+                    while let Expr::Cast { e: x, .. } = e {
+                        e = x;
+                    }
+                    e.clone()
+                };
+                let mem = matches!(lv, Expr::Global { .. } | Expr::Load { .. } | Expr::Member { .. }) && !lv.has_call();
+                let d = match step {
+                    Expr::Binary { op: op @ (BinOp::Add | BinOp::Sub), l, r, .. } if strip(l) == Expr::Var(t) && r.as_int() == Some(1) => Some(if *op == BinOp::Add { 1 } else { -1 }),
+                    Expr::Cast { e: inner, .. } => match &**inner {
+                        Expr::Binary { op: op @ (BinOp::Add | BinOp::Sub), l, r, .. } if strip(l) == Expr::Var(t) && r.as_int() == Some(1) => Some(if *op == BinOp::Add { 1 } else { -1 }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(d) = d.filter(|_| mem && temp(t) && l2 == lv && uses.get(&t) == Some(&2)) {
+                    if mentions_var(&b[i + 2], t) == 1 && reads_unconditionally(&b[i + 2], t) {
+                        let inc = Expr::IncDec { e: Box::new(lv.clone()), delta: d, post: true };
+                        let mut s = b[i + 2].clone();
+                        subst_var(&mut s, t, &inc);
+                        b[i + 2] = s;
+                        b.drain(i..i + 2);
+                        continue;
+                    }
+                }
+            }
             // pre-increment of an lvalue whose new value is reused
             if let (Stmt::Assign { dst: Expr::Var(t), src: e }, Stmt::Assign { dst: l, src: Expr::Var(t2) }) = (&b[i], &b[i + 1]) {
                 let t = *t;

@@ -11,7 +11,9 @@
 //!    lines the compiler rejects are dropped and the compile retried;
 //! 4. parse `.debug` (`dwarf`) -> classes/enums/... (`convert`), typedef targets and variable
 //!    types from the forcing globals, `bool` fields restored, declarations resolved (`resolve`);
-//! 5. cache the TypeDb as JSON under `work_dir/ctxcache/<hash>.json`.
+//! 5. cache the TypeDb as gzip'd JSON under `work_dir/ctxcache/<generation>/<hash>.json.gz`
+//!    (generation: a hash of the TypeDb-building sources; the key also covers the headers'
+//!    fingerprint, `mwdec_core::paths::header_fingerprint`).
 pub mod convert;
 pub mod dwarf;
 pub mod layout;
@@ -31,6 +33,40 @@ use std::path::{Path, PathBuf};
 
 /// Bump when the TypeDb produced for the same inputs changes (invalidates caches).
 const CACHE_VERSION: &str = "mwdec-ctx-25-declspec-variables";
+
+/// Hash of the sources that build a TypeDb (build.rs): the cache generation. Concurrent
+/// builds share one work directory; a build with other context code reads and writes its own generation.
+pub const CTX_INPUTS_HASH: &str = env!("MWDEC_CTX_INPUTS_HASH");
+
+/// Marker a generation directory gets on every use (its mtime = last use).
+const LAST_USED: &str = "last_used";
+
+/// The cache directory of this build's generation (`<work>/ctxcache/<inputs hash>`); other
+/// generations unused for a day are deleted (once per process, in the background), as are
+/// entries of the old flat layout.
+fn cache_generation(work_dir: &Path) -> PathBuf {
+    let root = work_dir.join("ctxcache");
+    let dir = root.join(&CTX_INPUTS_HASH[..12]);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let (r, keep) = (root.clone(), dir.clone());
+    ONCE.call_once(move || {
+        let _ = std::fs::create_dir_all(&keep).and_then(|_| std::fs::write(keep.join(LAST_USED), b""));
+        let _ = std::thread::Builder::new().name("ctxcache-prune".into()).spawn(move || {
+            let Ok(rd) = std::fs::read_dir(&r) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p == keep {
+                    continue;
+                }
+                let t = std::fs::metadata(p.join(LAST_USED)).or_else(|_| e.metadata()).and_then(|m| m.modified()).ok();
+                if t.and_then(|t| t.elapsed().ok()).is_some_and(|d| d.as_secs() > 86400) {
+                    let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                }
+            }
+        });
+    });
+    dir
+}
 
 /// Parse the DWARF of an already-compiled MWCC object into a TypeDb (no header scan).
 pub fn typedb_from_object_bytes(elf: &[u8]) -> Result<TypeDb> {
@@ -54,10 +90,18 @@ fn fnv1a64(parts: &[&[u8]]) -> u64 {
 /// Cache key of a context build.
 pub fn context_hash(context_tu: &str, cflags: &[String], root: &Path) -> String {
     let flags = cflags.join("\u{1}");
+    let headers = mwdec_core::paths::header_fingerprint(root);
     let root = root.to_string_lossy();
     format!(
         "{:016x}",
-        fnv1a64(&[CACHE_VERSION.as_bytes(), context_tu.as_bytes(), flags.as_bytes(), root.as_bytes()])
+        fnv1a64(&[
+            CACHE_VERSION.as_bytes(),
+            CTX_INPUTS_HASH.as_bytes(),
+            &headers.to_le_bytes(),
+            context_tu.as_bytes(),
+            flags.as_bytes(),
+            root.as_bytes()
+        ])
     )
 }
 
@@ -85,7 +129,7 @@ pub fn build_typedb(context_tu: &str, cflags: &[String], work_dir: &Path) -> Res
 pub fn build_typedb_in(root: &Path, context_tu: &str, cflags: &[String], work_dir: &Path) -> Result<(TypeDb, BuildStats)> {
     let t0 = std::time::Instant::now();
     let key = context_hash(context_tu, cflags, root);
-    let cache_dir = work_dir.join("ctxcache");
+    let cache_dir = cache_generation(work_dir);
     let cache_file = cache_dir.join(format!("{key}.json.gz"));
     if let Some(mut db) = load_cache(&cache_file) {
         {
@@ -727,3 +771,4 @@ fn template_decl(m: &mangle::MangledFn, db: &TypeDb) -> Option<Vec<DeclInfo>> {
 pub fn default_work_dir() -> PathBuf {
     mwdec_core::paths::work_dir("mwdec-ctx")
 }
+

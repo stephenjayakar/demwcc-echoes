@@ -1379,6 +1379,8 @@ impl<'a> Em<'a> {
                     None => Type::Array(Box::new(Type::Int { size: 1, signed: false }), max.max(1)),
                 }
             };
+            // (a global the lifter saw read as volatile, re-extended after its load)
+            let t = if !matches!(t, Type::Volatile(_)) && self.ir.globals.iter().any(|g| g.symbol == sym && matches!(g.ty, Type::Volatile(_))) { Type::Volatile(Box::new(t)) } else { t };
             self.gtypes.insert(sym, t);
         }
         self.collect_global_structs();
@@ -1617,6 +1619,107 @@ impl<'a> Em<'a> {
             return None;
         }
         Some((&**this, args.as_slice(), sg))
+    }
+
+    /// `if (p) { p->A(q->a); p->b = q->b; ... }`: member-wise copies of one object into the
+    /// tested pointer, member offsets running contiguously from 0 and at least one by a copy
+    /// constructor: the expansion of `new (p) T(*q)` for a struct `T` of those members (its
+    /// implicit copy constructor). Returns the two pointers and the members (offset, type).
+    fn placement_copy<'s>(&self, cond: &'s Expr, then: &'s [Stmt]) -> Option<(&'s Expr, &'s Expr, Vec<(i64, Type)>)> {
+        if then.len() < 2 || std::env::var_os("MWDEC_NO_PLACEMENT_COPIES").is_some() {
+            return None;
+        }
+        fn strip(mut e: &Expr) -> &Expr {
+            while let Expr::Cast { e: x, .. } = e {
+                e = x;
+            }
+            e
+        }
+        // a pointer value as (base, byte offset)
+        fn addr(e: &Expr) -> (&Expr, i64) {
+            match strip(e) {
+                Expr::Binary { op: BinOp::Add, l, r, .. } if r.as_int().is_some() => {
+                    let (b, k) = addr(l);
+                    (b, k + r.as_int().unwrap())
+                }
+                x => (x, 0),
+            }
+        }
+        // an lvalue `*(T*)(base + k)` as (base, byte offset)
+        fn place(e: &Expr) -> Option<(&Expr, i64)> {
+            match strip(e) {
+                Expr::Load { base, offset, .. } => {
+                    let (b, k) = addr(base);
+                    Some((b, k + *offset as i64))
+                }
+                _ => None,
+            }
+        }
+        let tested = match cond {
+            Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) => &**l,
+            e => e,
+        };
+        let p = strip(tested);
+        if !matches!(p, Expr::Var(_)) {
+            return None;
+        }
+        let mut q: Option<&Expr> = None;
+        let mut members: Vec<(i64, Type)> = vec![];
+        let mut next = 0i64;
+        let mut ctors = 0;
+        for s in then {
+            let (d, dk, sb, sk, ty) = match s {
+                Stmt::Expr(Expr::Call { callee: Callee::Method { sig: sg, this, .. }, args, .. }) => {
+                    let cls = sg.this_class.as_deref()?;
+                    if !sig::is_ctor(sg) || args.len() != 1 || sg.params.len() != 1 {
+                        return None;
+                    }
+                    let own = |t: &Type| matches!(strip_cv(&mwdec_lift::types::resolve(self.db, strip_cv(t))), Type::Named(n) if sig::norm_name(n) == sig::norm_name(cls) || sig::norm_name(n) == sig::norm_name(&strip_unnamed_ns(cls)));
+                    if !matches!(&sg.params[0].ty, Type::Ref(t) if own(t)) {
+                        return None;
+                    }
+                    let (d, dk) = addr(this);
+                    let (sb, sk) = place(&args[0]).unwrap_or_else(|| addr(&args[0]));
+                    ctors += 1;
+                    (d, dk, sb, sk, Type::Named(cls.to_string()))
+                }
+                Stmt::Assign { dst, src } => {
+                    let (d, dk) = place(dst)?;
+                    let (sb, sk) = place(src)?;
+                    let ty = match strip(dst) {
+                        Expr::Load { ty, .. } => ty.clone(),
+                        _ => return None,
+                    };
+                    if !matches!(strip(src), Expr::Load { ty: t, .. } if t == &ty) || !matches!(strip_cv(&ty), Type::Int { .. } | Type::Float { .. } | Type::Ptr(_) | Type::Bool | Type::Char | Type::Long { .. } | Type::Unknown { size: 1 | 2 | 4 | 8 }) {
+                        return None;
+                    }
+                    // an untyped word is a plain integer member
+                    let ty = match strip_cv(&ty) {
+                        Type::Unknown { size } => Type::Int { size: *size as u8, signed: true },
+                        _ => ty,
+                    };
+                    (d, dk, sb, sk, ty)
+                }
+                _ => return None,
+            };
+            let size = mwdec_lift::types::size_of(self.db, &ty)? as i64;
+            if d != p || dk != next || sk != dk || strip(sb) == p || !matches!(strip(sb), Expr::Var(_)) || q.is_some_and(|q| q != sb) {
+                return None;
+            }
+            if !matches!(ty, Type::Named(_)) && dk % size.min(4) != 0 {
+                return None;
+            }
+            q = Some(sb);
+            // a two-word copy the lifter paired up: two word members
+            if matches!(strip_cv(&ty), Type::Int { size: 8, .. }) {
+                members.push((dk, Type::Int { size: 4, signed: true }));
+                members.push((dk + 4, Type::Int { size: 4, signed: true }));
+            } else {
+                members.push((dk, ty));
+            }
+            next = dk + size;
+        }
+        (ctors > 0).then(|| (p, q.unwrap(), members))
     }
 
     fn stmt(&mut self, s: &Stmt, depth: usize) {
@@ -1925,6 +2028,24 @@ impl<'a> Em<'a> {
                 let p = self.expr(this, 0);
                 let a = self.args(args, Some(sg));
                 let _ = writeln!(self.out, "{ind}new ({p}) {cls}({a});");
+            }
+            Stmt::If { cond, then, els } if !self.opts.c_mode && els.is_empty() && self.placement_copy(cond, then).is_some() => {
+                let (p, q, members) = self.placement_copy(cond, then).unwrap();
+                let fields: Vec<String> = members.iter().map(|(k, t)| format!("{};", decl(t, &format!("m{k:x}")))).collect();
+                let body = fields.join(" ");
+                let n = self.type_defs.iter().filter(|d| d.starts_with("struct __mwdec_copy")).count();
+                let name = self
+                    .type_defs
+                    .iter()
+                    .find_map(|d| d.strip_prefix("struct ").and_then(|r| r.split_once(" { ")).filter(|(nm, rest)| nm.starts_with("__mwdec_copy") && rest.strip_suffix(" };") == Some(&body)).map(|(nm, _)| nm.to_string()))
+                    .unwrap_or_else(|| {
+                        let nm = format!("__mwdec_copy{n}");
+                        self.type_defs.push(format!("struct {nm} {{ {body} }};"));
+                        nm
+                    });
+                let pe = self.expr(p, 0);
+                let qe = self.expr(q, 0);
+                let _ = writeln!(self.out, "{ind}new ((void*){pe}) {name}(*(const {name}*){qe});");
             }
             Stmt::If { cond, then, els } => {
                 let c = self.cond(cond);

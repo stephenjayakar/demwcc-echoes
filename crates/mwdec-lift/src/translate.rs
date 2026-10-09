@@ -925,6 +925,10 @@ impl<'a> Lifter<'a> {
             }
             bb = up;
             let blk = &self.cfg.blocks[bb];
+            // (reads of the value in its own block after the definition, `addi r4, r4, f@l;
+            // cmplw r3, r4; bne`: computed into the argument register for the call and tested
+            // before it; nothing else in the function touches the register)
+            let mut read_here = 0;
             for j in (blk.start..blk.end).rev() {
                 let i = &self.insns[j];
                 if i.is_call() || i.is_bctrl() {
@@ -934,16 +938,29 @@ impl<'a> Lifter<'a> {
                     continue;
                 }
                 let (d, u) = defs_uses(i);
-                if u.contains(&reg) {
-                    return false;
+                // (a value built in place, `lis r4, f@ha; addi r4, r4, f@l`: one more touch)
+                if d.contains(&reg) && u.contains(&reg) && read_here > 0 && self.param_home_slots && i.op() == Opcode::Addi {
+                    read_here += 1;
+                    continue;
                 }
-                if d.contains(&reg) {
+                if d.contains(&reg) && (!u.contains(&reg) || read_here == 0) {
                     let touches = (0..self.insns.len()).filter(|&q| !self.frame.skip.contains(&q) && !self.insns[q].is_call() && !self.insns[q].is_bctrl() && {
                         let (d2, u2) = defs_uses(&self.insns[q]);
                         d2.contains(&reg) || u2.contains(&reg)
                     }).count();
-                    return touches == 1;
+                    return touches == 1 + read_here && (read_here == 0 || self.param_home_slots);
                 }
+                if u.contains(&reg) {
+                    // (only tested: a compare reads it; a partial address or an operand of
+                    // other code is no argument value)
+                    if !self.param_home_slots || !matches!(i.op(), Opcode::Cmp | Opcode::Cmpl | Opcode::Cmpi | Opcode::Cmpli) {
+                        return false;
+                    }
+                    read_here += 1;
+                }
+            }
+            if read_here > 0 {
+                return false;
             }
             if bb == 0 {
                 return false;
@@ -1736,6 +1753,14 @@ impl<'a> Lifter<'a> {
                 if sz > 0 && o + (sz as i32) < end {
                     end = o + sz as i32;
                 }
+            } else if n + 1 < addr.len() {
+                // an object of a class the context lacks (no size): a byte or halfword at its
+                // start and nothing else up to the next word is an empty / one-member object
+                // (a functor passed by value); the slots after it are objects of their own
+                let at_o = acc.get(&o).map(|a| a.sizes.iter().map(|x| x.0 as i32).max().unwrap_or(0)).unwrap_or(0);
+                if (1..=2).contains(&at_o) && acc.range(o + 1..(o + 4).min(end)).next().is_none() && acc.range(o + 4..end).next().is_some() {
+                    end = o + 4;
+                }
             }
             let size = (end - o) as u32;
             // an object of a known class whose interior addresses are passed: declared as that
@@ -2012,6 +2037,27 @@ impl<'a> Lifter<'a> {
     }
 
     // ------------------------------------------------------------ globals / literals
+
+    /// `e` (a register's value) is an unsigned global of `size` bytes read directly: declare it
+    /// volatile.
+    fn volatile_if_reextended(&mut self, e: &Expr, size: u8) {
+        let e = match e {
+            Expr::Var(t) => match self.temp_def.get(t) {
+                Some(d) => d.clone(),
+                None => return,
+            },
+            e => e.clone(),
+        };
+        if let Expr::Global { symbol, ty } = &e {
+            if matches!(ty, Type::Int { size: s, signed: false } if *s == size) {
+                if let Some(g) = self.globals.get_mut(symbol) {
+                    if !matches!(g.ty, Type::Volatile(_)) {
+                        g.ty = Type::Volatile(Box::new(g.ty.clone()));
+                    }
+                }
+            }
+        }
+    }
 
     fn note_global(&mut self, sym: &str, ty: &Type, is_fn: bool) {
         if self.globals.contains_key(sym) {
@@ -4353,6 +4399,11 @@ impl<'a> Lifter<'a> {
                 if i.ra() == i.rs() && ins.field_sh() == 0 && ins.field_me() == 31 && (ins.field_mb() == 24 || ins.field_mb() == 16) {
                     let t = t_int(if ins.field_mb() == 24 { 1 } else { 2 }, false);
                     self.note_reextension(&s, &t);
+                }
+                // a just-loaded unsigned global masked to its own width again (`lhz r3, g; clrlwi.
+                // r0, r3, 16`): the compiler re-extends only a volatile read
+                if ins.field_sh() == 0 && ins.field_me() == 31 && matches!(ins.field_mb(), 16 | 24) {
+                    self.volatile_if_reextended(&s, if ins.field_mb() == 16 { 2 } else { 1 });
                 }
                 let v = self.rlwinm(s, ins.field_sh(), ins.field_mb(), ins.field_me());
                 if self.cfg.blocks[self.cfg.block_of[k]].term.is_switch() && ins.field_sh() == 2 && ins.field_me() == 29 {
