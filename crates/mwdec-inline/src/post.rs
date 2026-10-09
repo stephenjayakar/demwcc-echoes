@@ -184,6 +184,95 @@ pub fn forward_stack_temps(body: &mut Vec<Stmt>, vars: &[Var], dead: &[mwdec_lif
     n
 }
 
+/// A stack object holding a real call's by-value result, copied whole once by the next statement
+/// (`T t = a + b; *this = t;`): the assignment of the call's result (`*this = a + b;`).
+pub fn forward_call_into_copy(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
+    if std::env::var_os("MWDI_NO_CALL_COPIES").is_some() {
+        return 0;
+    }
+    let counts = mentions_body(body);
+    let mut n = 0;
+    Stmt::for_each_block_mut(body, &mut |b| {
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let fwd = match (&b[i], &b[i + 1]) {
+                (
+                    Stmt::Assign { dst: Expr::Var(v), src: call @ Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, .. } },
+                    Stmt::Assign { dst, src: Expr::Var(w) },
+                ) if v == w
+                    && sig.mangled.is_some()
+                    && matches!(vars[*v].kind, VarKind::Stack { .. })
+                    && matches!(crate::util::strip(&vars[*v].ty), Type::Named(_))
+                    && counts.get(v) == Some(&2)
+                    && !matches!(dst, Expr::Var(_))
+                    && !dst.uses_var(*v)
+                    && crate::util::strip(&mwdec_lift::types::ty_of(dst, vars)) == crate::util::strip(&vars[*v].ty) =>
+                {
+                    Some(Stmt::Assign { dst: dst.clone(), src: call.clone() })
+                }
+                _ => None,
+            };
+            match fwd {
+                Some(s) => {
+                    b[i] = s;
+                    b.remove(i + 1);
+                    n += 1;
+                }
+                None => i += 1,
+            }
+        }
+    });
+    n
+}
+
+/// Locals assigned only from folded inline calls returning `bool` take that type (`b =
+/// IsAllocated()` stays a `bool`: as an `unsigned int` a later `bool` parameter normalises it).
+pub fn retype_bool_call_locals(body: &[Stmt], vars: &mut [Var]) -> usize {
+    if std::env::var_os("MWDI_NO_BOOL_LOCALS").is_some() {
+        return 0;
+    }
+    let mut defs: HashMap<VarId, (usize, usize)> = HashMap::new();
+    fn walk(b: &[Stmt], defs: &mut HashMap<VarId, (usize, usize)>) {
+        for s in b {
+            match s {
+                Stmt::Assign { dst: Expr::Var(v), src } => {
+                    let e = defs.entry(*v).or_default();
+                    e.0 += 1;
+                    let folded_bool = matches!(src, Expr::Call { callee: Callee::Direct { sig, .. } | Callee::Method { sig, .. }, ret, .. } if sig.mangled.is_none() && matches!(crate::util::strip(ret), Type::Bool) && matches!(crate::util::strip(&sig.ret), Type::Bool));
+                    if folded_bool {
+                        e.1 += 1;
+                    }
+                }
+                Stmt::If { then, els, .. } => {
+                    walk(then, defs);
+                    walk(els, defs);
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => walk(body, defs),
+                Stmt::For { init, step, body, .. } => {
+                    walk(init, defs);
+                    walk(step, defs);
+                    walk(body, defs);
+                }
+                Stmt::Switch { cases, .. } => {
+                    for c in cases {
+                        walk(&c.body, defs);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut defs);
+    let mut n = 0;
+    for (v, (all, folded)) in defs {
+        if all > 0 && all == folded && matches!(vars[v].kind, VarKind::Local) && matches!(crate::util::strip(&vars[v].ty), Type::Int { .. } | Type::Unknown { .. }) {
+            vars[v].ty = Type::Bool;
+            n += 1;
+        }
+    }
+    n
+}
+
 fn collect_folded<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     e.walk(&mut |x| {
         // (a non-const method has effects: two `in.Read()` are two reads, whatever the

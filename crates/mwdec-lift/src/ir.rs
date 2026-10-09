@@ -286,6 +286,9 @@ pub struct IrFunction {
     /// Bases whose constructor/destructor the function ran on `this` implicitly (calls the
     /// compiler makes itself, dropped from the body): the class derives from them.
     pub implicit_bases: Vec<String>,
+    /// Classes of the unit's own source the function constructs (a temporary passed by
+    /// reference, named by the vtable its inline constructor stores), with their base.
+    pub local_class_bases: Vec<(String, String)>,
     pub globals: Vec<GlobalRef>,
     pub frame: FrameInfo,
     /// Lifter diagnostics (unhandled instructions, guesses).
@@ -299,6 +302,9 @@ pub struct IrFunction {
     /// Bytes of the writable splitter-named words (`lbl_` in `.sdata`) the function reads: maybe
     /// compiler temporaries, never folded to values, only compared with an inline's own.
     pub temp_bytes: Vec<(String, Vec<u8>)>,
+    /// Function-local static objects built by a constructor on first use (`static CVector3f
+    /// v(1.f, 1.f, 1.f);`, the compiler's guarded initialization): (symbol, construction).
+    pub static_ctors: Vec<(String, Expr)>,
     /// Frame stores nothing reads, dropped from `body` (see [`DeadStackStore`]).
     pub dead_stores: Vec<DeadStackStore>,
     /// An inline function the body is written into (the draft defines it first, `inline`, and

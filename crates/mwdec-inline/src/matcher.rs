@@ -2442,6 +2442,8 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     // by-value accessor results bound to a reference local (their dead stores), before folding
     // so the folds read the local's members
     total += crate::reflocal::apply(ir, lib, db);
+    // local statics constructed on first use (`static CVector3f v(1.f, 1.f, 1.f);`)
+    total += crate::statics::apply(ir, lib, db, &idx);
     for _round in 0..4 {
         let raw = build_defs(&ir.body, &ir.vars);
         let vars = ir.vars.clone();
@@ -2502,6 +2504,10 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     }
     // reference locals bound only to pass the accessor's result on once
     total += crate::reflocal::unbind_single_use(ir);
+    // call results copied whole once (`*this = *this + other;`)
+    total += crate::post::forward_call_into_copy(&mut ir.body, &ir.vars);
+    // locals holding folded `bool` inline results
+    crate::post::retype_bool_call_locals(&ir.body, &mut ir.vars);
     // members the function can't name, through their accessors (last: a naming step after the
     // temp-forwarding passes, which would treat the accessor calls as values to share)
     let named = {

@@ -505,15 +505,11 @@ pub fn sig_from_mangled(mangled: &str, db: &TypeDb) -> Option<FuncSig> {
         None => m.name.clone(),
     };
     let keys: Vec<Type> = m.params.iter().map(|p| resolve::param_key(db, &p.ty)).collect();
-    let scope_cls = m.scope.as_deref().filter(|s| is_class_scope(s, db));
-    // (member types a declaration names unqualified, `erase(iterator)`, are the class's)
-    let decl_key = |t: &Type| resolve::param_key(db, &scope_cls.map_or_else(|| t.clone(), |c| qualify_nested(db, t, c)));
     let pick = |list: &[DeclInfo]| -> Option<DeclInfo> {
         let same_shape = |d: &&DeclInfo| d.params.len() == m.params.len() && d.is_const == m.is_const && d.variadic == m.variadic;
         list.iter()
             .filter(same_shape)
             .find(|d| d.params.iter().map(|p| resolve::param_key(db, &p.ty)).collect::<Vec<_>>() == keys)
-            .or_else(|| list.iter().filter(same_shape).find(|d| d.params.iter().map(|p| decl_key(&p.ty)).collect::<Vec<_>>() == keys))
             .or_else(|| {
                 let cands: Vec<&DeclInfo> = list.iter().filter(same_shape).collect();
                 if cands.len() == 1 {

@@ -1278,3 +1278,278 @@ pub fn conditional_temporaries(ir: &mut IrFunction) {
 fn types_eq(a: &Type, b: &Type) -> bool {
     named(a).map(crate::sig::norm_name) == named(b).map(crate::sig::norm_name)
 }
+
+/// The class a vtable symbol belongs to (`__vt__29CValidCameraWaypointPredicate`).
+fn vtable_class(sym: &str) -> Option<String> {
+    let rest = sym.strip_prefix("__vt__")?;
+    let n: usize = rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()?;
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    let name = rest.get(digits..digits + n)?;
+    (rest.len() == digits + n && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then(|| name.to_string())
+}
+
+fn vtable_store(s: &Stmt, v: VarId) -> Option<String> {
+    let Stmt::Assign { dst: Expr::Member { base, offset: 0, .. }, src: Expr::AddrOf(g) } = s else { return None };
+    if !matches!(**base, Expr::Var(x) if x == v) {
+        return None;
+    }
+    match &**g {
+        Expr::Global { symbol, .. } => vtable_class(symbol),
+        _ => None,
+    }
+}
+
+/// A frame object built by an inline constructor of a class the context lacks (its vtable
+/// stored over the base's), passed by reference to one call and destroyed right after
+/// through the base's destructor: a temporary of that class of the unit's own source,
+/// `f(..., D())` (`D : B`; the emitter defines it from `local_class_bases`).
+pub fn derived_temporary_args(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    let mut total: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *total.entry(*v).or_default() += 1;
+        }
+    });
+    let vars = ir.vars.clone();
+    let mut found: Vec<(String, String, VarId)> = vec![];
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        let mut j = 0;
+        while j < b.len() {
+            // a call taking `&S` of a stack object S
+            let mut s_var = None;
+            Stmt::walk_exprs(std::slice::from_ref(&b[j]), &mut |e| {
+                if let Expr::Call { args, .. } = e {
+                    for a in args {
+                        if let Expr::AddrOf(x) = a {
+                            if let Expr::Var(v) = **x {
+                                if matches!(vars[v].kind, VarKind::Stack { .. }) {
+                                    s_var.get_or_insert(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            let Some(v) = s_var else {
+                j += 1;
+                continue;
+            };
+            // vtable stores before it (the last names the class)
+            let mut pre: Vec<usize> = vec![];
+            let mut k = j;
+            while k > 0 && vtable_store(&b[k - 1], v).is_some() {
+                k -= 1;
+                pre.push(k);
+            }
+            let Some(d) = pre.iter().min().map(|_| vtable_store(&b[j - 1], v).unwrap()) else {
+                j += 1;
+                continue;
+            };
+            // after it: the derived vtable again and the base destructor on S
+            let mut post: Vec<usize> = vec![];
+            let mut q = j + 1;
+            while q < b.len() && vtable_store(&b[q], v).is_some() {
+                post.push(q);
+                q += 1;
+            }
+            let base = match b.get(q) {
+                Some(Stmt::Expr(Expr::Call { callee: Callee::Method { sig: s, this, .. }, .. })) if crate::sig::is_dtor(s) && matches!(&**this, Expr::AddrOf(x) if matches!(**x, Expr::Var(y) if y == v)) => s.this_class.clone(),
+                _ => None,
+            };
+            let Some(base) = base else {
+                j += 1;
+                continue;
+            };
+            let known = crate::sig::find_class(db, &d).is_some_and(|c| !c.is_declaration);
+            let uses = pre.len() + post.len() + 2;
+            if known || crate::sig::norm_name(&d) == crate::sig::norm_name(&base) || total.get(&v) != Some(&uses) || crate::sig::find_class(db, &base).map_or(true, |c| c.vtable.is_empty()) {
+                j += 1;
+                continue;
+            }
+            // the temporary in place of the argument
+            let built = Expr::AddrOf(Box::new(Expr::Construct { class: Type::Named(d.clone()), ctor: None, args: vec![] }));
+            Stmt::rewrite_exprs(std::slice::from_mut(&mut b[j]), &mut |e| {
+                if matches!(e, Expr::AddrOf(x) if matches!(**x, Expr::Var(y) if y == v)) {
+                    *e = built.clone();
+                }
+            });
+            let mut rm: Vec<usize> = pre.iter().chain(post.iter()).copied().collect();
+            rm.push(q);
+            rm.sort_unstable();
+            let first = *rm.first().unwrap();
+            for i in rm.into_iter().rev() {
+                b.remove(i);
+            }
+            found.push((d, base, v));
+            let _ = first;
+            j = j - pre.len() + 1;
+        }
+    });
+    for (d, base, v) in found {
+        ir.vars[v].ty = Type::Named(d.clone());
+        if !ir.local_class_bases.iter().any(|x| x.0 == d) {
+            ir.local_class_bases.push((d, base));
+        }
+    }
+}
+
+/// Scope-guard classes of the context: one member, an inline default constructor initializing
+/// it from an argument-free call (`mEnabled(OSDisableInterrupts())`) and an inline destructor
+/// passing it to another function (`OSRestoreInterrupts(mEnabled);`): (class, member size,
+/// acquire function, release function).
+fn scope_guard_classes(db: &mwdec_core::TypeDb) -> Vec<(String, u32, String, String)> {
+    let mut out = vec![];
+    for (name, c) in &db.classes {
+        if c.is_declaration || c.fields.len() != 1 || !c.bases.is_empty() || c.vptr_offset.is_some() || name.contains('<') {
+            continue;
+        }
+        let f = &c.fields[0];
+        let last = crate::sig::split_scope(name).1;
+        let Some(ctor) = db.decls.get(&format!("{name}::{last}")).and_then(|ds| ds.iter().find(|d| d.params.is_empty() && d.is_inline_defined)) else { continue };
+        let Some(dtor) = db.decls.get(&format!("{name}::~{last}")).and_then(|ds| ds.iter().find(|d| d.is_inline_defined)) else { continue };
+        let init: Vec<&str> = ctor.init_list.as_deref().unwrap_or("").split_whitespace().collect();
+        let body: Vec<&str> = dtor.inline_body.as_deref().unwrap_or("").split_whitespace().collect();
+        let (acq, rel) = match (init.as_slice(), body.as_slice()) {
+            ([m, "(", a, "(", ")", ")"], [r, "(", m2, ")", ";"]) if *m == f.name && *m2 == f.name => (a.to_string(), r.to_string()),
+            _ => continue,
+        };
+        let Some(sz) = crate::types::size_of(Some(db), &f.ty) else { continue };
+        out.push((name.clone(), sz, acq, rel));
+    }
+    out
+}
+
+/// The callee of an argument-free direct call, through a comparison with zero / casts.
+fn acquire_call(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Cast { e, .. } => acquire_call(e),
+        Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) => acquire_call(l),
+        Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. } if args.is_empty() => Some(symbol),
+        _ => None,
+    }
+}
+
+/// `t = acquire(); ... release(t);` with `t` also stored, dead, into a frame slot of the
+/// member's size: a scope guard object (`CInterruptGuard guard;`) whose inline constructor
+/// and destructor are those calls.
+pub fn scope_guards(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    if ir.dead_stores.is_empty() {
+        return;
+    }
+    let guards = scope_guard_classes(db);
+    if guards.is_empty() {
+        return;
+    }
+    let mut uses: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    crate::inline::count_uses(&ir.body, &mut uses);
+    let vars = ir.vars.clone();
+    let dead = ir.dead_stores.clone();
+    let mut consumed: Vec<usize> = vec![];
+    let mut new_vars: Vec<Var> = vec![];
+    Stmt::for_each_block_mut(&mut ir.body, &mut |b| {
+        let mut i = 0;
+        while i < b.len() {
+            let Stmt::Assign { dst: Expr::Var(t), src } = &b[i] else {
+                i += 1;
+                continue;
+            };
+            let (t, src) = (*t, src.clone());
+            let Some(acq) = acquire_call(&src).map(|s| s.to_string()) else {
+                i += 1;
+                continue;
+            };
+            let Some((cls, sz, _, rel)) = guards.iter().find(|g| g.2 == acq).cloned() else {
+                i += 1;
+                continue;
+            };
+            // every use of the flag a release call (one on each path out of the scope)
+            let is_release = |s: &Stmt| matches!(s, Stmt::Expr(Expr::Call { callee: Callee::Direct { symbol, .. }, args, .. }) if *symbol == rel && args.len() == 1 && matches!(strip_casts(&args[0]), Expr::Var(x) if *x == t));
+            let mut releases = 0usize;
+            fn count_rel(b: &[Stmt], f: &dyn Fn(&Stmt) -> bool, n: &mut usize) {
+                for s in b {
+                    if f(s) {
+                        *n += 1;
+                    }
+                    match s {
+                        Stmt::If { then, els, .. } => {
+                            count_rel(then, f, n);
+                            count_rel(els, f, n);
+                        }
+                        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => count_rel(body, f, n),
+                        _ => {}
+                    }
+                }
+            }
+            count_rel(&b[i + 1..], &is_release, &mut releases);
+            if !matches!(vars[t].kind, VarKind::Local) || releases == 0 || uses.get(&t) != Some(&releases) {
+                i += 1;
+                continue;
+            }
+            let k = usize::MAX;
+            // (the call's register result, tested against zero: its temp folded away since)
+            let reg_flag = |e: &Expr| match strip_casts(e) {
+                Expr::Binary { op: BinOp::Ne, l, r, .. } => r.as_int() == Some(0) && matches!(strip_casts(l), Expr::Var(_)),
+                Expr::Var(_) => true,
+                _ => false,
+            };
+            let calls_acq = |e: &Expr| {
+                let mut hit = false;
+                e.walk(&mut |x| hit |= matches!(x, Expr::Call { callee: Callee::Direct { symbol, .. }, .. } if *symbol == acq));
+                hit
+            };
+            let Some(di) = dead.iter().position(|d| d.size == sz && (d.value == src || d.value == Expr::Var(t) || calls_acq(&d.value) || reg_flag(&d.value))) else {
+                i += 1;
+                continue;
+            };
+            if consumed.contains(&di) {
+                i += 1;
+                continue;
+            }
+            let id = vars.len() + new_vars.len();
+            new_vars.push(Var { name: "guard".into(), ty: Type::Named(cls.clone()), kind: VarKind::Stack { offset: dead[di].offset, size: sz } });
+            let last = crate::sig::split_scope(&cls).1.to_string();
+            let ctor = mwdec_core::FuncSig {
+                qualified_name: format!("{cls}::{last}"),
+                mangled: None,
+                ret: Type::Void,
+                params: vec![],
+                this_class: Some(cls.clone()),
+                is_const: false,
+                is_static: false,
+                is_virtual: false,
+                variadic: false,
+                runs_code: true,
+            };
+            let _ = k;
+            fn drop_rel(b: &mut Vec<Stmt>, f: &dyn Fn(&Stmt) -> bool) {
+                b.retain(|s| !f(s));
+                for s in b.iter_mut() {
+                    match s {
+                        Stmt::If { then, els, .. } => {
+                            drop_rel(then, f);
+                            drop_rel(els, f);
+                        }
+                        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => drop_rel(body, f),
+                        _ => {}
+                    }
+                }
+            }
+            let mut rest = b.split_off(i + 1);
+            drop_rel(&mut rest, &is_release);
+            b.extend(rest);
+            b[i] = Stmt::Expr(Expr::Call { callee: Callee::Method { symbol: String::new(), sig: ctor, this: Box::new(Expr::AddrOf(Box::new(Expr::Var(id)))), qualified: false }, args: vec![], ret: Type::Void });
+            consumed.push(di);
+            i += 1;
+        }
+    });
+    ir.vars.extend(new_vars);
+    consumed.sort_unstable();
+    for di in consumed.into_iter().rev() {
+        ir.dead_stores.remove(di);
+    }
+    for (n, d) in ir.dead_stores.iter_mut().enumerate() {
+        d.order = n;
+    }
+}

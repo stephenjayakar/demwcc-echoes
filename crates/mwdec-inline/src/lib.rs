@@ -29,6 +29,7 @@ pub mod safety;
 pub mod scalarinl;
 pub mod ser;
 pub mod session;
+pub mod statics;
 pub mod stmtinl;
 pub mod stmts;
 pub mod template;

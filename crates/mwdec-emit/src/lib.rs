@@ -891,6 +891,26 @@ impl<'a> Em<'a> {
         }
         // the own class (synth_own_class) is wanted too
         wanted.extend(self.synth.keys().cloned());
+        // classes of the unit's own source built as temporaries (`f(D())`): derived from the base
+        // whose destructor ran, declaring its first virtual method (so the vtable stays the unit's)
+        for (d, b) in &ir.local_class_bases {
+            if !self.unknown_type(db, d) {
+                continue;
+            }
+            wanted.insert(d.clone());
+            let key_fn = sig::find_class(db, b).and_then(|c| c.vtable.iter().find(|m| !sig::is_dtor(&m.sig) && !m.sig.qualified_name.contains('~')).map(|m| m.sig.clone()));
+            let e = self.synth.entry(d.clone()).or_default();
+            e.base = Some(b.clone());
+            if let Some(s) = key_fn {
+                let name = sig::split_scope(&s.qualified_name).1.to_string();
+                let ps: Vec<String> = s.params.iter().map(|p| type_str(&p.ty)).collect();
+                let mut decl_s = format!("{} {name}({})", type_str(&s.ret), ps.join(", "));
+                if s.is_const {
+                    decl_s.push_str(" const");
+                }
+                e.add_method(&format!("{name}({})", ps.join(", ")), decl_s);
+            }
+        }
         if wanted.is_empty() {
             return;
         }
@@ -907,7 +927,7 @@ impl<'a> Em<'a> {
             }
         }
         // static data members of those classes the function reads
-        for g in ir.globals.iter().filter(|g| !g.is_function && !db.globals.contains_key(&g.symbol)) {
+        for g in ir.globals.iter().filter(|g| !g.is_function && !db.globals.contains_key(&g.symbol) && !g.symbol.starts_with("__vt__")) {
             let Some(d) = sig::demangle(&g.symbol) else { continue };
             if d.contains('(') {
                 continue;
@@ -1297,7 +1317,9 @@ impl<'a> Em<'a> {
             body.push(';');
         }
         // a destructor the unit's object defines or calls (`delete` calls it)
-        if !s.methods.iter().any(|(k, _)| k.starts_with('~')) && self.db.is_some_and(|db| db.object_dtors.contains(n) || db.object_dtors.iter().any(|d| strip_unnamed_ns(d) == n)) {
+        // (not for a temporary's class whose destructor the function inlines)
+        let inline_temp = self.ir.local_class_bases.iter().any(|(d, _)| d == n);
+        if !inline_temp && !s.methods.iter().any(|(k, _)| k.starts_with('~')) && self.db.is_some_and(|db| db.object_dtors.contains(n) || db.object_dtors.iter().any(|d| strip_unnamed_ns(d) == n)) {
             let _ = write!(body, " ~{last}();");
         }
         if s.base.is_none() && !s.fields.is_empty() && s.methods.iter().all(|(k, _)| !k.starts_with('~')) {
@@ -2606,7 +2628,9 @@ impl<'a> Em<'a> {
                         _ => xt,
                     };
                     let same = sig::norm_name(&format!("{:?}", strip_cv(&xt))) == sig::norm_name(&format!("{:?}", strip_cv(inner)));
-                    if !same {
+                    // (a temporary of a class of the unit's own source derived from the parameter's)
+                    let derived_temp = matches!(&**x, Expr::Construct { .. }) && self.is_base_of(Some(strip_cv(inner)), strip_cv(&xt));
+                    if !same && !derived_temp {
                         if let Some(s) = self.typed_member(x, inner) {
                             return s;
                         }
@@ -3102,6 +3126,12 @@ impl<'a> Em<'a> {
     fn is_base_of(&self, base: Option<&Type>, derived: &Type) -> bool {
         let (Some(db), Some(b)) = (self.db, base.and_then(named)) else { return false };
         let Some(d) = named(derived) else { return false };
+        // (a class of the unit's own source the function builds: its recorded base)
+        if let Some((_, lb)) = self.ir.local_class_bases.iter().find(|(c, _)| sig::norm_name(c) == sig::norm_name(d)) {
+            if sig::norm_name(lb) == sig::norm_name(b) || self.is_base_of(base, &Type::Named(lb.clone())) {
+                return true;
+            }
+        }
         fn walk(db: &TypeDb, c: &str, target: &str, depth: u32) -> bool {
             if depth > 16 {
                 return false;
@@ -3275,6 +3305,16 @@ impl<'a> Em<'a> {
         let t = extern_type(ty);
         let dt = self.gtypes.get(symbol).cloned().unwrap_or_else(|| t.clone());
         if let Some(st) = local_static_name(symbol) {
+            // a local static object constructed on first use: `static T v(args);`
+            if let Some((_, init)) = self.ir.static_ctors.iter().find(|(s, _)| s == symbol) {
+                let init = init.clone();
+                let rendered = match &init {
+                    Expr::Construct { args, ctor, .. } => format!("({})", self.args(args, ctor.as_ref())),
+                    e => format!(" = {}", self.expr(e, 0)),
+                };
+                self.local_statics.insert(format!("static {}{rendered};", decl(&dt, &st)));
+                return reinterpret_global(st, &t, &dt);
+            }
             // function-local static (`init$90`): declared in the body, with its initial value
             // when the object has one (initialized data sections)
             let g = self.ir.globals.iter().find(|g| g.symbol == symbol);
