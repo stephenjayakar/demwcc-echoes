@@ -299,7 +299,7 @@ fn ty_of_load(e: &Expr) -> Type {
 pub fn count_ops(e: &Expr) -> usize {
     let mut n = 0;
     e.walk(&mut |x| {
-        if matches!(x, Expr::Binary { .. } | Expr::Unary { .. } | Expr::Call { .. } | Expr::Ternary { .. }) {
+        if matches!(x, Expr::Binary { .. } | Expr::Unary { .. } | Expr::Call { .. } | Expr::Ternary { .. }) || matches!(x, Expr::Construct { ctor: Some(cs), .. } if cs.mangled.is_some()) {
             n += 1;
         }
     });
@@ -340,9 +340,16 @@ fn from_probe_expr(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, 
             if std::env::var("MWDI_TRACE_TPL").is_ok_and(|f| p.sig.qualified_name.contains(f.as_str())) {
                 eprintln!("TPL {} object return: {e:?}", p.sig.qualified_name);
             }
-            let comps = object_comps(e, c, db).ok_or("object return form")?;
-            let comps = comps.into_iter().map(|c| to_holes(&c.pat, &map).map(|pat| Comp { pat, ..c })).collect::<Option<Vec<_>>>().ok_or("free vars")?;
-            Shape::Object { class: c.clone(), comps }
+            match object_comps(e, c, db) {
+                Some(comps) => {
+                    let comps = comps.into_iter().map(|c| to_holes(&c.pat, &map).map(|pat| Comp { pat, ..c })).collect::<Option<Vec<_>>>().ok_or("free vars")?;
+                    Shape::Object { class: c.clone(), comps }
+                }
+                // an object built by its out-of-line constructor (`return CCharAnimTime(mMaxTime);`):
+                // the construction itself is the value
+                None if matches!(e, Expr::Construct { ctor: Some(cs), .. } if cs.mangled.is_some()) && std::env::var_os("MWDI_NO_CTOR_RETURNS").is_none() => Shape::Scalar(to_holes(e, &map).ok_or("free vars")?),
+                None => return Err("object return form".into()),
+            }
         }
         ([Stmt::Return(Some(e))], _) => Shape::Scalar(to_holes(e, &map).ok_or("free vars")?),
         _ => {

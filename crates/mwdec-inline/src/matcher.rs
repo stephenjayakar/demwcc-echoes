@@ -517,6 +517,8 @@ impl<'a, 'e> M<'a, 'e> {
                 // an element access spelled as indexing on one side and as an address sum on the other
                 (Expr::Load { base, offset, ty }, Expr::Index { ty: t2, .. }) if compat(ty, t2, self.env.db) => self.m_linear(base, *offset as i64, &Expr::AddrOf(Box::new(t.clone())), 0),
                 (Expr::Ternary { c, t: a, f, .. }, Expr::Ternary { c: c2, t: a2, f: f2, .. }) => self.m(c, c2) && self.m(a, a2) && self.m(f, f2),
+                // the same out-of-line constructor
+                (Expr::Construct { ctor: Some(c1), args, .. }, Expr::Construct { ctor: Some(c2), args: a2, .. }) if c1.mangled.is_some() && c1.mangled == c2.mangled && args.len() == a2.len() => args.iter().zip(a2).all(|(x, y)| self.m(x, y)),
                 (Expr::Call { callee, args, .. }, Expr::Call { callee: c2, args: a2, .. }) => {
                     if args.len() != a2.len() {
                         return false;
@@ -808,6 +810,8 @@ impl<'a, 'e> M<'a, 'e> {
                         // every member of one object value (`r.mPos` set from `Lerp(...)`)
                         out.push(if *ptr { Expr::AddrOf(Box::new(v)) } else { v });
                     } else if let Some(a) = lvalue_addr(self.env, m, class) {
+                        out.push(a);
+                    } else if let Some(a) = (depth < 3).then(|| ref_object_of(self.env, m, class, depth)).flatten() {
                         out.push(a);
                     } else if *temp_ok && depth < 3 && !matches!(self.t.shape, Shape::Stmts { .. }) {
                         let (v, sc) = explain_object(self.env, class, m, depth + 1)?;
@@ -1164,6 +1168,54 @@ pub fn lvalue_addr(env: &Env, m: &BTreeMap<i32, Expr>, cls: &str) -> Option<Expr
     }
     let (p, d) = base?;
     crate::addr::object_at(&p, d, cls, env).map(|(a, _)| a)
+}
+
+/// The `cls` object the members `m` are read from, reached through a reference-returning inline
+/// of another object (`MainHeader()`: `*reinterpret_cast<const Header*>(mData.get())`) when the
+/// address itself has another type: that call's address.
+fn ref_object_of(env: &Env, m: &BTreeMap<i32, Expr>, cls: &str, depth: u32) -> Option<Expr> {
+    if std::env::var_os("MWDI_NO_REF_OBJECTS").is_some() {
+        return None;
+    }
+    let defs = env.defs;
+    let mut base: Option<(Expr, i32)> = None;
+    for (off, e) in m {
+        let (p, o) = crate::addr::access(res(e, defs), env)?;
+        let d = o - off;
+        match &base {
+            None => base = Some((p, d)),
+            Some((p0, d0)) => {
+                if *d0 != d || !teq(p0, &p, defs) {
+                    return None;
+                }
+            }
+        }
+    }
+    let (p, d) = base?;
+    if d != 0 {
+        return None;
+    }
+    for t in &env.lib.templates {
+        let Shape::Scalar(pat) = &t.shape else { continue };
+        if !t.ret_ref || mwdec_lift::pointee(strip(&t.sig.ret)).and_then(|x| class_name(x, env.db)).as_deref().map(mwdec_lift::sig::norm_name) != Some(mwdec_lift::sig::norm_name(cls)) {
+            continue;
+        }
+        // (the reference is the address value itself, not a member of another object of `cls`)
+        if matches!(pat, Expr::AddrOf(_)) {
+            continue;
+        }
+        let mut mm = M::new(env, t);
+        if !mm.m(pat, &p) {
+            continue;
+        }
+        let Some((args, _)) = mm.finalize(depth + 1) else { continue };
+        let mut call = make_call(t, args);
+        if let Expr::Call { ret, .. } = &mut call {
+            *ret = Type::Named(cls.to_string());
+        }
+        return Some(Expr::AddrOf(Box::new(call)));
+    }
+    None
 }
 
 /// Explain the virtual object `m` (components of a `cls` value) as an object template call.
@@ -2630,7 +2682,7 @@ fn root_ok(p: &Expr, t: &Expr) -> bool {
     match (p, t) {
         (Expr::Binary { op, .. }, Expr::Binary { op: o2, .. }) => op == o2,
         (Expr::Unary { op, .. }, Expr::Unary { op: o2, .. }) => op == o2,
-        (Expr::Call { .. }, Expr::Call { .. }) | (Expr::Ternary { .. }, Expr::Ternary { .. }) | (Expr::Index { .. }, Expr::Index { .. }) => true,
+        (Expr::Call { .. }, Expr::Call { .. }) | (Expr::Ternary { .. }, Expr::Ternary { .. }) | (Expr::Index { .. }, Expr::Index { .. }) | (Expr::Construct { .. }, Expr::Construct { .. }) => true,
         (Expr::Cast { e: a, .. }, Expr::Cast { e: b, .. }) => matches!((&**a, &**b), (Expr::Call { .. }, Expr::Call { .. })) || (!matches!(&**a, Expr::Cast { .. }) && root_ok(a, b)),
         _ => false,
     }
