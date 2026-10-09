@@ -148,6 +148,9 @@ pub struct Lifter<'a> {
     pub param_home_slots: bool,
     pub params: Vec<VarId>,
     pub decl_params: Vec<String>,
+    /// Narrow parameters the code re-extends (`clrlwi r4, r4, 24` of a `u8`): declared `const`
+    /// (the compiler re-extends a const narrow parameter where it is used).
+    pub reextended: HashSet<VarId>,
     entry_vals: HashMap<Reg, Expr>,
     rd_in: Vec<Vec<Vec<u32>>>,
     use_count: HashMap<Site, u32>,
@@ -307,6 +310,7 @@ impl<'a> Lifter<'a> {
             param_home_slots: false,
             params: vec![],
             decl_params: vec![],
+            reextended: HashSet::new(),
             entry_vals: HashMap::new(),
             rd_in: vec![vec![]; nb],
             use_count: HashMap::new(),
@@ -3678,6 +3682,15 @@ impl<'a> Lifter<'a> {
         self.def(st, k, gpr(4), crate::wide::lo32(Expr::Var(t)));
     }
 
+    /// An extension of a narrow parameter's entry value to its own type (a re-extension).
+    fn note_reextension(&mut self, s: &Expr, t: &Type) {
+        if let Expr::Var(v) = s {
+            if matches!(self.vars[*v].kind, VarKind::Param { .. }) && *strip_cv(&types::resolve(self.db, &self.vars[*v].ty)) == *t {
+                self.reextended.insert(*v);
+            }
+        }
+    }
+
     fn ret_value(&mut self, st: &St, r: Reg) -> Expr {
         if r == gpr(3) && crate::wide::is_wide(&types::resolve(self.db, &self.ret_ty)) {
             let signed = !matches!(strip_cv(&types::resolve(self.db, &self.ret_ty)), Type::Int { signed: false, .. });
@@ -4185,6 +4198,12 @@ impl<'a> Lifter<'a> {
                         }
                     }
                     (Addze, Ca::Srawi(x, n)) => arith(BinOp::Div, as_signed(x.clone(), &self.vars), Expr::int(1i64 << n), &self.vars),
+                    // `subfc t, a, b; subfe r, r, r`: -1 when b <u a, else 0 (the branch-free unsigned
+                    // select mask, `b < a ? x : 0` as `x & mask`)
+                    (Subfe, Ca::Subfc(x, y)) if i.ra() == i.rb() => {
+                        let c = Expr::cmp(BinOp::Lt, as_unsigned(y.clone(), &self.vars), as_unsigned(x.clone(), &self.vars));
+                        Expr::Unary { op: UnOp::Neg, e: Box::new(Expr::cast(t_s32(), c)), ty: t_s32() }
+                    }
                     // high word of a 64-bit addition / subtraction: the halves of two 64-bit values
                     (Adde, Ca::Addc(alo, blo)) | (Subfe, Ca::Subfc(alo, blo)) if self.param_home_slots => {
                         let b2 = self.get(st, gpr(i.rb()));
@@ -4309,6 +4328,9 @@ impl<'a> Lifter<'a> {
             Extsb | Extsh => {
                 let s = self.get(st, gpr(i.rs()));
                 let t = if ins.op == Extsb { t_int(1, true) } else { t_int(2, true) };
+                if i.ra() == i.rs() {
+                    self.note_reextension(&s, &t);
+                }
                 let v = Expr::cast(t, s);
                 self.def(st, k, gpr(i.ra()), v);
                 if i.rc() {
@@ -4326,6 +4348,12 @@ impl<'a> Lifter<'a> {
             }
             Rlwinm => {
                 let s = self.get(st, gpr(i.rs()));
+                // (in place, `clrlwi r4, r4, 24`: an argument re-extended for a call; an extension into
+                // another register is the ordinary one before a compare)
+                if i.ra() == i.rs() && ins.field_sh() == 0 && ins.field_me() == 31 && (ins.field_mb() == 24 || ins.field_mb() == 16) {
+                    let t = t_int(if ins.field_mb() == 24 { 1 } else { 2 }, false);
+                    self.note_reextension(&s, &t);
+                }
                 let v = self.rlwinm(s, ins.field_sh(), ins.field_mb(), ins.field_me());
                 if self.cfg.blocks[self.cfg.block_of[k]].term.is_switch() && ins.field_sh() == 2 && ins.field_me() == 29 {
                     let s = self.get(st, gpr(i.rs()));

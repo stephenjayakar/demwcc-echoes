@@ -84,6 +84,34 @@ fn read(e: &Expr, vars: &[Var], db: &TypeDb) -> Option<Expr> {
                 _ => None,
             }
         }
+        // a signed field through a byte read: `(int)((x << k) & M) >> s` (the compiler's
+        // `extlwi; srawi`), the field bits [s - k, 32 - k) of x
+        Expr::Binary { op: BinOp::Shr, l, r, .. } if matches!(strip_cast(l), Expr::Binary { op: BinOp::And, l: sl, .. } if matches!(strip_cast(sl), Expr::Binary { op: BinOp::Shl, .. })) => {
+            let Expr::Binary { l: sl, r: m, .. } = strip_cast(l) else { return None };
+            let Expr::Binary { l: x, r: k, .. } = strip_cast(sl) else { return None };
+            let (x, k, s, m) = (strip_cast(x), int_of(k)?, int_of(r)?, int_of(m)?);
+            let bits = unit_bits(x)?;
+            // (bits shifted out of the top are dropped: the field is the top 32 - s bits)
+            if s >= 32 || k > s || k + bits < 32 || (m as u64) < (1u64 << s) || (m >> s) != (u32::MAX >> s) {
+                return None;
+            }
+            let (shift, width) = ((s - k) as u8, (32 - s) as u8);
+            if shift as u32 + width as u32 > bits {
+                return None;
+            }
+            make(x, shift, width, vars, db).or_else(|| {
+                // (the byte is the high one of a halfword unit)
+                if bits != 8 {
+                    return None;
+                }
+                let wide = match x {
+                    Expr::Load { base, offset, .. } => Expr::Load { base: base.clone(), offset: *offset, ty: Type::Int { size: 2, signed: true } },
+                    Expr::Member { base, offset, .. } => Expr::Member { base: base.clone(), offset: *offset, ty: Type::Int { size: 2, signed: true } },
+                    _ => return None,
+                };
+                make(&wide, shift + 8, width, vars, db)
+            })
+        }
         Expr::Binary { op: BinOp::Shr, l, r, .. } => {
             let x = strip_cast(l);
             let bits = unit_bits(x)?;

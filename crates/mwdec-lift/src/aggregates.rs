@@ -432,7 +432,7 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
 /// Does class `t` declare an assignment that is no member-wise copy: one taking its source by
 /// non-const reference (an ownership transfer: `auto_ptr`, `single_ptr`) or an inline one that
 /// tests or calls (`rc_ptr`'s reference counting)?
-fn transfers_on_assign(db: &TypeDb, t: &Type) -> bool {
+pub fn transfers_on_assign(db: &TypeDb, t: &Type) -> bool {
     let Some(name) = named(t) else { return false };
     let base = |n: &str| -> String {
         let n = n.trim();

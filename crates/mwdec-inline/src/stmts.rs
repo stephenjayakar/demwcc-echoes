@@ -759,6 +759,11 @@ fn try_ctor_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, t: &Templ
         Expr::AddrOf(x) => *x,
         p => Expr::Load { base: Box::new(p), offset: 0, ty: mwdec_core::Type::Named(t.class.clone().unwrap_or_default()) },
     };
+    // (built into a member of the method's own object outside a constructor, `m = T(..)` runs
+    // T's assignment: another meaning for a class whose assignment is no member-wise copy)
+    if crate::groups::own_member_assigned(&lv, env) && t.class.as_deref().is_some_and(|c| mwdec_lift::aggregates::transfers_on_assign(env.db, &mwdec_core::Type::Named(c.to_string()))) {
+        return false;
+    }
     let call = make_call(t, args);
     b.splice(i..oend, [Stmt::Assign { dst: lv, src: call }]);
     true

@@ -173,6 +173,7 @@ pub struct M<'a, 'e> {
 
 impl<'a, 'e> M<'a, 'e> {
     pub fn new(env: &'a Env<'e>, t: &'a Template) -> Self {
+        ZERO_USED.with(|c| c.set(0));
         M { env, t, b: vec![None; t.holes.len()], folded: vec![] }
     }
 
@@ -438,6 +439,23 @@ impl<'a, 'e> M<'a, 'e> {
             if let Expr::Cast { ty, e: inner } = p {
                 if matches!(strip(ty), Type::Ptr(_)) && !matches!(t, Expr::Cast { .. }) {
                     return self.m(inner, t);
+                }
+            }
+            // a member of a temporary object that is zero (`begin() + pos`: the begin iterator's
+            // index 0 added to `pos` folded away): only with that temporary's zero stored, dead,
+            // in the frame
+            if let Expr::Binary { op: BinOp::Add, l, r, ty } = p {
+                if !matches!(t, Expr::Binary { op: BinOp::Add, .. }) && vclass(ty, self.env.db) != 1 && std::env::var_os("MWDI_NO_ZERO_MEMBERS").is_none() && dead_zero_word() {
+                    for (z, other) in [(l, r), (r, l)] {
+                        if comp_of(z, &self.t.holes).is_some() {
+                            let snap = self.b.clone();
+                            if self.m(z, &Expr::Int { value: 0, ty: Type::Int { size: 4, signed: true } }) && self.m(other, t) {
+                                ZERO_USED.with(|c| c.set(c.get() + 1));
+                                return true;
+                            }
+                            self.b = snap;
+                        }
+                    }
                 }
             }
             // a pointer stepped by a constant (`p + 1` for a byte pointer): `&p[k]` one way, a sum
@@ -710,7 +728,8 @@ impl<'a, 'e> M<'a, 'e> {
     /// `depth` bounds nested explanations.
     pub fn finalize(&self, depth: u32) -> Option<(Vec<Expr>, i32)> {
         let mut out = vec![];
-        let mut score = 0;
+        // (a zero member invented for a temporary loses to any explanation without one)
+        let mut score = -11 * ZERO_USED.with(|c| c.replace(0)) as i32;
         // the dead frame stores the expansion leaves must be in the target too
         if !self.t.dead.is_empty() {
             score += self.dead_stores_match()? as i32 * 2;
@@ -1685,7 +1704,8 @@ pub struct Accessor {
     pub off: i32,
     pub ty: Type,
     /// 0 value, 1 reference, 2 pointer (`return &m;`), 3 reference to a pointer member's
-    /// pointee (`return *m;`: the member's value is the result's address)
+    /// pointee (`return *m;`: the member's value is the result's address), 4 an object member
+    /// by value
     pub how: u8,
     /// (field, owner) of every member named on the way (`a`, then `b` of `a`'s class)
     pub fields: Vec<(String, String)>,
@@ -1774,6 +1794,8 @@ pub fn accessors(db: &TypeDb) -> std::rc::Rc<Vec<Accessor>> {
                 (Type::Ref(_), false) => 1,
                 (Type::Ptr(_), true) => 2,
                 (r, false) if mwdec_lift::scalar_size(strip(&mwdec_lift::types::resolve(Some(db), r).into_owned())).is_some() || mwdec_lift::types::is_enum(Some(db), r) => 0,
+                // an object member returned by value (`CCharAnimTime GetDuration() const`)
+                (r, false) if class_name(r, db).is_some() && class_name(r, db) == class_name(&ty, db) => 4,
                 _ => continue,
             };
             let sig = mwdec_core::FuncSig {
@@ -2020,6 +2042,61 @@ fn name_inside(e: &mut Expr, call: Expr, env: &Env, idx: &Index) -> usize {
     }
 }
 
+/// `T v = obj.m;` where the frame also holds a dead store of part of `obj.m`: the copy went
+/// through a by-value accessor's temporary (`T v = info.GetDuration();`, the temporary's other
+/// words forwarded), so the source called it. The accessor of the innermost object owning `m`.
+fn byvalue_accessor_copies(ir: &mut IrFunction, db: &TypeDb, lib: &InlineLib, idx: &Index) -> usize {
+    if std::env::var_os("MWDI_NO_BYVALUE_COPIES").is_some() || ir.dead_stores.is_empty() {
+        return 0;
+    }
+    let defs = build_defs(&ir.body, &ir.vars);
+    let vars = ir.vars.clone();
+    let env = Env { db, vars: &vars, defs: &defs, lib, objects: &idx.objects };
+    let accs = accessors(db);
+    let dead: Vec<(Expr, i32, u32)> = ir.dead_stores.iter().filter_map(|d| crate::addr::access(res(&d.value, &defs), &env).map(|(p, o)| (p, o, d.size))).collect();
+    let mut n = 0;
+    for s in ir.body.iter_mut() {
+        let Stmt::Assign { dst: Expr::Var(v), src } = s else { continue };
+        if !matches!(vars[*v].kind, VarKind::Stack { .. }) {
+            continue;
+        }
+        let Some(cls) = class_name(&vars[*v].ty, db) else { continue };
+        let size = mwdec_lift::types::size_of(Some(db), &vars[*v].ty).unwrap_or(0) as i32;
+        if !matches!(src, Expr::Load { .. } | Expr::Member { .. }) || class_name(&ty_of(src, &vars), db).as_deref() != Some(cls.as_str()) {
+            continue;
+        }
+        let Some((b, o)) = crate::addr::access(src, &env) else { continue };
+        // a dead store of part of the object, read from it
+        if !dead.iter().any(|(p, po, _)| *po >= o && *po < o + size && teq(p, &b, &defs)) {
+            continue;
+        }
+        let mut best: Option<(i32, usize, Expr)> = None;
+        for (ai, a) in accs.iter().enumerate() {
+            if a.how != 4 || class_name(&a.ty, db).as_deref() != Some(cls.as_str()) || o < a.off {
+                continue;
+            }
+            let Some(addr) = object_as_written(src, &b, o - a.off, &a.class, &env) else { continue };
+            // (the innermost owner: the smallest member offset)
+            if best.as_ref().map_or(true, |(bo, _, _)| a.off < *bo) {
+                best = Some((a.off, ai, addr));
+            }
+        }
+        let Some((_, ai, mut addr)) = best else { continue };
+        let a = &accs[ai];
+        // (the object's own way there named too: `mFundamentals.GetSteadyStateAnimInfo()`)
+        if let Expr::AddrOf(x) = &mut addr {
+            if let Expr::Load { base, .. } | Expr::Member { base, .. } = &mut **x {
+                accessor_expr(base, &env, idx);
+            }
+        }
+        let mut a_this = addr;
+        accessor_expr(&mut a_this, &env, idx);
+        *src = Expr::Call { callee: Callee::Method { symbol: String::new(), sig: a.sig.clone(), this: Box::new(a_this), qualified: false }, args: vec![], ret: a.sig.ret.clone() };
+        n += 1;
+    }
+    n
+}
+
 /// Rank of an accessor choice (lower is better): named const getters first, as the emitter.
 fn acc_rank(name: &str, is_const: bool) -> u8 {
     if name.starts_with("operator") {
@@ -2142,7 +2219,7 @@ fn member_ref_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
     let accs = accessors(env.db);
     let mut best_d: Option<(u8, String, usize, Expr)> = None;
     for (ai, a) in accs.iter().enumerate() {
-        if matches!(a.how, 0 | 3) || o < a.off || !fits(&a.sig.ret) {
+        if matches!(a.how, 0 | 3 | 4) || o < a.off || !fits(&a.sig.ret) {
             continue;
         }
         let Some(addr) = object_as_written(e, &b, o - a.off, &a.class, env) else { continue };
@@ -2374,6 +2451,16 @@ thread_local! {
     static TEMPS: std::cell::RefCell<HashMap<String, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
 }
 
+thread_local! {
+    /// Zero members assumed by the current match (see `M::m`).
+    static ZERO_USED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Does the function's frame hold a dead store of a zero word?
+fn dead_zero_word() -> bool {
+    TARGET_DEAD.with(|d| d.borrow().iter().any(|(size, v)| *size == 4 && v.as_int() == Some(0)))
+}
+
 /// The bytes of the function's literal symbol `sym` in hex (see [`crate::template::LITERAL_PREFIX`]).
 fn literal_hex(sym: &str) -> Option<String> {
     let hex = |b: &Vec<u8>| b.iter().map(|x| format!("{x:02x}")).collect();
@@ -2409,6 +2496,7 @@ thread_local! {
 }
 
 fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
+    crate::groups::set_in_ctor(ir.symbol.starts_with("__ct__"));
     // members' own constructors' stores at the start of a constructor body are implicit
     let (stripped, pending) = if std::env::var("MWDI_NO_CTORS").is_ok() { (0, Default::default()) } else { crate::defctor::strip(ir, db, &lib.default_ctors) };
     let stripped = stripped + crate::defctor::copy_ctor_inits(ir, db, &lib.copy_ctors);
@@ -2418,6 +2506,8 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     let stripped = stripped + crate::defctor::default_temps(ir, db, &lib.default_ctors);
     // stack buffers built as a default construction and used as a named object: `T v;`
     let stripped = stripped + crate::defctor::default_locals(ir, db, &lib.default_ctors);
+    // the returned object built as a default construction: `return T();`
+    let stripped = stripped + crate::defctor::default_returns(ir, db, &lib.default_ctors);
     // list loops, before folding can merge the walking pointer with its first value
     let stash = if std::env::var("MWDI_NO_ITERLOOPS").is_err() { crate::iterloops::lists_prefold(ir, db) } else { vec![] };
     let stripped = stripped + stash.len();
@@ -2521,6 +2611,9 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     };
     crate::stmtinl::finish(ir);
     total += crate::walkptr::constructed_buffers(ir, db);
+    // named copies of an object member made through a by-value accessor (its result's dead
+    // store; after the forwarding passes: the source named the copy)
+    total += byvalue_accessor_copies(ir, db, lib, &idx);
     total + named
 }
 
@@ -2685,6 +2778,49 @@ fn ctor_members(env: &Env, cls: &str, sig: &mwdec_core::FuncSig, args: &[Expr]) 
     None
 }
 
+/// The constructor of `cls` with fewer parameters than `n` explaining the members `m` where
+/// every object parameter is an object the members are read from (an lvalue, not a temporary).
+fn grouped_ctor(env: &Env, cls: &str, m: &BTreeMap<i32, Expr>, n: usize) -> Option<Expr> {
+    if std::env::var_os("MWDI_NO_GROUPED_CTORS").is_some() {
+        return None;
+    }
+    let list = env.objects.get(&mwdec_lift::sig::norm_name(cls))?;
+    for &ti in list {
+        let t = &env.lib.templates[ti];
+        let Shape::Object { comps, .. } = &t.shape else { continue };
+        // (not the copy constructor: the object itself rebuilt is no grouping)
+        let norm = mwdec_lift::sig::norm_name;
+        if !matches!(t.kind, CallKind::Ctor) || t.holes.len() >= n || !t.holes.iter().any(|h| matches!(h, HoleKind::Obj { .. })) || t.holes.iter().any(|h| matches!(h, HoleKind::Obj { class, .. } if norm(class) == norm(cls))) {
+            continue;
+        }
+        if !m.keys().all(|o| comps.iter().any(|c| c.off == *o)) || comps.len() != m.len() {
+            continue;
+        }
+        let mut mm = M::new(env, t);
+        if !comps.iter().all(|c| mm.m(&c.pat, &m[&c.off])) {
+            continue;
+        }
+        // object holes bound to objects that exist (no constructions of temporaries)
+        let lvalues = t.holes.iter().enumerate().all(|(h, k)| match (k, &mm.b[h]) {
+            // (read from an object of another class: members of a `cls` object regrouped are
+            // the object itself)
+            (HoleKind::Obj { class, .. }, Some(Bind::Comps(c))) => {
+                lvalue_addr(env, c, class).is_some()
+                    && c.values().next().and_then(|e| crate::addr::access(res(e, env.defs), env)).and_then(|(p, _)| crate::addr::outer_class(&p, env)).is_some_and(|oc| norm(&oc) != norm(cls))
+            }
+            (HoleKind::Obj { .. }, Some(Bind::Val(_))) => true,
+            (HoleKind::Obj { .. }, _) => false,
+            _ => true,
+        });
+        if !lvalues {
+            continue;
+        }
+        let Some((args, _)) = mm.finalize(0) else { continue };
+        return Some(make_call(t, args));
+    }
+    None
+}
+
 fn root_ok(p: &Expr, t: &Expr) -> bool {
     match (p, t) {
         (Expr::Binary { op, .. }, Expr::Binary { op: o2, .. }) => op == o2,
@@ -2740,6 +2876,12 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
                             *e = call;
                             return 1;
                         }
+                    }
+                    // a constructor taking an object for consecutive members read from one
+                    // object (`CQuaternion(w, q.GetVector())` over `CQuaternion(w, x, y, z)`)
+                    if let Some(call) = grouped_ctor(env, &cn, &m, args.len()) {
+                        *e = call;
+                        return 1;
                     }
                 }
             }

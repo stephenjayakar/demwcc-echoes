@@ -269,7 +269,44 @@ pub mod harness {
         let Some(src) = &unit.source else { bail!("unit {} has no source path", unit.name) };
         let text = std::fs::read(project.root.join(src)).with_context(|| format!("reading includes of {src}"))?;
         let text = String::from_utf8_lossy(&text);
-        Ok(include_lines(&text))
+        let mut out = include_lines(&text);
+        // headers a `.inc` fragment of the file includes (its own includes are the TU's too):
+        // only their `#include` lines, from the project's include directory
+        let dir = project.root.join(src).parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        for frag in fragment_includes(&text) {
+            for base in [project.root.join("include"), dir.clone()] {
+                if let Ok(t) = std::fs::read(base.join(&frag)) {
+                    for l in include_lines(&String::from_utf8_lossy(&t)).lines() {
+                        if !out.lines().any(|o| o == l) {
+                            out.push_str(l);
+                            out.push('\n');
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `.inc` fragments a file includes (quoted names).
+    fn fragment_includes(text: &str) -> Vec<String> {
+        let mut out = vec![];
+        for line in text.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix('#') else { continue };
+            let Some(arg) = rest.trim_start().strip_prefix("include") else { continue };
+            let arg = arg.trim();
+            if let Some(r) = arg.strip_prefix('"') {
+                if let Some(e) = r.find('"') {
+                    let name = &r[..e];
+                    if name.to_ascii_lowercase().ends_with(".inc") {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Extract `#include` directives (one per line, trailing comments dropped).

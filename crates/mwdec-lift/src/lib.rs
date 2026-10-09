@@ -490,6 +490,16 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     if sig::ret_unknown(&l.sig) || matches!(l.sig.ret, mwdec_core::Type::Unknown { .. }) {
         localtypes::pointer_returns(&mut body, &mut l.vars, &mut l.ret_ty);
     }
+    // narrow parameters re-extended where used: `const` in the declaration
+    for (n, p) in l.params.clone().iter().enumerate() {
+        if l.reextended.contains(p) {
+            if let Some(d) = l.decl_params.get_mut(n) {
+                if !d.is_empty() && !d.starts_with("const ") && !d.contains('*') && !d.contains('&') {
+                    *d = format!("const {d}");
+                }
+            }
+        }
+    }
     // objects returned by value into frame objects by functions the context doesn't declare:
     // the call returns the type the object turned out to have
     let vars_now = l.vars.clone();

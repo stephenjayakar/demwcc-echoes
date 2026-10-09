@@ -293,6 +293,12 @@ fn main() -> Result<()> {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
+    // (an explicit root is the root everywhere: the TypeDb builds and other defaults follow
+    // `MWDEC_ROOT`, and so do the processes this one starts)
+    if let Some(r) = &cli.root {
+        std::env::set_var("MWDEC_ROOT", r);
+        std::env::set_var("MWDEC_PROJECT_ROOT", r);
+    }
     let root = cli.root.clone().unwrap_or_else(mwdec_mwcc::default_root);
     let work = cli.work.clone().unwrap_or_else(mwdec_mwcc::default_work);
     match cli.cmd {

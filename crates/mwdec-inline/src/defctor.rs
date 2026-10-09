@@ -1848,6 +1848,45 @@ fn stack_buffer(vars: &[mwdec_lift::Var], e: &Expr) -> Option<VarId> {
     }
 }
 
+/// The returned object built as its class's default construction (`*__return` written by
+/// exactly the probe's stores, then `return;`): `return T();`.
+pub fn default_returns(ir: &mut IrFunction, db: &TypeDb, dc: &DefCtors) -> usize {
+    let Some(rv) = ir.vars.iter().position(|v| v.kind == VarKind::StructRet) else { return 0 };
+    let cls = match strip_cv(&ir.vars[rv].ty) {
+        Type::Ptr(x) => crate::util::class_name(strip_cv(x), db),
+        _ => None,
+    };
+    let Some(cls) = cls else { return 0 };
+    let Some(want) = dc.get(&cls) else { return 0 };
+    if want.is_empty() {
+        return 0;
+    }
+    // the statements mentioning the return slot: a run right before the final `return;`
+    let Some(last) = ir.body.len().checked_sub(1) else { return 0 };
+    if !matches!(ir.body[last], Stmt::Return(None)) {
+        return 0;
+    }
+    let pick: Vec<usize> = (0..last).filter(|&i| mentions(&ir.body[i], rv)).collect();
+    if pick.is_empty() || pick.iter().zip(pick.iter().skip(1)).any(|(a, b)| b - a != 1) || *pick.last().unwrap() + 1 != last {
+        return 0;
+    }
+    if !pick.iter().all(|&i| matches!(&ir.body[i], Stmt::Assign { dst: Expr::Load { base, .. }, src } if matches!(&**base, Expr::Var(v) if *v == rv) && !src.uses_var(rv))) {
+        return 0;
+    }
+    let defs = temp_defs(&ir.body, &ir.vars);
+    let c = Canon { this: Some(rv), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
+    let run: Vec<(usize, &Stmt)> = pick.iter().map(|&i| (i, &ir.body[i])).collect();
+    let Some((stores, _)) = run_stores(&c, &run, &ir.vars) else { return 0 };
+    if !(same_stores(want, &stores) || same_stores(&forward_stores(want), &stores)) {
+        return 0;
+    }
+    let class = Type::Named(cls);
+    let first = pick[0];
+    ir.body.drain(first..last);
+    ir.body.insert(first, Stmt::Assign { dst: Expr::Load { base: Box::new(Expr::Var(rv)), offset: 0, ty: class.clone() }, src: Expr::Construct { class, ctor: None, args: vec![] } });
+    1
+}
+
 /// An untyped stack buffer built as a class's default construction and then destroyed by that
 /// class's destructor (`T v;` the source never used), or passed to a `T&` parameter and read
 /// afterwards (`T v; f(v); ... v ...`): the named local `T v;`, its construction and

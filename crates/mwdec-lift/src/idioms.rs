@@ -895,6 +895,14 @@ fn fold_new(body: &mut Vec<Stmt>, _vars: &[Var]) {
                 {
                     Some((*t, args.iter().skip(1).cloned().collect::<Vec<_>>()))
                 }
+                // storage from another allocator (`operator new[]` with a computed size, a
+                // `void*` function) then one constructor behind its null test: the placement
+                // `new (alloc(...)) T(args)`
+                Stmt::Assign { dst: Expr::Var(t), src: c @ Expr::Call { callee: Callee::Direct { symbol, sig: cs }, .. } }
+                    if (symbol.starts_with("__nwa__") || matches!(strip_cv(&cs.ret), Type::Ptr(x) if matches!(**x, Type::Void))) && matches!(_vars[*t].kind, VarKind::Local) && matches!(b.get(i + 1), Some(Stmt::If { .. }) | Some(Stmt::Assign { .. })) =>
+                {
+                    Some((*t, vec![c.clone()]))
+                }
                 // the inline placement `operator new(size_t, void*)`: the address itself, then
                 // the constructor behind its null test (`new (&storage) T(args)`)
                 Stmt::Assign { dst: Expr::Var(t), src: a @ (Expr::AddrOf(_) | Expr::Cast { .. } | Expr::Binary { .. }) } if !a.has_call() && matches!(_vars[*t].kind, VarKind::Local) && matches!(b.get(i + 1), Some(Stmt::If { .. })) => {

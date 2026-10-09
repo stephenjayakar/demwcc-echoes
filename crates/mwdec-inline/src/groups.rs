@@ -86,6 +86,12 @@ fn try_copy(b: &[Stmt], start: usize, end: usize, stores: &[CStore], env: &Env) 
             if out_of_line_assign(&cls, env) {
                 continue;
             }
+            // (nor one whose inline assignment is no member-wise copy, `rc_ptr` / `single_ptr`,
+            // copied into a member of the method's own object outside a constructor)
+            let own_member = matches!(&anchor.addr, Expr::Var(v) if matches!(env.vars[*v].kind, mwdec_lift::ir::VarKind::This));
+            if own_member && !IN_CTOR.with(|c| c.get()) && mwdec_lift::aggregates::transfers_on_assign(env.db, &Type::Named(cls.clone())) {
+                continue;
+            }
             // already member-wise float copies of a small class are handled by the lifter
             let Some((_, dlv)) = object_at(&anchor.addr, lo, &cls, env) else { continue };
             let Some((_, slv)) = object_at(&sp, lo + dsrc, &cls, env) else { continue };
@@ -120,6 +126,32 @@ fn try_copy(b: &[Stmt], start: usize, end: usize, stores: &[CStore], env: &Env) 
         }
     }
     None
+}
+
+thread_local! {
+    /// Whether the function being folded is a constructor (its members are under construction).
+    static IN_CTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An lvalue that is a member of the method's own object (`this->m`, at any depth), written
+/// outside a constructor: an assignment to an existing object.
+pub fn own_member_assigned(lv: &Expr, env: &Env) -> bool {
+    fn root(e: &Expr) -> Option<&Expr> {
+        match e {
+            Expr::Load { base, .. } | Expr::Member { base, .. } => match &**base {
+                b @ Expr::Var(_) => Some(b),
+                b => root(b),
+            },
+            Expr::AddrOf(x) | Expr::Cast { e: x, .. } => root(x),
+            _ => None,
+        }
+    }
+    !IN_CTOR.with(|c| c.get()) && matches!(root(lv), Some(Expr::Var(v)) if matches!(env.vars[*v].kind, mwdec_lift::ir::VarKind::This))
+}
+
+/// Set for the function about to be folded (see `IN_CTOR`).
+pub fn set_in_ctor(v: bool) {
+    IN_CTOR.with(|c| c.set(v));
 }
 
 /// Does `cls` declare a copy assignment defined out of line?
@@ -298,7 +330,13 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
         let min_off = comps.iter().map(|c| c.off).min()?;
         let max_end = comps.iter().map(|c| c.off + 4).max()?;
         let first = comps.iter().find(|c| c.off == min_off)?;
+        // (an object built into a member of the method's own object outside a constructor is
+        // assigned: no `m = T(...)` for a class whose assignment is no member-wise copy)
+        let guarded = mutate.is_none() && !IN_CTOR.with(|c| c.get()) && mwdec_lift::aggregates::transfers_on_assign(env.db, &Type::Named(cls.clone()));
         for (anchor_ix, anchor) in stores.iter().enumerate().filter(|(_, s)| scalar_compat(&s.ty, &first.ty)) {
+            if guarded && matches!(&anchor.addr, Expr::Var(v) if matches!(env.vars[*v].kind, mwdec_lift::ir::VarKind::This)) {
+                continue;
+            }
             let delta = anchor.off - first.off;
             // window: between the neighbouring stores to the anchor's own location
             let same: &[usize] = by_loc.get(&(anchor.aid, anchor.off)).map_or(&[], |v| v.as_slice());
