@@ -406,6 +406,11 @@ pub fn emitted_kind(ui: &UnitInputs, f: &Function) -> Option<String> {
 /// Sources that make the compiler emit `f` (an explicit instantiation or a use; see
 /// `mwdec_emit::instantiate`), for header inlines, template instances and implicit members.
 pub fn instantiation_drafts(ui: &UnitInputs, f: &Function) -> Vec<String> {
+    // (spelled for this unit's language, whatever was emitted before on this thread)
+    mwdec_emit::with_c_mode(ui.c_mode, ui.db.as_ref(), || instantiation_drafts_in(ui, f))
+}
+
+fn instantiation_drafts_in(ui: &UnitInputs, f: &Function) -> Vec<String> {
     if let Some(t) = thunk_target(&f.name) {
         return thunk_drafts(ui, t);
     }
@@ -628,7 +633,8 @@ pub fn variant_drafts(ui: &UnitInputs, f: &Function, include_implicit: bool) -> 
     // each point alone, then (few points) every pair: independent source properties often
     // only match together
     let mut sets: Vec<Vec<&'static str>> = points.iter().map(|p| vec![*p]).collect();
-    if (2..=4).contains(&points.len()) {
+    // (MWDEC_NO_VARIANT_PAIRS: singles only, to measure what the pairs cost)
+    if (2..=4).contains(&points.len()) && std::env::var_os("MWDEC_NO_VARIANT_PAIRS").is_none() {
         for i in 0..points.len() {
             for j in i + 1..points.len() {
                 sets.push(vec![points[i], points[j]]);
@@ -1105,6 +1111,17 @@ pub fn cmd_eval(root: &Path, work: &Path, a: EvalArgs) -> Result<()> {
                     row.implicit = d.implicit.clone();
                     row.drafted = d.src.is_some() || !d.alts.is_empty();
                     row.draft_hash = Some(draft_hash(&d));
+                    // (`MWDEC_DRAFTS_DUMP=<dir>`: every draft text of the reply, to diff two runs)
+                    if let Some(dir) = std::env::var_os("MWDEC_DRAFTS_DUMP") {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let mut parts: Vec<(String, String)> = vec![("status".into(), d.status.clone()), ("src".into(), d.src.clone().unwrap_or_default())];
+                        parts.extend(d.plain.iter().map(|v| ("plain".to_string(), v.clone())));
+                        parts.extend(d.raw.iter().map(|v| ("raw".to_string(), v.clone())));
+                        parts.extend(d.alts.iter().enumerate().map(|(i, v)| (format!("alt {i}"), v.clone())));
+                        parts.extend(d.variants.iter().enumerate().map(|(i, v)| (format!("variant {i}"), v.clone())));
+                        let text: String = parts.iter().map(|(k, v)| format!("// --- {k}\n{v}\n")).collect();
+                        let _ = std::fs::write(Path::new(&dir).join(format!("{}__{}.cpp", sanitize(&e.unit), sanitize(&e.symbol))), text);
+                    }
                     row.wrong_meaning = d.src.as_deref().is_some_and(|s| s.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP));
                     row.seconds = t.elapsed().as_secs_f64();
                     let mut f = out_file.lock().unwrap();

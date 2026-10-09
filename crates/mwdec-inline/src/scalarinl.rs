@@ -366,12 +366,58 @@ fn quantized_casts(e: &mut Expr, lib: &InlineLib, env: &Env) -> usize {
     n
 }
 
+/// Helpers whose value is a conversion of a call (`float cosf(float x) { return (float)cos(x); }`):
+/// the matcher's scalar index leaves cast-rooted patterns out (a bare conversion is too common),
+/// but one around a call is specific.
+fn cast_calls(e: &mut Expr, lib: &InlineLib, env: &Env) -> usize {
+    let cands: Vec<usize> = lib
+        .templates
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.holes.iter().all(|h| matches!(h, HoleKind::Scalar(_)))
+                && matches!(&t.shape, Shape::Scalar(Expr::Cast { e, .. }) if e.has_call())
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if cands.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    e.rewrite(&mut |x| {
+        if !matches!(x, Expr::Cast { .. }) || !x.has_call() {
+            return;
+        }
+        for &ti in &cands {
+            let t = &lib.templates[ti];
+            let Shape::Scalar(p) = &t.shape else { continue };
+            let mut m = crate::matcher::M::new(env, t);
+            if !m.m(p, x) {
+                continue;
+            }
+            let Some((args, _)) = m.finalize(0) else { continue };
+            *x = call_of(lib, ti, args);
+            n += 1;
+            return;
+        }
+    });
+    n
+}
+
+/// The conversion-of-a-call helpers over `body` (same code either way, so not a variant).
+pub fn conversions(body: &mut [Stmt], env: &Env) -> usize {
+    let mut n = 0;
+    Stmt::rewrite_exprs(body, &mut |e| n += cast_calls(e, env.lib, env));
+    n
+}
+
 /// All the rewrites over `body`; returns how many applied.
 pub fn rewrite(body: &mut Vec<Stmt>, env: &Env, idx: &Index) -> usize {
     let sm = shift_mask_templates(env.lib);
     let mut n = 0;
     Stmt::rewrite_exprs(body, &mut |e| n += shift_masks(e, &sm, env.lib));
     Stmt::rewrite_exprs(body, &mut |e| n += quantized_casts(e, env.lib, env));
+    Stmt::rewrite_exprs(body, &mut |e| n += cast_calls(e, env.lib, env));
     Stmt::for_each_block_mut(body, &mut |b| n += if_chains(b, env, idx));
     fn top(b: &mut Vec<Stmt>, env: &Env, idx: &Index, n: &mut usize) {
         for s in b.iter_mut() {

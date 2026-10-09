@@ -295,3 +295,69 @@ pub fn reference_members(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
     });
     n
 }
+
+/// Variant point [`crate::variants::LOCALS_NARROW_BY_DEFS`]: an `int` local every write of which
+/// is a narrowing cast to one small type (`v = (u8)(v | x)`) or a constant of that type, with at
+/// least one cast, is a local of that type (`u8 v; v |= x;`: the compiler's `clrlwi` into the
+/// variable's register). Its writes lose the casts; returns the retyped locals (their updates
+/// from themselves are written as compound assignments).
+pub fn narrow_by_defs(body: &mut Vec<Stmt>, vars: &mut [Var]) -> Vec<VarId> {
+    use mwdec_core::Type;
+    let n = vars.len();
+    let mut ty: Vec<Option<Type>> = vec![None; n];
+    let mut bad = vec![false; n];
+    let mut casts = vec![0usize; n];
+    let mut consts: Vec<Vec<i64>> = vec![vec![]; n];
+    let fits = |c: i64, t: &Type| match t {
+        Type::Int { size: 1, signed: false } => (0..=0xff).contains(&c),
+        Type::Int { size: 2, signed: false } => (0..=0xffff).contains(&c),
+        Type::Int { size: 1, signed: true } => (-0x80..=0x7f).contains(&c),
+        Type::Int { size: 2, signed: true } => (-0x8000..=0x7fff).contains(&c),
+        _ => false,
+    };
+    {
+        let mut snap = body.clone();
+        Stmt::for_each_block_mut(&mut snap, &mut |b| {
+            for s in b.iter() {
+                let Stmt::Assign { dst: Expr::Var(v), src } = s else { continue };
+                let v = *v;
+                if !matches!(vars[v].kind, VarKind::Local) || !matches!(strip_cv(&vars[v].ty), Type::Int { size: 4, .. } | Type::Unknown { size: 4 }) {
+                    bad[v] = true;
+                    continue;
+                }
+                match src {
+                    Expr::Int { value, .. } => consts[v].push(*value),
+                    Expr::Cast { ty: ct, e } if matches!(strip_cv(ct), Type::Int { size: 1 | 2, .. }) && !matches!(**e, Expr::Int { .. }) => {
+                        let t = strip_cv(ct).clone();
+                        casts[v] += 1;
+                        match &ty[v] {
+                            None => ty[v] = Some(t),
+                            Some(c) if *c == t => {}
+                            Some(_) => bad[v] = true,
+                        }
+                    }
+                    _ => bad[v] = true,
+                }
+            }
+        });
+    }
+    let chosen: Vec<VarId> = (0..n).filter(|&v| matches!(&ty[v], Some(t) if !bad[v] && casts[v] > 0 && consts[v].iter().all(|&c| fits(c, t)))).collect();
+    if chosen.is_empty() || !crate::variants::alt(crate::variants::LOCALS_NARROW_BY_DEFS) {
+        return vec![];
+    }
+    Stmt::for_each_block_mut(body, &mut |b| {
+        for s in b.iter_mut() {
+            if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+                if chosen.contains(v) {
+                    if let Expr::Cast { e, .. } = src {
+                        *src = (**e).clone();
+                    }
+                }
+            }
+        }
+    });
+    for &v in &chosen {
+        vars[v].ty = ty[v].clone().unwrap();
+    }
+    chosen
+}

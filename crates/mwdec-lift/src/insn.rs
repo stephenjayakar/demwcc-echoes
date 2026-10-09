@@ -451,6 +451,7 @@ pub fn defs_uses(i: &Insn) -> (Vec<Reg>, Vec<Reg>) {
         Mtfsf => u.push(fpr(ins.field_frb())),
         Mtfsb0 | Mtfsb1 | Mtfsfi => {}
         // special registers
+        Mftb => push_g(&mut d, i.rd()),
         Mfspr => {
             push_g(&mut d, i.rd());
             match ins.field_spr() {

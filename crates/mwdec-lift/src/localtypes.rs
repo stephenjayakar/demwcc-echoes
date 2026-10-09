@@ -944,3 +944,70 @@ fn direct_kids(e: &Expr) -> Vec<&Expr> {
     }
     v
 }
+
+/// A float local's bits read as a word only to be stored as a word (`t = f.@0; *(p + 4) = t;`: an
+/// object of floats built in the frame and copied through integer registers) is a float copy:
+/// the store takes the float (`*(float*)(p + 4) = f`), so the object built from those stores gets
+/// float members instead of converted integers.
+pub fn float_word_copies(body: &mut Vec<Stmt>, vars: &[Var]) {
+    let is_bits = |e: &Expr| -> Option<VarId> {
+        match e {
+            Expr::Member { base, offset: 0, ty } if matches!(strip_cv(ty), Type::Int { size: 4, .. } | Type::Unknown { size: 4 }) => match &**base {
+                Expr::Var(v) if matches!(strip_cv(&vars[*v].ty), Type::Float { size: 4 }) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let word_store = |d: &Expr| matches!(d, Expr::Load { ty, .. } | Expr::Member { ty, .. } if matches!(strip_cv(ty), Type::Int { size: 4, .. } | Type::Unknown { size: 4 }));
+    let mut uses = HashMap::new();
+    crate::inline::count_uses(body, &mut uses);
+    // temps holding the bits, read once
+    let mut temps: HashMap<VarId, VarId> = HashMap::new();
+    {
+        let mut snap = body.clone();
+        let mut defs: HashMap<VarId, usize> = HashMap::new();
+        Stmt::for_each_block_mut(&mut snap, &mut |b| {
+            for s in b.iter() {
+                if let Stmt::Assign { dst: Expr::Var(t), src } = s {
+                    *defs.entry(*t).or_default() += 1;
+                    if let Some(f) = is_bits(src) {
+                        temps.insert(*t, f);
+                    }
+                }
+            }
+        });
+        temps.retain(|t, _| defs.get(t) == Some(&1) && uses.get(t) == Some(&1) && matches!(vars[*t].kind, VarKind::Local));
+    }
+    // only temps whose one read is such a store
+    let mut stored: std::collections::HashSet<VarId> = Default::default();
+    let mut snap = body.clone();
+    Stmt::for_each_block_mut(&mut snap, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Assign { dst, src: Expr::Var(t) } = s {
+                if temps.contains_key(t) && word_store(dst) {
+                    stored.insert(*t);
+                }
+            }
+        }
+    });
+    temps.retain(|t, _| stored.contains(t));
+    Stmt::for_each_block_mut(body, &mut |b| {
+        b.retain(|s| !matches!(s, Stmt::Assign { dst: Expr::Var(t), .. } if temps.contains_key(t)));
+        for s in b.iter_mut() {
+            let Stmt::Assign { dst, src } = s else { continue };
+            if !word_store(dst) {
+                continue;
+            }
+            let f = match &*src {
+                Expr::Var(t) => temps.get(t).copied(),
+                e => is_bits(e),
+            };
+            let Some(f) = f else { continue };
+            *src = Expr::Var(f);
+            if let Expr::Load { ty, .. } | Expr::Member { ty, .. } = dst {
+                *ty = Type::Float { size: 4 };
+            }
+        }
+    });
+}

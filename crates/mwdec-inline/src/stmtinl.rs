@@ -433,6 +433,7 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     let env = Env { db, vars: &vars, defs: &defs, lib, objects: &idx.objects };
     let mut n = forward_calls(&mut ir.body, &env);
     n += negated_predicates(&mut ir.body, &env);
+    n += crate::scalarinl::conversions(&mut ir.body, &env);
     let on = CONTAINER_LOCALS.with(|c| c.get());
     // scalar helpers in folded / reoriented forms (`scalarinl`): counted, applied in the variant
     {

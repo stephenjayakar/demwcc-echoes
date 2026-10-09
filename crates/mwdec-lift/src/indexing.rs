@@ -199,27 +199,77 @@ pub fn raw_index(body: &mut [Stmt], vars: &[Var]) {
 /// In `for (i = 0; i < n; i++)`: an offset variable `v = 0; ... v = v + K;` advancing in lockstep
 /// with `i` is `i * K` (strength reduction undone).
 pub fn undo_strength_reduction(body: &mut Vec<Stmt>, vars: &[Var]) {
-    Stmt::for_each_block_mut(body, &mut |b| {
+    // (one offset per pass: a loop may step several, the counter's old copy among them)
+    for _ in 0..4 {
+        let mut changed = false;
+        Stmt::for_each_block_mut(body, &mut |b| changed |= undo_one(b, vars));
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn undo_one(b: &mut Vec<Stmt>, vars: &[Var]) -> bool {
+    {
         for k in 0..b.len() {
             let Stmt::For { init, step, body: lb, .. } = &b[k] else { continue };
             let i = match (init.as_slice(), step.as_slice()) {
-                ([Stmt::Assign { dst: Expr::Var(i), src }], [Stmt::Expr(Expr::IncDec { e, delta: 1, .. })]) if src.as_int() == Some(0) && matches!(**e, Expr::Var(x) if x == *i) => *i,
+                ([Stmt::Assign { dst: Expr::Var(i), src }], [st]) if src.as_int() == Some(0) && is_inc(st, *i) => *i,
+                // (the counter set to 0 before the loop)
+                ([], [st @ (Stmt::Assign { dst: Expr::Var(_), .. } | Stmt::Expr(_))]) => {
+                    let i = match st {
+                        Stmt::Assign { dst: Expr::Var(i), .. } => *i,
+                        Stmt::Expr(Expr::IncDec { e, .. }) => match &**e {
+                            Expr::Var(i) => *i,
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    let zero = b[..k].iter().rposition(|s| crate::idioms::stmt_mentions(s, i)).is_some_and(|z| matches!(&b[z], Stmt::Assign { dst: Expr::Var(x), src } if *x == i && src.as_int() == Some(0)));
+                    if !is_inc(st, i) || !zero {
+                        continue;
+                    }
+                    i
+                }
                 _ => continue,
             };
-            // candidate: last statement of the body (or of the trailing arm) `v = v + K`
-            let mut found: Option<(VarId, i64)> = None;
-            fn last_inc(b: &[Stmt]) -> Option<(VarId, i64)> {
-                match b.last()? {
-                    Stmt::Assign { dst: Expr::Var(v), src: Expr::Binary { op: BinOp::Add, l, r, .. } } if matches!(**l, Expr::Var(x) if x == *v) => r.as_int().map(|k| (*v, k)),
-                    Stmt::If { els, then, .. } => last_inc(els).or_else(|| last_inc(then)),
+            // candidates: the trailing steps of the body (or of its trailing arm) `v = v + K`
+            fn step_of(s: &Stmt) -> Option<(VarId, i64)> {
+                match s {
+                    Stmt::Assign { dst: Expr::Var(v), src } => match uncast(src) {
+                        Expr::Binary { op: BinOp::Add, l, r, .. } if matches!(uncast(l), Expr::Var(x) if x == v) => r.as_int().map(|k| (*v, k)),
+                        _ => None,
+                    },
                     _ => None,
                 }
             }
-            if let Some((v, kk)) = last_inc(lb) {
-                if vars[v].kind == VarKind::Local && !is_ptr(&vars[v].ty) {
-                    found = Some((v, kk));
+            fn trailing_steps(b: &[Stmt], out: &mut Vec<(VarId, i64)>) {
+                let real: Vec<&Stmt> = b.iter().filter(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))).collect();
+                for s in real.iter().rev() {
+                    match step_of(s) {
+                        Some(c) => out.push(c),
+                        None => {
+                            if out.is_empty() {
+                                if let Stmt::If { then, els, .. } = s {
+                                    trailing_steps(els, out);
+                                    if out.is_empty() {
+                                        trailing_steps(then, out);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    }
                 }
             }
+            let mut cands = vec![];
+            trailing_steps(lb, &mut cands);
+            let found = cands.into_iter().find(|&(v, _)| {
+                v != i
+                    && vars[v].kind == VarKind::Local
+                    && !is_ptr(&vars[v].ty)
+                    && b[..k].iter().any(|s| matches!(s, Stmt::Assign { dst: Expr::Var(x), src } if *x == v && src.as_int() == Some(0)))
+            });
             let Some((v, kk)) = found else { continue };
             // init `v = 0` earlier in this list, v not used after the loop
             let Some(ini) = b[..k].iter().rposition(|s| matches!(s, Stmt::Assign { dst: Expr::Var(x), src } if *x == v && src.as_int() == Some(0))) else { continue };
@@ -253,12 +303,13 @@ pub fn undo_strength_reduction(body: &mut Vec<Stmt>, vars: &[Var]) {
             let repl = if kk == 1 { Expr::Var(i) } else { Expr::bin(BinOp::Mul, Expr::Var(i), Expr::int(kk), t_s32()) };
             if let Stmt::For { body: lb, .. } = &mut b[k] {
                 fn drop_inc(b: &mut Vec<Stmt>, v: VarId) -> bool {
-                    match b.last_mut() {
-                        Some(Stmt::Assign { dst: Expr::Var(x), .. }) if *x == v => {
-                            b.pop();
-                            true
-                        }
-                        Some(Stmt::If { then, els, .. }) => drop_inc(els, v) || drop_inc(then, v),
+                    if let Some(at) = b.iter().rposition(|s| matches!(s, Stmt::Assign { dst: Expr::Var(x), .. } if *x == v)) {
+                        b.remove(at);
+                        return true;
+                    }
+                    let Some(at) = b.iter().rposition(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_))) else { return false };
+                    match &mut b[at] {
+                        Stmt::If { then, els, .. } => drop_inc(els, v) || drop_inc(then, v),
                         _ => false,
                     }
                 }
@@ -270,9 +321,10 @@ pub fn undo_strength_reduction(body: &mut Vec<Stmt>, vars: &[Var]) {
                 });
             }
             b.remove(ini);
-            break;
+            return true;
         }
-    });
+    }
+    false
 }
 
 /// `p = p + K` (through casts, or `&*(p + K)`): K.

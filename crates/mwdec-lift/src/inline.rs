@@ -461,6 +461,14 @@ pub fn inline_list(items: &mut Vec<Stmt>, uses: &mut HashMap<VarId, usize>, is_t
                     }
                 }
             }
+            // variant point [`crate::variants::FLOAT_UNFUSED_PRODUCTS`]: a float product the compiler
+            // didn't fuse into the add or subtract reading it (separate
+            // fmuls / fadds): computed into a local of its own in the source (an expression fuses)
+            // (a variant: products inside inline expansions are unfused too, and the folds need
+            // them in their expressions)
+            if ok && unfused_product(&src, &items[j], t, vars) && crate::variants::alt(crate::variants::FLOAT_UNFUSED_PRODUCTS) {
+                ok = false;
+            }
             let mut move_after: Vec<usize> = vec![];
             if ok && fx.calls {
                 // temps the use doesn't read keep their place after the call too (`t = f(); p =
@@ -563,4 +571,27 @@ fn collect_calls(e: &Expr, out: &mut Vec<Expr>) {
         }
         _ => {}
     }
+}
+
+/// `t = a * b` (float) read as an operand of a float `+` / `-` in `s`.
+fn unfused_product(src: &Expr, s: &Stmt, t: VarId, vars: &[Var]) -> bool {
+    let is_float = |e: &Expr| matches!(crate::types::ty_of(e, vars), mwdec_core::Type::Float { .. });
+    let mut x = src;
+    while let Expr::Cast { e, .. } = x {
+        x = e;
+    }
+    if !matches!(x, Expr::Binary { op: BinOp::Mul, .. }) || !is_float(x) {
+        return false;
+    }
+    let mut found = false;
+    for e in stmt_exprs(s) {
+        e.walk(&mut |y| {
+            if let Expr::Binary { op: BinOp::Add | BinOp::Sub, l, r, .. } = y {
+                if is_float(y) && (matches!(**l, Expr::Var(v) if v == t) || matches!(**r, Expr::Var(v) if v == t)) {
+                    found = true;
+                }
+            }
+        });
+    }
+    found
 }

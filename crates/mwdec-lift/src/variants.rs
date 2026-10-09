@@ -39,6 +39,9 @@ pub const STRUCTCOPY_RETURN_WHOLE: &str = "structcopy.return_whole";
 /// Values read from memory once and kept in a local read again at every use (MWCC CSEs the reads).
 /// (named to sort after the other points: the driver tries the first `MAX_VARIANT_POINTS` asked)
 pub const REREAD_TEMPS: &str = "temps.reread";
+/// An address computed before a branch and used only in its arms spelled again at each use
+/// (by default it is a local assigned before the branch).
+pub const ARMS_ADDRESS_INLINE: &str = "temps.arms_address_inline";
 /// Runs of one constant stored to consecutive array elements (`a[0] = 1; a[1] = 1;`, MWCC's full
 /// unroll of a small constant loop) rerolled into `for (i = 0; i < n; i++) a[i] = 1;`.
 pub const REROLL_CONST_STORES: &str = "unroll.const_stores";
@@ -75,6 +78,18 @@ pub const BOOL_CONST_LOCAL: &str = "bool.const_local";
 /// Temps read from memory just before a loop and used once inside it are read there (the
 /// compiler hoisted the loop-invariant reads: `i < v.size()`, `a[i].id == id`).
 pub const LOOP_INVARIANT_READS: &str = "loop.invariant_reads";
+
+/// A float product read by an add or subtract that the compiler didn't fuse (separate fmuls /
+/// fadds) stays a local of its own.
+pub const FLOAT_UNFUSED_PRODUCTS: &str = "float.unfused_products";
+
+/// A narrow (char / short) destination updated from itself is written as a compound assignment
+/// (`v |= x`, not `v = (u8)(v | x)`).
+pub const ASSIGN_COMPOUND_NARROW: &str = "assign.compound_narrow";
+
+/// Int locals written only narrowed to one small type (or small constants) take that type, their
+/// self-updates written as compound assignments.
+pub const LOCALS_NARROW_BY_DEFS: &str = "locals.narrow_by_defs";
 
 /// GC/1.2.5n: draft locals in volatile registers holding a global read are folded into their
 /// single use when the target's frame shows no scalar-local slots (`mwdec_lift::sdkframe`).
@@ -119,6 +134,12 @@ pub const EXPR_BYTE_FIELDS: &str = "expr.byte_fields";
 /// Externs the function only reads (scalars) are declared `const`.
 pub const CONST_READ_ONLY_EXTERNS: &str = "types.const_read_only_externs";
 
+/// `k & ~(c ? -1 : 0)` written as the select `c ? 0 : k`.
+pub const EXPR_MASK_SELECT: &str = "expr.mask_select";
+
+/// Read-only pointer parameters of a function without a prototype declared pointer-to-const.
+pub const PARAM_CONST_POINTERS: &str = "param.const_pointers";
+
 /// Registered decision points: (name, what the alternative does).
 pub const POINTS: &[(&str, &str)] = &[
     (EXPLICIT_DEFAULT_ARGS, "trailing arguments equal to their declared defaults are passed explicitly"),
@@ -128,6 +149,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (REROLL_CONST_STORES, "runs of one constant stored to consecutive array elements become a for loop"),
     (REROLL_CONST_STORES_EARLY, "the same, the loop moved before the constant stores right before it"),
     (REREAD_TEMPS, "single-assignment locals of pure memory reads are re-read where they are used"),
+    (ARMS_ADDRESS_INLINE, "an address computed before a branch and read only in its arms is spelled at each use"),
     (STRUCTCOPY_WORDS_LL, "a run of word copies between two objects becomes 64-bit copies (one per word pair)"),
     (STRUCTCOPY_WORDS_BLOCK, "a run of word copies between two objects becomes one block copy (helper struct)"),
     (STRUCTCOPY_RETURN_WHOLE, "a returned object filled from one object behind flag checks becomes `return x;`"),
@@ -144,11 +166,16 @@ pub const POINTS: &[(&str, &str)] = &[
     (INCDEC_STEP_AFTER, "a step after a read the next statement uses is a statement after it, not a post-increment"),
     (EXPR_BYTE_FIELDS, "byte/halfword fields packed into a word are narrowing conversions, not masks"),
     (CONST_READ_ONLY_EXTERNS, "scalar externs the function only reads are declared const"),
+    (EXPR_MASK_SELECT, "a value masked by a 0/-1 select is a select between the value and zero"),
+    (PARAM_CONST_POINTERS, "parameters only loaded through are declared pointer-to-const (their loads ignore stores)"),
     (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),
     (ORDER_SPLIT_LAST_FIELD, "a packed word built from field inserts gets its last field in a statement of its own"),
     (BOOL_CONST_LOCAL, "bool locals defined once are const (re-extended at their uses)"),
     (LOOP_INVARIANT_READS, "temps read before a loop and used once inside it are read in the loop"),
+    (FLOAT_UNFUSED_PRODUCTS, "float products the compiler did not fuse into an add stay locals"),
+    (ASSIGN_COMPOUND_NARROW, "narrow destinations updated from themselves use compound assignment"),
+    (LOCALS_NARROW_BY_DEFS, "int locals written only narrowed take the narrow type"),
     (SRET_CLASS_BY_LAYOUT, "an unnamed struct return takes the one context class whose layout and constructor fit its stores"),
 ];
 

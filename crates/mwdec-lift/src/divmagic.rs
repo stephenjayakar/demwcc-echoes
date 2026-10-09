@@ -288,6 +288,8 @@ pub fn fold(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
         Stmt::rewrite_exprs(body, &mut |e| {
             if let Some(n) = rem_pow2(e, &c, vars) {
                 *e = n;
+            } else if let Some(n) = half(e, &c, vars) {
+                *e = n;
             }
         });
     }
@@ -339,4 +341,25 @@ pub fn fold(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &[bool]) {
             break;
         }
     }
+}
+
+/// Signed halving: `(x + ((u32)x >> 31)) >> 1` (arithmetic) is `x / 2` (`srwi 31; add; srawi 1`).
+fn half(e: &Expr, c: &Ctx, vars: &[Var]) -> Option<Expr> {
+    let Expr::Binary { op: BinOp::Shr, l, r, .. } = e else { return None };
+    if r.as_int() != Some(1) || is_signed(&types::ty_of(l, vars)) != Some(true) {
+        return None;
+    }
+    let Expr::Binary { op: BinOp::Add, l: a, r: b, .. } = c.res(l) else { return None };
+    let sign_of = |t: &Expr| -> Option<Expr> {
+        match c.res(t) {
+            Expr::Binary { op: BinOp::Shr, l: x, r: k, .. } if k.as_int() == Some(31) && is_signed(&types::ty_of(x, vars)) != Some(true) => Some((**x).clone()),
+            _ => None,
+        }
+    };
+    let x = match (sign_of(a), sign_of(b)) {
+        (Some(x), _) if same(c, &x, b) => (**b).clone(),
+        (_, Some(x)) if same(c, &x, a) => (**a).clone(),
+        _ => return None,
+    };
+    Some(Expr::bin(BinOp::Div, Expr::cast(t_s32(), strip_any(&x).clone()), Expr::int(2), t_s32()))
 }

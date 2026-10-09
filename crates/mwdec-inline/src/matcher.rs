@@ -685,6 +685,17 @@ thread_local! {
     static CLASS_AT: std::cell::RefCell<(usize, HashMap<(String, i32, String), bool>)> = std::cell::RefCell::new((0, HashMap::new()));
 }
 
+/// Forget the [`class_at_pub`] memo. Its key is the TypeDb's address, which a later unit's
+/// TypeDb can reuse once the earlier one is dropped: a stale answer then made the same function
+/// fold differently depending on which units were drafted before it in the process.
+pub fn reset_memos() {
+    CLASS_AT.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 = 0;
+        c.1.clear();
+    });
+}
+
 pub fn class_at_pub(db: &TypeDb, outer: &str, off: i32, cls: &str) -> bool {
     let id = db as *const TypeDb as usize;
     let key = (outer.to_string(), off, cls.to_string());
@@ -1021,6 +1032,8 @@ pub fn index(lib: &InlineLib) -> Index {
 }
 
 pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
+    // (per function: memos keyed by a TypeDb's address must not outlive it)
+    reset_memos();
     TARGET_DEAD.with(|d| *d.borrow_mut() = ir.dead_stores.iter().map(|x| (x.size, x.value.clone())).collect());
     LITERALS.with(|d| *d.borrow_mut() = ir.literal_bytes.iter().cloned().collect());
     let n = apply_inner(ir, lib, db);

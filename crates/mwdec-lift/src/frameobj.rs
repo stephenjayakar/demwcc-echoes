@@ -457,3 +457,68 @@ pub fn copyable(db: &mwdec_core::TypeDb, t: &Type) -> bool {
     };
     !db.decls.get(&key).is_some_and(|ds| ds.iter().filter(copy_ctor).any(|d| d.access != mwdec_core::Access::Public))
 }
+
+/// A frame object declared as a class with an inline default constructor whose initializer list
+/// sets members to constants (`reserved_vector() : mCount(0) {}`): the constant member stores
+/// before its first use are that construction, implicit in the declaration.
+pub fn drop_default_construction_stores(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let Some(db) = db else { return };
+    let vars = ir.vars.clone();
+    for (v, var) in vars.iter().enumerate() {
+        if !matches!(var.kind, VarKind::Stack { .. }) {
+            continue;
+        }
+        let Some(cls) = named(&var.ty).map(|s| s.to_string()) else { continue };
+        let Some(c) = crate::sig::find_class(db, &cls) else { continue };
+        let base = strip_template_args(&cls);
+        let last = crate::sig::split_scope(&base).1.to_string();
+        let Some(init) = db.decls.get(&format!("{base}::{last}")).and_then(|ds| ds.iter().find(|d| d.params.is_empty() && d.is_inline_defined).and_then(|d| d.init_list.clone())) else { continue };
+        // member offset -> constant literal
+        let mut consts: Vec<(i32, String)> = vec![];
+        for part in crate::sig::split_top(&init, ',') {
+            let toks: Vec<&str> = part.split_whitespace().collect();
+            if toks.len() < 4 || toks[1] != "(" || toks.last() != Some(&")") {
+                continue;
+            }
+            if let Some(f) = c.fields.iter().find(|f| f.name == toks[0]) {
+                consts.push((f.offset as i32, toks[2..toks.len() - 1].join(" ")));
+            }
+        }
+        if consts.is_empty() {
+            continue;
+        }
+        // the leading statements of the top-level body that mention v
+        let mut k = 0;
+        while k < ir.body.len() {
+            let mut mentions = false;
+            Stmt::walk_exprs(std::slice::from_ref(&ir.body[k]), &mut |e| {
+                if matches!(e, Expr::Var(w) if *w == v) {
+                    mentions = true;
+                }
+            });
+            if !mentions {
+                k += 1;
+                continue;
+            }
+            let is_ctor_store = match &ir.body[k] {
+                Stmt::Assign { dst: Expr::Member { base, offset, .. }, src } if matches!(**base, Expr::Var(w) if w == v) => {
+                    consts.iter().any(|(o, lit)| o == offset && literal_value_is(lit, src))
+                }
+                _ => false,
+            };
+            if !is_ctor_store {
+                break;
+            }
+            ir.body.remove(k);
+        }
+    }
+}
+
+fn literal_value_is(lit: &str, e: &Expr) -> bool {
+    let t: String = lit.split_whitespace().collect();
+    match e {
+        Expr::Int { value, .. } => t.parse::<i64>().ok() == Some(*value) || (t == "false" && *value == 0) || (t == "true" && *value == 1) || ((t == "nullptr" || t == "NULL") && *value == 0),
+        Expr::Float { bits, double } => t.trim_end_matches(|c| c == 'f' || c == 'F').parse::<f64>().ok().is_some_and(|x| if *double { x.to_bits() == *bits } else { (x as f32).to_bits() as u64 == *bits }),
+        _ => false,
+    }
+}

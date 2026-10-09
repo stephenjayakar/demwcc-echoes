@@ -122,3 +122,41 @@ pub fn const_read_only_externs(body: &mut Vec<Stmt>, globals: &mut BTreeMap<Stri
         }
     });
 }
+
+/// `k & ~(c ? -1 : 0)` is `c ? 0 : k`, `k & (c ? -1 : 0)` is `c ? k : 0` (the compiler's
+/// branchless select of a value or zero; variant [`crate::variants::EXPR_MASK_SELECT`]).
+fn mask_select(e: &Expr) -> Option<Expr> {
+    let Expr::Binary { op: BinOp::And, l, r, ty } = e else { return None };
+    let all_ones = |t: &Expr| t.as_int() == Some(-1) || t.as_int().is_some_and(|v| v as u32 == u32::MAX);
+    let sel = |m: &Expr| -> Option<(Expr, bool)> {
+        let (neg, m) = match m {
+            Expr::Unary { op: UnOp::BitNot, e, .. } => (true, &**e),
+            m => (false, m),
+        };
+        match m {
+            Expr::Ternary { c, t, f, .. } if all_ones(t) && f.as_int() == Some(0) => Some(((**c).clone(), neg)),
+            _ => None,
+        }
+    };
+    for (k, m) in [(l, r), (r, l)] {
+        if let Some((c, neg)) = sel(m) {
+            let zero = Expr::Int { value: 0, ty: ty.clone() };
+            let (t, f) = if neg { (zero, (**k).clone()) } else { ((**k).clone(), zero) };
+            return Some(Expr::Ternary { c: Box::new(c), t: Box::new(t), f: Box::new(f), ty: ty.clone() });
+        }
+    }
+    None
+}
+
+pub fn mask_selects(body: &mut Vec<Stmt>) {
+    let mut any = false;
+    Stmt::walk_exprs(body, &mut |e| any |= mask_select(e).is_some());
+    if !any || !crate::variants::alt(crate::variants::EXPR_MASK_SELECT) {
+        return;
+    }
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if let Some(n) = mask_select(e) {
+            *e = n;
+        }
+    });
+}

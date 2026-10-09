@@ -26,11 +26,14 @@ impl<'a> UnitProver<'a> {
             db.is_some_and(|d| mwdec_lift::sig::find_class(d, s).is_some())
                 || mwdec_lift::sig::split_scope(s).1.chars().next().is_some_and(|c| !c.is_ascii_lowercase())
         };
-        let sources = if mwdec_lift::sig::demangle(symbol).is_none() {
-            mwdec_emit::instantiate::triggers_c(&sig)
-        } else {
-            mwdec_emit::instantiate::triggers(symbol, Some(&sig.ret), &is_class)
-        };
+        let c_mode = self.ctx.cflags.iter().any(|f| f == "-lang=c" || f == "-lang=c99");
+        let sources = mwdec_emit::with_c_mode(c_mode, db, || {
+            if mwdec_lift::sig::demangle(symbol).is_none() {
+                mwdec_emit::instantiate::triggers_c(&sig)
+            } else {
+                mwdec_emit::instantiate::triggers(symbol, Some(&sig.ret), &is_class)
+            }
+        });
         for src in sources.iter().take(6) {
             let Ok(c) = self.mwcc.compile_in(self.ctx, src) else { continue };
             let Ok(o) = mwdec_obj::load_object_bytes("placeholder.o", &c.obj) else { continue };

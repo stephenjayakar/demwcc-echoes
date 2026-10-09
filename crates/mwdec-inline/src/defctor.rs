@@ -420,7 +420,7 @@ impl DefCache {
 
 const PROBE: &str = "__mwdec_dc";
 /// Version of the canonical form (part of the cache key).
-const VERSION: &str = "defctor v15";
+const VERSION: &str = "defctor v16";
 
 fn probe_text(spelled: &str, k: usize) -> String {
     format!("struct {PROBE}{k} {{ {spelled} m; {PROBE}{k}(); }};\n{PROBE}{k}::{PROBE}{k}() {{}}\n")
@@ -1235,6 +1235,8 @@ pub enum COp {
     Call { name: String, args: Vec<CE> },
     /// steps run when a condition holds (`if (other.m_valid) construct(m_data, other.data())`)
     If { cond: CE, then: Vec<COp> },
+    /// a run of `len` statements with this canonical text (loops: see [`Shape`])
+    Shape { text: String, len: usize },
 }
 
 /// `o` with `This(k)` shifted by `by` and the probe's source parameter bound to `bind`.
@@ -1243,6 +1245,7 @@ fn bind_op(o: &COp, by: i32, src: usize, bind: usize) -> COp {
         COp::Store(s) => COp::Store(CStore { addr: bind_ce(&s.addr, by, src, bind), size: s.size, val: bind_ce(&s.val, by, src, bind) }),
         COp::Call { name, args } => COp::Call { name: name.clone(), args: args.iter().map(|a| bind_ce(a, by, src, bind)).collect() },
         COp::If { cond, then } => COp::If { cond: bind_ce(cond, by, src, bind), then: then.iter().map(|x| bind_op(x, by, src, bind)).collect() },
+        COp::Shape { .. } => o.clone(),
     }
 }
 
@@ -1379,8 +1382,174 @@ fn ops_from_probe(ir: &IrFunction, db: &TypeDb) -> Option<Vec<COp>> {
         }
         out.push(COp::Call { name: format!("{}/{}", sig.qualified_name, sig.params.len()), args: a });
     }
-    out.extend(probe_steps(&c, &ir.body, &defs)?);
+    match probe_steps(&c, &ir.body, &defs) {
+        Some(steps) => out.extend(steps),
+        // a copy with a loop (an element-wise copy): the statements' canonical text
+        None if out.is_empty() && has_loop(&ir.body) => {
+            let this = ir.this_var?;
+            let src = ir.vars.iter().position(|v| matches!(v.kind, VarKind::Param { .. }))?;
+            let run: Vec<Stmt> = ir.body.iter().filter(|s| !matches!(s, Stmt::Return(None))).cloned().collect();
+            let mut sh = Shape { this, src, base: 0, vars: &ir.vars, names: HashMap::new() };
+            let text = sh.list(&run)?;
+            return Some(vec![COp::Shape { text, len: run.len() }]);
+        }
+        None => return None,
+    }
     (!out.is_empty()).then_some(out)
+}
+
+fn has_loop(b: &[Stmt]) -> bool {
+    b.iter().any(|s| match s {
+        Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } => true,
+        Stmt::If { then, els, .. } => has_loop(then) || has_loop(els),
+        _ => false,
+    })
+}
+
+/// Canonical text of statements, to compare a run of a function with a probe's body: addresses
+/// from `this` as offsets from `base` (`T<k>`), the source parameter's object as `P`, other
+/// locals numbered by first appearance; casts dropped, accesses by size. The same text is the
+/// same computation on the same layout.
+struct Shape<'a> {
+    this: VarId,
+    src: VarId,
+    base: i64,
+    vars: &'a [mwdec_lift::Var],
+    names: HashMap<VarId, usize>,
+}
+
+fn shape_add(b: String, k: i64) -> String {
+    match b.strip_prefix('T').and_then(|x| x.parse::<i64>().ok()) {
+        Some(t) => format!("T{}", t + k),
+        None if k == 0 => b,
+        None => format!("{b}+{k}"),
+    }
+}
+
+impl Shape<'_> {
+    fn val(&mut self, e: &Expr) -> Option<String> {
+        Some(match e {
+            Expr::Cast { e, .. } => return self.val(e),
+            Expr::Var(v) if *v == self.this => format!("T{}", -self.base),
+            Expr::Var(v) if *v == self.src => "*P".into(),
+            Expr::Var(v) => {
+                if !matches!(self.vars[*v].kind, VarKind::Local | VarKind::Stack { .. }) {
+                    return None;
+                }
+                let n = self.names.len();
+                format!("L{}", self.names.entry(*v).or_insert(n))
+            }
+            Expr::Int { value, .. } => format!("{value}"),
+            Expr::Float { bits, .. } => format!("F{bits}"),
+            Expr::Binary { op, l, r, .. } => {
+                let (a, b) = (self.val(l)?, self.val(r)?);
+                if *op == BinOp::Add {
+                    if let (true, Ok(k)) = (a.starts_with('T'), b.parse::<i64>()) {
+                        return Some(shape_add(a, k));
+                    }
+                }
+                format!("({op:?} {a} {b})")
+            }
+            Expr::Unary { op, e, .. } => format!("({op:?} {})", self.val(e)?),
+            Expr::Load { ty, .. } | Expr::Member { ty, .. } | Expr::Index { ty, .. } => format!("M{}[{}]", mwdec_lift::scalar_size(ty).unwrap_or(0), self.addr(e)?),
+            Expr::AddrOf(x) => self.addr(x)?,
+            Expr::IncDec { e, delta, post } => format!("(inc {delta} {post} {})", self.addr(e)?),
+            Expr::Call { callee, args, .. } => {
+                let mut s = match callee {
+                    Callee::Direct { sig, .. } => format!("call {}(", sig.qualified_name),
+                    Callee::Method { sig, this, .. } => format!("call {}({},", sig.qualified_name, self.val(this)?),
+                    _ => return None,
+                };
+                for a in args {
+                    s.push_str(&self.val(a)?);
+                    s.push(',');
+                }
+                s.push(')');
+                s
+            }
+            _ => return None,
+        })
+    }
+
+    fn addr(&mut self, lv: &Expr) -> Option<String> {
+        match lv {
+            Expr::Cast { e, .. } => self.addr(e),
+            Expr::Load { base, offset, .. } => {
+                let b = self.val(base)?;
+                Some(shape_add(b, *offset as i64))
+            }
+            Expr::Member { base, offset, .. } => {
+                let b = self.addr(base)?;
+                Some(shape_add(b, *offset as i64))
+            }
+            Expr::Index { base, index, ty } => Some(format!("(ix {} {} {})", self.val(base)?, self.val(index)?, mwdec_lift::scalar_size(ty).unwrap_or(0))),
+            Expr::Var(v) if *v == self.src => Some("P".into()),
+            Expr::Var(_) => Some(format!("&{}", self.val(lv)?)),
+            _ => None,
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) -> Option<String> {
+        Some(match s {
+            Stmt::Assign { dst, src } => {
+                let d = self.val(dst)?;
+                format!("{d}={};", self.val(src)?)
+            }
+            Stmt::Expr(e) => format!("{};", self.val(e)?),
+            Stmt::If { cond, then, els } => {
+                let c = self.val(cond)?;
+                let t = self.list(then)?;
+                format!("if({c}){{{t}}}else{{{}}}", self.list(els)?)
+            }
+            Stmt::While { cond, body } => {
+                let c = self.val(cond)?;
+                format!("while({c}){{{}}}", self.list(body)?)
+            }
+            Stmt::DoWhile { body, cond } => {
+                let b = self.list(body)?;
+                format!("do{{{b}}}while({});", self.val(cond)?)
+            }
+            Stmt::For { init, cond, step, body } => {
+                let i = self.list(init)?;
+                let c = self.val(cond)?;
+                let st = self.list(step)?;
+                format!("for({i};{c};{st}){{{}}}", self.list(body)?)
+            }
+            Stmt::Return(None) => String::new(),
+            Stmt::Break => "break;".into(),
+            Stmt::Continue => "continue;".into(),
+            _ => return None,
+        })
+    }
+
+    fn list(&mut self, b: &[Stmt]) -> Option<String> {
+        let mut out = String::new();
+        for s in b {
+            out.push_str(&self.stmt(s)?);
+        }
+        Some(out)
+    }
+}
+
+/// The run of `len` statements of `body` whose canonical text (the probe's `this` at `off`, its
+/// source the object of `src`) is `text`, its locals used nowhere else.
+fn shape_window(body: &[Stmt], vars: &[mwdec_lift::Var], this: VarId, src: VarId, off: i32, text: &str, len: usize) -> Option<Vec<usize>> {
+    if len == 0 || len > body.len() {
+        return None;
+    }
+    for s in 0..=body.len() - len {
+        let mut sh = Shape { this, src, base: off as i64, vars, names: HashMap::new() };
+        let Some(t) = sh.list(&body[s..s + len]) else { continue };
+        if t != text {
+            continue;
+        }
+        let locals: Vec<VarId> = sh.names.keys().copied().collect();
+        if body.iter().enumerate().any(|(k, st)| (k < s || k >= s + len) && locals.iter().any(|&v| mentions(st, v))) {
+            continue;
+        }
+        return Some((s..s + len).collect());
+    }
+    None
 }
 
 /// The steps of a probe body; an early return (`if (!o.valid) return; ...`) guards the steps
@@ -1501,6 +1670,7 @@ fn first_param(ops: &[COp]) -> Option<usize> {
         COp::Store(s) => find(&s.addr).or_else(|| find(&s.val)),
         COp::Call { args, .. } => args.iter().find_map(find),
         COp::If { cond, then } => find(cond).or_else(|| first_param(then)),
+        COp::Shape { .. } => None,
     })
 }
 
@@ -1604,6 +1774,14 @@ pub fn copy_ctor_inits(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usiz
             };
             let Some(pc) = pclass else { continue };
             let Some(ops) = cc.get(&copy_key(&cls, &pc)) else { continue };
+            // an element-wise copy (a loop): the run with the probe's canonical text
+            if let [COp::Shape { text, len }] = ops.as_slice() {
+                if let Some(w) = shape_window(&ir.body, &ir.vars, this, p, off, text, *len) {
+                    found = Some((p, w));
+                    break;
+                }
+                continue;
+            }
             let Some(src) = first_param(ops) else { continue };
             let mut pick = vec![];
             let mut at = 0;

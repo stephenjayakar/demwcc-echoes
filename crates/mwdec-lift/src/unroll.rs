@@ -83,6 +83,11 @@ fn shape_a(b: &[Stmt], k: usize) -> Option<(VarId, Expr, Vec<Stmt>)> {
     let t = real(then);
     // [temps...] if (n > 8) {...} ctr2 = n - i; if (i < n) do {...}
     let m = t.len();
+    if m >= 2 {
+        if let Some(r) = shape_a_formed(&t, n) {
+            return Some(r);
+        }
+    }
     if m < 3 {
         return None;
     }
@@ -146,6 +151,52 @@ fn shape_a(b: &[Stmt], k: usize) -> Option<(VarId, Expr, Vec<Stmt>)> {
         return None;
     }
     Some((*i, n.clone(), body1))
+}
+
+/// Shape A whose remainder loop is already a `for (; i < n; i++) BODY` (the counted-loop
+/// recovery ran first): `[temps...] if (n > 8) {...} for (; i < n; i++) BODY`.
+fn shape_a_formed(t: &[&Stmt], n: &Expr) -> Option<(VarId, Expr, Vec<Stmt>)> {
+    let m = t.len();
+    let Stmt::For { init, cond, step, body } = t[m - 1] else { return None };
+    if !init.is_empty() {
+        return None;
+    }
+    let (rop, ri, rn) = cmp_parts(cond)?;
+    let Expr::Var(i) = ri else { return None };
+    if rop != BinOp::Lt || rn != n || !straight(body) {
+        return None;
+    }
+    let steps1 = match step.as_slice() {
+        [Stmt::Expr(Expr::IncDec { e, delta: 1, .. })] => matches!(&**e, Expr::Var(x) if x == i),
+        [s] => matches!(s, Stmt::Assign { dst: Expr::Var(x), src } if x == i && matches!(strip(src), Expr::Binary { op: BinOp::Add, l, r, .. } if matches!(strip(l), Expr::Var(y) if y == i) && is_int(r, 1))),
+        _ => false,
+    };
+    if !steps1 {
+        return None;
+    }
+    let Stmt::If { cond: c8, then: then8, els: els8 } = t[m - 2] else { return None };
+    if !els8.is_empty() {
+        return None;
+    }
+    let (op8, n8, eight) = cmp_parts(c8)?;
+    if op8 != BinOp::Gt || n8 != n || !is_int(eight, 8) {
+        return None;
+    }
+    let t8 = real(then8);
+    let [Stmt::Assign { dst: Expr::Var(_), .. }, Stmt::If { then: inner, els: inner_els, .. }] = t8.as_slice() else { return None };
+    if !inner_els.is_empty() {
+        return None;
+    }
+    let il = real(inner);
+    let [uloop] = il.as_slice() else { return None };
+    let (_, body8) = ctr_loop(uloop)?;
+    let steps8 = body8
+        .iter()
+        .any(|s| matches!(s, Stmt::Assign { dst: Expr::Var(x), src } if x == i && matches!(strip(src), Expr::Binary { op: BinOp::Add, l, r, .. } if matches!(strip(l), Expr::Var(y) if y == i) && is_int(r, 8))));
+    if !steps8 || t[..m - 2].iter().any(|s| !matches!(s, Stmt::Assign { dst: Expr::Var(_), .. })) {
+        return None;
+    }
+    Some((*i, n.clone(), body.clone()))
 }
 
 /// `p + k` written as an add or as `&p->field` (`&*(p + k)`).

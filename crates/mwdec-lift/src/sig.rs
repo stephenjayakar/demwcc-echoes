@@ -208,6 +208,16 @@ pub fn find_class<'a>(db: &'a TypeDb, name: &str) -> Option<&'a mwdec_core::Clas
     key.and_then(|k| db.classes.get(&k))
 }
 
+/// Forget the per-thread class-name index of [`find_class`] (keyed by the TypeDb's address and
+/// size, which a later TypeDb can reuse once the earlier one is dropped).
+pub fn reset_memos() {
+    SPACED.with(|s| {
+        let mut s = s.borrow_mut();
+        s.0 = (0, 0);
+        s.1.clear();
+    });
+}
+
 thread_local! {
     static SPACED: std::cell::RefCell<((usize, usize), std::collections::HashMap<String, String>)> = std::cell::RefCell::new(((0, 0), std::collections::HashMap::new()));
 }

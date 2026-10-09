@@ -2389,7 +2389,8 @@ pub fn invariant_loop_conditions(body: &[Stmt]) -> Vec<String> {
         let mut vs = vec![];
         cond.walk(&mut |e| match e {
             Expr::Var(v) => vs.push(*v),
-            Expr::Load { .. } | Expr::Global { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Call { .. } | Expr::IncDec { .. } | Expr::BitField { .. } | Expr::New { .. } => opaque = true,
+            // (an unknown value, like a time base read, may change on its own)
+            Expr::Load { .. } | Expr::Global { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Call { .. } | Expr::IncDec { .. } | Expr::BitField { .. } | Expr::New { .. } | Expr::Unknown { .. } => opaque = true,
             _ => {}
         });
         if opaque || vs.is_empty() {

@@ -553,10 +553,7 @@ impl<'a> Lifter<'a> {
         }
         // C callee without a prototype in the context: arguments are the registers set up
         // for this call (up to the highest one written since the previous call)
-        if sig::demangle(&r.target).is_none()
-            && s.params.is_empty()
-            && !self.db.map_or(false, |db| db.decls.contains_key(&r.target) || db.functions.contains_key(&r.target))
-        {
+        if s.params.is_empty() && self.unprototyped_c(&r.target) {
             // words stored to the outgoing parameter area: the GPR arguments are all used, and
             // registers still holding this function's own arguments are passed on
             let outgoing = self.outgoing_stack_words(k);
@@ -1429,6 +1426,7 @@ impl<'a> Lifter<'a> {
         let mut acc: BTreeMap<i32, Acc> = BTreeMap::new();
         let mut addr: Vec<i32> = vec![];
         let mut obj_size: HashMap<i32, u32> = HashMap::new();
+        let mut obj_type: HashMap<i32, Type> = HashMap::new();
         let mut psq: HashSet<i32> = HashSet::new();
         // addresses passed in r3 (a struct return) to calls whose signature is not known yet
         let mut indirect: HashSet<i32> = HashSet::new();
@@ -1463,6 +1461,9 @@ impl<'a> Lifter<'a> {
                     if let Some(sz) = self.addr_object_size(k, i.rd()) {
                         let e = obj_size.entry(i.simm() as i32).or_insert(0);
                         *e = (*e).max(sz);
+                        if let Some(t) = self.addr_object_type(k, i.rd()) {
+                            obj_type.entry(i.simm() as i32).or_insert(t);
+                        }
                         if self.addr_is_sret(k, i.rd()) {
                             sret_addr.insert(i.simm() as i32);
                         }
@@ -1522,8 +1523,14 @@ impl<'a> Lifter<'a> {
         // inlined member destructor of a temporary stays apart so the temporary can fold)
         let mut starts: Vec<i32> = vec![];
         let mut covered_to = i32::MIN;
+        // objects whose interior addresses are passed on (elements, members by reference)
+        let mut with_interior: HashSet<i32> = HashSet::new();
         for &o in &addr {
             if o < covered_to && !sret_addr.contains(&o) && !receiver_addr.contains(&o) && obj_size.get(&o).map_or(true, |&sz| o + sz as i32 <= covered_to) {
+                // (an interior address handed to a call as an object: an element or a member)
+                if let (Some(&st), true) = (starts.last(), obj_size.contains_key(&o)) {
+                    with_interior.insert(st);
+                }
                 continue;
             }
             starts.push(o);
@@ -1567,7 +1574,13 @@ impl<'a> Lifter<'a> {
                 }
             }
             let size = (end - o) as u32;
-            let v = self.new_var(format!("stack_{:x}", o), t_unk(size), VarKind::Stack { offset: o, size }, false);
+            // an object of a known class whose interior addresses are passed: declared as that
+            // class, so the addresses read as its elements/members (`pts[1]`, not `stack_8 + 0x10`)
+            let ty = match obj_type.get(&o) {
+                Some(t) if with_interior.contains(&o) && types::size_of(self.db, t) == Some(size) => t.clone(),
+                _ => t_unk(size),
+            };
+            let v = self.new_var(format!("stack_{:x}", o), ty, VarKind::Stack { offset: o, size }, false);
             regions.push((o, size, v));
         }
         // quantized loads/stores of the frame are conversion scratch, unless they read an object
@@ -1576,6 +1589,30 @@ impl<'a> Lifter<'a> {
             if !self.frame.save_slots.contains_key(&o) && !regions.iter().any(|&(s, z, _)| o >= s && o < s + z as i32) {
                 conv.insert(o);
             }
+        }
+        // a wider access over the slots of narrower ones (bytes stored one by one, read back as a
+        // word: a small object built in place) makes them one object
+        {
+            let saves: HashSet<i32> = self.frame.save_slots.keys().copied().collect();
+            let free = |o: i32, regions: &Vec<(i32, u32, VarId)>| !conv.contains(&o) && !saves.contains(&o) && !regions.iter().any(|&(s, z, _)| o >= s && o < s + z as i32);
+            let offs: Vec<i32> = acc.keys().copied().collect();
+            let mut k = 0;
+            let mut sorted = offs.clone();
+            sorted.sort();
+            while k < sorted.len() {
+                let o = sorted[k];
+                let wide = acc[&o].sizes.iter().filter(|x| !x.1).map(|x| x.0 as i32).max().unwrap_or(0);
+                let inner: Vec<i32> = sorted.iter().copied().filter(|&o2| o2 > o && o2 < o + wide).collect();
+                if wide >= 2 && !inner.is_empty() && free(o, &regions) && inner.iter().all(|&o2| free(o2, &regions) && acc[&o2].sizes.iter().all(|x| !x.1 && o2 + x.0 as i32 <= o + wide)) {
+                    let size = wide as u32;
+                    let v = self.new_var(format!("stack_{:x}", o), t_unk(size), VarKind::Stack { offset: o, size }, false);
+                    regions.push((o, size, v));
+                    k += 1 + inner.len();
+                    continue;
+                }
+                k += 1;
+            }
+            regions.sort_by_key(|r| r.0);
         }
         let mut slots = BTreeMap::new();
         for (&o, a) in &acc {
@@ -1718,6 +1755,43 @@ impl<'a> Lifter<'a> {
                             Some(t) => class_size(t),
                             None => class_size(pt),
                         };
+                    }
+                }
+                return None;
+            }
+            if i.is_bctrl() || defs_uses(i).0.contains(&gpr(rd)) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// The class [`Self::addr_object_size`] measured (the call's receiver, struct return or
+    /// reference/by-value class parameter).
+    fn addr_object_type(&self, k: usize, rd: u8) -> Option<Type> {
+        let b = self.cfg.block_of[k];
+        let class = |t: &Type| -> Option<Type> {
+            let r = types::resolve(self.db, t).into_owned();
+            let r = strip_cv(&r).clone();
+            (named(&r).is_some() && types::is_aggregate(self.db, &r)).then_some(r)
+        };
+        for j in k + 1..self.cfg.blocks[b].end {
+            if self.frame.skip.contains(&j) {
+                continue;
+            }
+            let i = &self.insns[j];
+            if i.is_call() || (i.is_jump() && i.reloc.is_some()) {
+                let (sig, lay, _) = self.call_layouts.get(&j)?;
+                if lay.this == Some(rd) {
+                    return class(&Type::Named(sig.this_class.clone()?));
+                }
+                if lay.sret == Some(rd) {
+                    return class(&sig.ret);
+                }
+                for (n, p) in lay.params.iter().enumerate() {
+                    if *p == ArgLoc::Gpr(rd) {
+                        let pt = &sig.params[n].ty;
+                        return class(pointee(pt).unwrap_or(pt));
                     }
                 }
                 return None;
@@ -2069,6 +2143,8 @@ impl<'a> Lifter<'a> {
 
     /// Use the DB's field type when it agrees with the access width/kind.
     fn refine_load_type(&self, base: &Expr, off: i32, ty: Type) -> Type {
+        // a sign-extending load (`lha`) of an unsigned halfword: the source read it signed
+        let keeps_sign = |t: &Type| matches!(ty, Type::Int { size: 2, signed: true }) && matches!(strip_cv(&types::resolve(self.db, t)), Type::Int { size: 2, signed: false });
         let bt = ty_of(base, &self.vars);
         // `*p` through a typed scalar pointer: the pointee type (char vs unsigned char, ...)
         if off == 0 {
@@ -2076,6 +2152,9 @@ impl<'a> Lifter<'a> {
                 let pr = types::resolve(self.db, p).into_owned();
                 let ps = strip_cv(&pr);
                 if !types::is_aggregate(self.db, ps) && compatible_scalar(self.db, ps, &ty) && !matches!(ps, Type::Void) {
+                    if keeps_sign(ps) {
+                        return ty;
+                    }
                     return ps.clone();
                 }
             }
@@ -2084,7 +2163,7 @@ impl<'a> Lifter<'a> {
         let Some(p) = pointee(&bt) else { return ty };
         let Some(cls) = named(&types::resolve(Some(db), p)).map(|s| s.to_string()) else { return ty };
         match types::field_path(db, &cls, off, scalar_size(&ty).unwrap_or(0)) {
-            Some((_, ft)) if compatible_scalar(self.db, &ft, &ty) => ft,
+            Some((_, ft)) if compatible_scalar(self.db, &ft, &ty) && !keeps_sign(&ft) => ft,
             _ => ty,
         }
     }
@@ -2200,7 +2279,17 @@ impl<'a> Lifter<'a> {
         let kept_address = (14..32).contains(&reg)
             && uses > 0
             && matches!(&e, Expr::AddrOf(inner) if matches!(&**inner, Expr::Member { base, .. } | Expr::Load { base, .. } if !matches!(&**base, Expr::Var(v) if matches!(self.vars[*v].kind, VarKind::Stack { .. }))));
-        if is_trivial(&e) && !(cross && self.refs_mutable(&e)) && !kept_address {
+        // an address computed before a branch and used only in its arms (in two blocks or more,
+        // none of them its own): the source took it once into a local (`T& s = o.Get(); if (c)
+        // s.F(); else s.G();`); spelled again in each arm it would be recomputed there
+        let arms_address = matches!(&e, Expr::AddrOf(inner) if matches!(&**inner, Expr::Member { .. } | Expr::Load { .. }))
+            && is_trivial(&e)
+            && self.use_blocks.get(&site).is_some_and(|s| {
+                let own = self.cfg.block_of[k];
+                s.len() >= 2 && s.iter().all(|&b| b != own)
+            })
+            && !crate::variants::alt(crate::variants::ARMS_ADDRESS_INLINE);
+        if is_trivial(&e) && !(cross && self.refs_mutable(&e)) && !kept_address && !arms_address {
             st.regs[reg as usize] = Some(e.clone());
             self.def_value.insert(site, e);
             return;
@@ -2333,6 +2422,51 @@ impl<'a> Lifter<'a> {
         lo
     }
 
+    /// A C function the context has no prototype for (its parameters are read off each call).
+    fn unprototyped_c(&self, target: &str) -> bool {
+        sig::demangle(target).is_none() && !self.db.map_or(false, |db| db.decls.contains_key(target) || db.functions.contains_key(target)) && sig_of(target, self.db).params.is_empty()
+    }
+
+    /// Calls of one unprototyped C function all pass the same parameters (one prototype): a
+    /// call reading fewer argument registers than another (an argument already in its register,
+    /// so not set up for this call) passes the others' count too. Calls with outgoing stack
+    /// words (all registers taken as used) don't set the count.
+    fn unify_c_call_arity(&mut self) {
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (&k, (s, lay, this)) in &self.call_layouts {
+            let Some(r) = self.insns[k].reloc.as_ref() else { continue };
+            if *this || lay.sret.is_some() || s.variadic || !s.params.iter().all(|p| p.ty == t_s32() || p.ty == t_f32()) || !self.unprototyped_c(&r.target) {
+                continue;
+            }
+            groups.entry(r.target.clone()).or_default().push(k);
+        }
+        for (_, ks) in groups {
+            if ks.len() < 2 {
+                continue;
+            }
+            let count = |lay: &Layout| {
+                let g = lay.params.iter().filter(|l| matches!(l, ArgLoc::Gpr(_))).count();
+                let f = lay.params.iter().filter(|l| matches!(l, ArgLoc::Fpr(_))).count();
+                (g, f, lay.params.iter().any(|l| matches!(l, ArgLoc::Stack)))
+            };
+            let counted: Vec<(usize, usize, usize, bool)> = ks.iter().map(|&k| {
+                let (g, f, st) = count(&self.call_layouts[&k].1);
+                (k, g, f, st || self.outgoing_stack_words(k) > 0)
+            }).collect();
+            let gm = counted.iter().filter(|c| !c.3).map(|c| c.1).max().unwrap_or(0);
+            let fm = counted.iter().filter(|c| !c.3).map(|c| c.2).max().unwrap_or(0);
+            for &(k, g, f, st) in &counted {
+                if st || (g >= gm && f >= fm) {
+                    continue;
+                }
+                let (mut s, _, _) = self.call_layouts[&k].clone();
+                s.params = (0..gm.max(g)).map(|_| mwdec_core::Param { name: None, ty: t_s32() }).chain((0..fm.max(f)).map(|_| mwdec_core::Param { name: None, ty: t_f32() })).collect();
+                let lay = layout(&s, false, false, self.db);
+                self.call_layouts.insert(k, (s, lay, false));
+            }
+        }
+    }
+
     fn infer_c_params(&mut self) {
         if sig::demangle(&self.f.name).is_some() || !self.sig.params.is_empty() {
             return;
@@ -2384,7 +2518,99 @@ impl<'a> Lifter<'a> {
                 self.sig.params.push(mwdec_core::Param { name: None, ty: t_f32() });
             }
         }
+        let (early, read_only) = self.const_pointer_params();
+        let chosen = if read_only.len() > early.len() && crate::variants::alt(crate::variants::PARAM_CONST_POINTERS) {
+            read_only
+        } else {
+            early
+        };
+        for r in chosen {
+            if let Some(p) = self.sig.params.get_mut(r as usize - 3) {
+                if p.ty == t_s32() {
+                    p.ty = Type::Ptr(Box::new(Type::Const(Box::new(Type::Char))));
+                }
+            }
+        }
         self.call_layouts.clear();
+    }
+
+    /// Parameters that can be declared pointer-to-const: every use is a load base (nothing is
+    /// stored through them or done with them). Loads through such a parameter do not depend on
+    /// stores, so they schedule differently. Returns (those loaded through above a prologue store
+    /// (link register or callee-saved register save), all of them): the post-RA prologue stores
+    /// are ordered before every other load, so the first group was declared `const T*`; the rest
+    /// is a draft variant.
+    fn const_pointer_params(&self) -> (Vec<u8>, Vec<u8>) {
+        use ppc750cl::Opcode::*;
+        let is_load = |i: &Insn| matches!(i.op(), Lwz | Lhz | Lha | Lbz | Lfs | Lfd) && i.reloc.is_none();
+        let is_copy = |i: &Insn| i.op() == Or && i.rs() == i.rb() && !i.rc();
+        let params: Vec<u8> = (0..self.sig.params.len().min(8) as u8)
+            .map(|n| n + 3)
+            .filter(|&r| self.sig.params[r as usize - 3].ty == t_s32())
+            .collect();
+        if params.is_empty() {
+            return (vec![], vec![]);
+        }
+        let mut uses: Vec<(usize, Reg, Vec<u32>)> = vec![];
+        self.for_each_use(|k, r, defs| uses.push((k, r, defs.to_vec())));
+        // the value a definition site holds: a parameter's entry value, or a register copy of it
+        let mut holds: HashMap<u32, u8> = HashMap::new();
+        for &(k, r, ref defs) in &uses {
+            let i = &self.insns[k];
+            if let Some(n) = params.iter().copied().find(|&n| gpr(n) == r).filter(|_| defs.len() == 1 && defs[0] == ENTRY && is_copy(i)) {
+                holds.insert(k as u32, n);
+            }
+        }
+        let param_of = |r: Reg, defs: &[u32]| -> Option<u8> {
+            if defs.len() != 1 {
+                return None;
+            }
+            if defs[0] == ENTRY {
+                return params.iter().copied().find(|&n| gpr(n) == r);
+            }
+            holds.get(&defs[0]).copied()
+        };
+        let mut loaded: HashSet<u8> = HashSet::new();
+        let mut bad: HashSet<u8> = HashSet::new();
+        for &(k, r, ref defs) in &uses {
+            let mine: Vec<u8> = defs
+                .iter()
+                .filter_map(|&d| if d == ENTRY { params.iter().copied().find(|&n| gpr(n) == r) } else { holds.get(&d).copied() })
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let i = &self.insns[k];
+            match param_of(r, defs) {
+                Some(n) if is_load(i) && gpr(i.ra()) == r => {
+                    loaded.insert(n);
+                }
+                Some(_) if is_copy(i) && defs[0] == ENTRY => {}
+                _ => bad.extend(mine),
+            }
+        }
+        let read_only: Vec<u8> = params.iter().copied().filter(|n| loaded.contains(n) && !bad.contains(n)).collect();
+        if read_only.is_empty() {
+            return (vec![], vec![]);
+        }
+        let entry = &self.cfg.blocks[0];
+        let last_save = (entry.start..entry.end).rfind(|&k| {
+            let i = &self.insns[k];
+            self.frame.skip.contains(&k) && i.ra() == 1 && matches!(i.op(), Stw | Stfd | Stmw | PsqSt)
+        });
+        let mut early = vec![];
+        for &(k, r, ref defs) in &uses {
+            if k >= last_save.unwrap_or(0) || k < entry.start || k >= entry.end {
+                continue;
+            }
+            let i = &self.insns[k];
+            if let Some(n) = param_of(r, defs) {
+                if is_load(i) && gpr(i.ra()) == r && read_only.contains(&n) && !early.contains(&n) {
+                    early.push(n);
+                }
+            }
+        }
+        (early, read_only)
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -2401,6 +2627,7 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
+        self.unify_c_call_arity();
         self.setup_stack_args();
         self.reaching_defs();
         self.infer_return();
@@ -3523,6 +3750,28 @@ impl<'a> Lifter<'a> {
                 let off = ins.field_ps_offset() as i32;
                 let src = self.get(st, fpr(ins.field_frs()));
                 if i.ra() == 1 && self.stack.conv.contains(&off) {
+                    // a float stored quantized to a slot read back as an integer: the header's
+                    // fast-cast inline (`CCast::ToUint8(float)`: `psq_st f, 0(p), 1, qr2`) when the
+                    // context declares it (a C cast is fctiwz)
+                    let q = ins.field_ps_i();
+                    if ins.field_ps_w() == 1 {
+                        let fast = match q {
+                            2 => Some(("CCast::ToUint8", "ToUint8__5CCastFf")),
+                            3 => Some(("CCast::FtoUS", "FtoUS__5CCastFf")),
+                            4 => Some(("CCast::ToInt8", "ToInt8__5CCastFf")),
+                            5 => Some(("CCast::FtoS", "FtoS__5CCastFf")),
+                            _ => None,
+                        };
+                        if let (Some((qn, sym)), Some(db), Some(qt)) = (fast, self.db, quant_type(q)) {
+                            if db.decls.contains_key(qn) {
+                                let sig = sig::sig_of(sym, Some(db));
+                                let sz = scalar_size(&qt).unwrap_or(4);
+                                let call = Expr::Call { callee: Callee::Direct { symbol: sym.to_string(), sig }, args: vec![src], ret: qt };
+                                st.mem.insert(off, (sz, call));
+                                return;
+                            }
+                        }
+                    }
                     st.mem.insert(off, (4, src));
                     return;
                 }
@@ -4091,6 +4340,11 @@ impl<'a> Lifter<'a> {
                     _ => Expr::Unknown { text: format!("mfspr {}", ins.field_spr()), ty: t_unk(4) },
                 };
                 self.def(st, k, gpr(i.rd()), v);
+            }
+            // the time base: a new value at every read (an opaque read, never a constant)
+            Mftb => {
+                self.warn(format!("time base read {} at {:#x}", i.text(), i.off));
+                self.def(st, k, gpr(i.rd()), Expr::Unknown { text: format!("mftb:{k}"), ty: t_unk(4) });
             }
             Mtspr => {
                 let s = self.get(st, gpr(i.rs()));

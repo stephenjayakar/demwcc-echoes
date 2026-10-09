@@ -97,6 +97,9 @@ pub fn lift_function(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>) -> any
 }
 
 pub fn lift_function_with(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOptions) -> anyhow::Result<IrFunction> {
+    // memos keyed by a TypeDb's address must not outlive it (a later unit's TypeDb can reuse
+    // the address): a draft must not depend on what was drafted before it in the process
+    sig::reset_memos();
     let ir = lift_once(obj, f, db, opts, Some(false))?;
     if idioms::constructs_into_param0(&ir) {
         // the "first parameter" is really the hidden struct-return pointer
@@ -329,6 +332,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     arglocals::args_to_locals(&mut body, &mut l.vars, &mut l.is_temp, db);
     loadorder::order_param_loads(&mut body, &l.vars);
     shapes::byte_fields(&mut body);
+    shapes::mask_selects(&mut body);
     shapes::const_read_only_externs(&mut body, &mut l.globals);
     if let Some(db) = db {
         globalcopy::global_struct_copies(&mut body, &l.vars, db);
@@ -407,6 +411,8 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     frameobj::whole_object_copies(&mut ir, db);
     frameobj::unknown_callee_byval(&mut ir, db);
     frameobj::fold_converting_return(&mut ir, db);
+    frameobj::drop_default_construction_stores(&mut ir, db);
+    localtypes::float_word_copies(&mut ir.body, &ir.vars);
     idioms::apply(&mut ir, db);
     idioms::narrow_float_stores(&mut ir, db);
     scalars::regroup(&mut ir, db);
