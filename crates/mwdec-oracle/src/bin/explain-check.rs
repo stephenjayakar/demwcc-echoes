@@ -91,6 +91,8 @@ fn main() -> anyhow::Result<()> {
                 Verdict::SwapStatements(..) => "swap statements".into(),
                 Verdict::WaitFor(..) => "wait for".into(),
                 Verdict::Priority(p) => format!("priority {p:?}"),
+                Verdict::ConstBase(_) => "const base".into(),
+                Verdict::NonConstBase(_) => "non-const base".into(),
                 Verdict::Unknown => format!("unknown: {}", a.text),
             };
             *tally.entry(key).or_default() += 1;

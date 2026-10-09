@@ -12,6 +12,18 @@
 //!   earlier (move that statement);
 //! - `Priority`: the pick rule decided by deadline / successors uncovered / height / opcode rank /
 //!   unit availability: statement order does not matter; change the dependence chains instead.
+//!
+//! The entry block is compared too: the post-RA pass interleaves the prologue's register saves
+//! with the first body instructions, and whether a load through a parameter can move above the
+//! saves is decided by the parameter's declared type (compiler experiments, GC/2.7): the
+//! pointee of a pointer/reference-to-const parameter (`this` of a const member function) is a
+//! known object that no store reaches, so its loads are free; a non-const pointer, or a pointee
+//! class with a `mutable` non-pointer member anywhere inside (e.g. an `auto_ptr`'s ownership
+//! flag), is of unknown origin and every load through it waits for the saves. Verdicts:
+//! - `ConstBase`: the target reads before a save the candidate's load depends on: the target's
+//!   parameter is pointer/reference-to-const;
+//! - `NonConstBase`: the target waits for a save the candidate's (free) load does not: the target's
+//!   parameter is not trusted read-only.
 
 use crate::asm::{self, Func, Obj};
 use crate::compile::Compiler;
@@ -21,6 +33,7 @@ use crate::tracer::{trace_source, TraceOptions};
 use anyhow::{anyhow, Result};
 use ppc750cl::Ins;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize)]
 pub enum Verdict {
@@ -31,6 +44,12 @@ pub enum Verdict {
     /// the second instruction waits for this instruction (text, candidate source line)
     WaitFor(String, Option<u32>),
     Priority(PickReason),
+    /// entry block: the target loads through parameter register `.0` before a register save
+    /// (the parameter is pointer/reference-to-const there)
+    ConstBase(u8),
+    /// entry block: the target's load through parameter register `.0` waits for the register
+    /// saves (a non-const parameter, or a pointee class with a mutable non-pointer member)
+    NonConstBase(u8),
     Unknown,
 }
 
@@ -202,6 +221,9 @@ pub fn explain_sched_diff(comp: &Compiler, cand_src: &str, func: &str, target_ob
         }
         lines.as_ref().and_then(|l| l.get((off / 4) as usize).copied().flatten())
     };
+    // loads through a parameter register (base never written before them)
+    let param_load: BTreeMap<u32, u8> =
+        entry_region(&cobj, &cf, false).into_iter().filter_map(|x| Some((x.off, x.param_load?.0))).collect();
     let mut out = vec![];
     for blk in &rep.blocks {
         for inv in &blk.inversions {
@@ -266,6 +288,19 @@ pub fn explain_sched_diff(comp: &Compiler, cand_src: &str, func: &str, target_ob
                     adv.pre_ra = Some(pe);
                 }
             }
+            // a load through a parameter held back by a store (or register save) that the target
+            // issues before it: the target's pointee is a known object (pointer-to-const parameter)
+            if let Some(&r) = param_load.get(&s.cand_off) {
+                let memory = |k: crate::sched::EdgeKind| k == crate::sched::EdgeKind::Memory;
+                let held = match &e.why {
+                    WhyKind::Dependence(p) => p.iter().any(|&k| memory(k)),
+                    WhyKind::NotReady { waiting_for: Some(w), .. } => b.nodes[*w].succs.iter().any(|x| x.to == ns && memory(x.kind)),
+                    _ => false,
+                };
+                if held && matches!(adv.verdict, Verdict::Forced(_) | Verdict::WaitFor(..)) {
+                    adv.verdict = Verdict::ConstBase(r);
+                }
+            }
             adv.text = match &adv.verdict {
                 Verdict::Forced(p) => format!("[{}] depends on [{}] ({p}): change the dependence, not the order", s.text, f.text),
                 Verdict::RegAlloc => "only register reuse orders them: fix the register assignment first".into(),
@@ -279,6 +314,8 @@ pub fn explain_sched_diff(comp: &Compiler, cand_src: &str, func: &str, target_ob
                     l.map(|x| format!(" (line {x})")).unwrap_or_default()
                 ),
                 Verdict::Priority(r) => format!("the scheduler's priority ({r:?}) decides, not statement order"),
+                Verdict::ConstBase(r) => const_base_text(*r),
+                Verdict::NonConstBase(r) => non_const_base_text(*r),
                 Verdict::Unknown => e.text.clone(),
             };
             if pf {
@@ -289,5 +326,141 @@ pub fn explain_sched_diff(comp: &Compiler, cand_src: &str, func: &str, target_ob
             out.push(adv);
         }
     }
+    let explained: Vec<u32> = out
+        .iter()
+        .filter(|a| matches!(a.verdict, Verdict::ConstBase(_) | Verdict::NonConstBase(_)))
+        .map(|a| a.second.cand_off)
+        .collect();
+    out.extend(entry_advice(&cobj, &cf, target_obj, target, &post, &post_maps).into_iter().filter(|a| {
+        let load = if matches!(a.verdict, Verdict::ConstBase(_)) { a.second.cand_off } else { a.first.cand_off };
+        !explained.contains(&load)
+    }));
     Ok(out)
 }
+
+fn const_base_text(r: u8) -> String {
+    format!("the target issues the load through r{r} before a store or register save the candidate orders before it: the pointee is a known object there, i.e. the parameter is declared pointer/reference-to-const (`this`: a const member function whose class has no mutable non-pointer member)")
+}
+
+fn non_const_base_text(r: u8) -> String {
+    format!("the target's load through r{r} waits for the register save: the parameter is not trusted read-only there (a non-const pointer/reference, or the pointee class has a mutable non-pointer member, e.g. an auto_ptr's ownership flag)")
+}
+
+/// One instruction of a function's entry region (up to the first branch or call).
+struct EntryIns {
+    off: u32,
+    text: String,
+    /// register save of the prologue (`stw`/`stfd`/`stmw`/`psq_st` of the frame)
+    save: bool,
+    /// load through a parameter register no earlier instruction wrote: (register, mnemonic +
+    /// displacement)
+    param_load: Option<(u8, String)>,
+}
+
+/// The instructions of `f` with their save / parameter-load facts; `entry`: only the entry region
+/// (up to the first branch or call), else the whole function in address order.
+fn entry_region(obj: &Obj, f: &Func, entry: bool) -> Vec<EntryIns> {
+    let frame = schedcheck::frame_offsets(f);
+    let lines = asm::disasm_func(obj, f, asm::AsmOpts { offsets: true, literals: false });
+    let texts: BTreeMap<u32, String> = lines
+        .iter()
+        .filter_map(|l| {
+            let (o, t) = l.trim().split_once(": ")?;
+            Some((u32::from_str_radix(o.trim(), 16).ok()?, t.trim().to_string()))
+        })
+        .collect();
+    let reg = |t: &str| t.strip_prefix('r').and_then(|n| n.parse::<u8>().ok());
+    let mut written = [false; 32];
+    let mut out = vec![];
+    for (i, c) in f.code.chunks_exact(4).enumerate() {
+        let off = (i * 4) as u32;
+        let ins = Ins::new(u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+        let text = texts.get(&off).cloned().unwrap_or_else(|| ins.simplified().to_string());
+        let m = text.split_whitespace().next().unwrap_or("").to_string();
+        if m.starts_with('b') {
+            if entry {
+                break;
+            }
+            continue;
+        }
+        let ops: Vec<&str> = text.splitn(2, ' ').nth(1).unwrap_or("").split(", ").map(|o| o.trim()).collect();
+        let save = frame.contains(&off) && matches!(m.as_str(), "stw" | "stfd" | "stmw" | "psq_st");
+        let mut param_load = None;
+        let is_load = m.starts_with('l') && !matches!(m.as_str(), "li" | "lis");
+        if is_load && !frame.contains(&off) {
+            if let Some((disp, base)) = ops.get(1).and_then(|o| o.strip_suffix(')')).and_then(|o| o.split_once('(')) {
+                if let Some(b) = reg(base) {
+                    if (3..=10).contains(&b) && !written[b as usize] {
+                        param_load = Some((b, format!("{m} {disp}")));
+                    }
+                }
+            }
+        }
+        // the register this instruction writes (first operand of everything but stores/compares)
+        if !m.starts_with("st") && !m.starts_with("cmp") {
+            if let Some(d) = ops.first().and_then(|o| reg(o)) {
+                written[d as usize] = true;
+            }
+        }
+        out.push(EntryIns { off, text, save, param_load });
+    }
+    out
+}
+
+/// Entry-block order differences between the prologue's register saves and the loads through
+/// parameters, explained by the alias class of the load (see the module docs).
+fn entry_advice(cobj: &Obj, cf: &Func, tobj: &Obj, tf: &Func, post: &[&SchedBlock], post_maps: &[Vec<Option<u32>>]) -> Vec<OrderAdvice> {
+    let c = entry_region(cobj, cf, true);
+    let t = entry_region(tobj, tf, true);
+    let mut used = vec![false; t.len()];
+    // the target counterpart: saves by exact text, loads by mnemonic + displacement
+    let mut pairs: Vec<(usize, usize)> = vec![];
+    for (i, x) in c.iter().enumerate() {
+        if !x.save && x.param_load.is_none() {
+            continue;
+        }
+        let k = t.iter().enumerate().position(|(j, y)| {
+            !used[j]
+                && match (&x.param_load, &y.param_load) {
+                    (Some((_, a)), Some((_, b))) => a == b,
+                    (None, None) => x.save && y.save && x.text == y.text,
+                    _ => false,
+                }
+        });
+        if let Some(k) = k {
+            used[k] = true;
+            pairs.push((i, k));
+        }
+    }
+    // (block, node) of a candidate offset in the post-RA schedule
+    let node = |off: u32| post_maps.iter().enumerate().find_map(|(b, m)| m.iter().position(|&o| o == Some(off)).map(|n| (b, n)));
+    let mut out = vec![];
+    for &(li, lk) in pairs.iter().filter(|&&(i, _)| c[i].param_load.is_some()) {
+        let r = c[li].param_load.as_ref().map_or(0, |p| p.0);
+        for &(si, sk) in pairs.iter().filter(|&&(i, _)| c[i].save) {
+            let cand_save_first = c[si].off < c[li].off;
+            if cand_save_first == (t[sk].off < t[lk].off) {
+                continue;
+            }
+            let (Some((bs, ns)), Some((bl, nl))) = (node(c[si].off), node(c[li].off)) else { continue };
+            if bs != bl {
+                continue;
+            }
+            let e = if cand_save_first { post[bs].why_before(ns, nl) } else { post[bs].why_before(nl, ns) };
+            let memory = matches!(&e.why, WhyKind::Dependence(p) if p.contains(&crate::sched::EdgeKind::Memory));
+            let (verdict, text) = if cand_save_first && memory {
+                (Verdict::ConstBase(r), const_base_text(r))
+            } else if !cand_save_first && !matches!(&e.why, WhyKind::Dependence(_)) {
+                (Verdict::NonConstBase(r), non_const_base_text(r))
+            } else {
+                continue;
+            };
+            let iref = |i: usize, k: usize| InstrRef { text: c[i].text.clone(), cand_off: c[i].off, target_off: t[k].off, line: None };
+            let (first, second) = if cand_save_first { (iref(si, sk), iref(li, lk)) } else { (iref(li, lk), iref(si, sk)) };
+            out.push(OrderAdvice { first, second, post_ra: Some(e), pre_ra: None, verdict, text });
+            break;
+        }
+    }
+    out
+}
+

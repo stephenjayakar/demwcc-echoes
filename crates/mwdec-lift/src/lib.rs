@@ -307,6 +307,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     simplify::recover_ctr_loops(&mut body, &mut l.vars, &mut l.is_temp);
     structure::offset_ctr_loops(&mut body, &l.vars);
     structure::ctr_break_loops(&mut body, &mut l.vars, &mut l.is_temp);
+    structure::loop_exit_returns_after(&mut body, &l.vars);
     unroll::reroll(&mut body);
     if opts.inline_temps {
         reinline(&mut body, &l.is_temp, &l.vars);

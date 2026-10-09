@@ -564,7 +564,12 @@ impl<'a> Lifter<'a> {
             // words stored to the outgoing parameter area: the GPR arguments are all used, and
             // registers still holding this function's own arguments are passed on
             let outgoing = self.outgoing_stack_words(k);
-            let gmax = if outgoing > 0 { Some(10) } else { (3..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q))) };
+            // (an incoming argument register the allocator kept free up to the call is one more
+            // argument, passed on unchanged)
+            // (while this function's own parameters are being inferred there are no entry values
+            // yet: the register then makes it a parameter too)
+            let through = self.passed_through(k).filter(|&r| self.entry_vals.is_empty() || self.entry_vals.contains_key(&gpr(r)));
+            let gmax = if outgoing > 0 { Some(10) } else { (3..=10u8).rev().find(|q| self.reg_set_for_call(k, gpr(*q))).max(through) };
             if let Some(g) = gmax {
                 for _ in 3..=g {
                     s.params.push(mwdec_core::Param { name: None, ty: t_s32() });
@@ -1071,6 +1076,7 @@ impl<'a> Lifter<'a> {
         let mut plain_ret_defs: HashSet<Site> = HashSet::new();
         // defs reaching each use (to see through register copies)
         let mut use_defs: HashMap<(u32, Reg), Vec<u32>> = HashMap::new();
+        let mut last_use: HashMap<(u32, Reg), usize> = HashMap::new();
         self.ret_reg = None;
         let mut cmp_uses: HashMap<Site, u32> = HashMap::new();
         let is_cmp: Vec<bool> = self.insns.iter().map(|i| matches!(i.op(), Opcode::Cmp | Opcode::Cmpl | Opcode::Cmpi | Opcode::Cmpli)).collect();
@@ -1080,6 +1086,8 @@ impl<'a> Lifter<'a> {
                 if is_cmp[k] {
                     *cmp_uses.entry((d, r)).or_default() += 1;
                 }
+                let e = last_use.entry((d, r)).or_insert(k);
+                *e = (*e).max(k);
             }
             use_defs.insert((k as u32, r), defs.to_vec());
         });
@@ -1149,6 +1157,23 @@ impl<'a> Lifter<'a> {
         });
         let g_ok = g_ok || self_value;
         let g_nc = g_nc || self_value;
+        // a call result left in r3 up to every return, while a value computed after its last use
+        // took a higher volatile register (r3 would have been the lowest free one): the
+        // allocator kept r3 live, the function returns the result
+        let kept_r3 = g_ok
+            && ret_defs.get(&gpr(3)).is_some_and(|defs| {
+                !defs.is_empty()
+                    && defs.iter().all(|&d| {
+                        if d == ENTRY {
+                            return false;
+                        }
+                        let Some(&lu) = last_use.get(&(d, gpr(3))) else { return false };
+                        let live = |j: usize| !self.frame.skip.contains(&j);
+                        let n = self.insns.len();
+                        (d as usize + 1..n).all(|j| !live(j) || !self.defs_of(j).contains(&gpr(3)))
+                            && (lu + 1..n).any(|j| live(j) && !self.insns[j].is_call() && self.defs_of(j).iter().any(|&r| r >= gpr(4) && r <= gpr(12)))
+                    })
+            });
         // a returned call result whose callee's return type is known decides between f1 and r3
         let call_ret = |r: Reg, want_float: bool| {
             ret_defs.get(&r).is_some_and(|defs| {
@@ -1171,7 +1196,7 @@ impl<'a> Lifter<'a> {
         if pick_f {
             self.ret_reg = Some(fpr(1));
             self.ret_ty = t_f32();
-        } else if g_ok && (g_nc || getter_like) {
+        } else if g_ok && (g_nc || getter_like || kept_r3) {
             self.ret_reg = Some(gpr(3));
             // bool if every def is li 0/1
             let mut defs = ret_defs.get(&gpr(3)).cloned().unwrap_or_default();
@@ -2587,7 +2612,9 @@ impl<'a> Lifter<'a> {
     /// stores, so they schedule differently. Returns (those loaded through above a prologue store
     /// (link register or callee-saved register save), all of them): the post-RA prologue stores
     /// are ordered before every other load, so the first group was declared `const T*`; the rest
-    /// is a draft variant.
+    /// is a draft variant. (They become `const char*`: a class pointee with a `mutable`
+    /// non-pointer member anywhere inside would not count as read-only to the compiler, so a
+    /// `const T*` of such a class would not schedule this way; `char` has no members.)
     fn const_pointer_params(&self) -> (Vec<u8>, Vec<u8>) {
         use ppc750cl::Opcode::*;
         let is_load = |i: &Insn| matches!(i.op(), Lwz | Lhz | Lha | Lbz | Lfs | Lfd) && i.reloc.is_none();

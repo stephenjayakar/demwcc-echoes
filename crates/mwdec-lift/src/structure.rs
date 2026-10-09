@@ -2349,6 +2349,66 @@ pub fn ctr_break_loops(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut 
     }
 }
 
+/// `while (1) { if (c) { S; return x; } B }` (the other arm `B; continue;` or after the `if`), with
+/// no other way out of the loop, is `while (!c) { B } S; return x;` (variant): the source had the
+/// exit code after a bottom-tested loop (a top-tested one keeps the return in the loop).
+pub fn loop_exit_returns_after(body: &mut Vec<Stmt>, vars: &[Var]) {
+    fn labels(b: &[Stmt]) -> bool {
+        let mut any = false;
+        for s in b {
+            match s {
+                Stmt::Label(_) | Stmt::Goto(_) => any = true,
+                Stmt::If { then, els, .. } => any |= labels(then) || labels(els),
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => any |= labels(body),
+                Stmt::For { init, step, body, .. } => any |= labels(init) || labels(step) || labels(body),
+                Stmt::Switch { cases, .. } => any |= cases.iter().any(|c| labels(&c.body)),
+                _ => {}
+            }
+        }
+        any
+    }
+    Stmt::for_each_block_mut(body, &mut |blk| {
+        let mut k = 0;
+        while k < blk.len() {
+            let found = (|| {
+                let Stmt::While { cond: Expr::Int { value: 1, .. }, body: lb } = &blk[k] else { return None };
+                let (Stmt::If { cond: c, then: t, els: e }, rest) = lb.split_first()? else { return None };
+                if !matches!(t.last(), Some(Stmt::Return(_))) || crate::ctrloop::has_own_jump(t, false) || labels(lb) {
+                    return None;
+                }
+                // the arm that stays: `B; continue;` (nothing after the if) or `B` then the rest
+                let mut stay: Vec<Stmt> = e.clone();
+                if matches!(stay.last(), Some(Stmt::Continue)) {
+                    stay.pop();
+                    if !rest.is_empty() {
+                        return None;
+                    }
+                } else if !e.is_empty() && rest.is_empty() {
+                    return None;
+                }
+                stay.extend(rest.iter().cloned());
+                if crate::ctrloop::has_own_jump(&stay, false) {
+                    return None;
+                }
+                if !crate::variants::alt(crate::variants::LOOP_EXIT_AFTER) {
+                    return None;
+                }
+                Some((c.clone().negate(vars), stay, t.clone()))
+            })();
+            let Some((cond, stay, exit)) = found else {
+                k += 1;
+                continue;
+            };
+            blk[k] = Stmt::While { cond, body: stay };
+            let n = exit.len();
+            for (j, s) in exit.into_iter().enumerate() {
+                blk.insert(k + 1 + j, s);
+            }
+            k += 1 + n;
+        }
+    });
+}
+
 /// Warning text of `invariant_loop_conditions` (eval rows flag drafts carrying it).
 pub const WARN_INVARIANT_LOOP: &str = "condition never changes in the loop";
 

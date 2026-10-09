@@ -1071,7 +1071,21 @@ fn pcode_at(d: &mut Debuggee, p: u32, opnames: &mut HashMap<i16, String>) -> Opt
         args.truncate(1);
         args.push(format!("({} operands, {} written regs)", argc, w));
     }
-    let text = format!("{:<8} {}", name, args.join(", ")).trim_end().to_string();
+    let mut text = format!("{:<8} {}", name, args.join(", ")).trim_end().to_string();
+    // `MWDEC_PCODE_FLAGS`: the alias class the scheduler sees on memory operations (word 0x14 of
+    // the PCode): `{ptr}` = through a pointer of unknown origin (ordered against every store and
+    // the prologue's register saves), `{const}` = marked read-only; neither = a known object (a
+    // stack/global object, or the pointee of a pointer-to-const parameter: never ordered against
+    // the register saves)
+    if std::env::var_os("MWDEC_PCODE_FLAGS").is_some() && args.iter().any(|a| a.starts_with('#') || a.contains('+')) && (name.starts_with('l') || name.starts_with("st") || name.starts_with("psq")) && !matches!(name.as_str(), "li" | "lis") {
+        let fl = u32::from_le_bytes([h[0x14], h[0x15], h[0x16], h[0x17]]);
+        if fl & 0x20 != 0 {
+            text.push_str(" {ptr}");
+        }
+        if fl & 0x40 != 0 {
+            text.push_str(" {const}");
+        }
+    }
     Some((PInstr { op, name, text, regs }, next))
 }
 

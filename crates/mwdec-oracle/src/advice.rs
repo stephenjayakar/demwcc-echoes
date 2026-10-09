@@ -149,6 +149,9 @@ pub struct OrderDiagnosis {
     pub priority: u32,
     /// differences the recorded schedule could not place (different blocks, not found)
     pub unexplained: u32,
+    /// entry-block differences decided by the const qualification of a parameter (register
+    /// saves against loads through it): change the parameter's type, not the order
+    pub qualifier: u32,
     /// per-difference details (the full `explain` output)
     pub details: Vec<OrderAdvice>,
 }
@@ -227,6 +230,7 @@ fn diagnose(cand: &Candidate, details: Vec<OrderAdvice>) -> OrderDiagnosis {
             }
             Verdict::RegAlloc => d.regalloc += 1,
             Verdict::Priority(_) => d.priority += 1,
+            Verdict::ConstBase(_) | Verdict::NonConstBase(_) => d.qualifier += 1,
             Verdict::Unknown => d.unexplained += 1,
         }
     }

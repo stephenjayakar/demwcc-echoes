@@ -24,7 +24,9 @@
 //! mwcc-oracle why <cand.cpp|-e CODE> --target <target.o> --fn NAME [--json]
 //!     every order difference against the target, explained by the REAL scheduler: forced by a
 //!     dependence, register reuse, program order (=> which statement to move), waiting for an
-//!     operand (=> which computation to move), or the scheduler's priority (statement order irrelevant)
+//!     operand (=> which computation to move), or the scheduler's priority (statement order irrelevant);
+//!     entry block too: a load through a parameter before/after the register saves (=> the parameter
+//!     is / is not pointer-to-const in the target)
 //! mwcc-oracle sched <cand.cpp|-e CODE|cand.o> --target <target.o> --fn NAME [--json]
 //!     scheduling dependence check: per block, which instruction pairs are in a different order and
 //!     whether a data/memory dependence forces it (=> source statements must move; lines via -sym on)
@@ -44,7 +46,8 @@
 //!     run the //@ expect lines of experiment files; exit 1 on any failure (--full: print the
 //!     listings of failing variants)
 //! Profiles: game (default), rel, relpool, sdkc, sdk125, musyx.
-//! Env: MWDEC_ROOT (project root, read-only), MWDEC_ORACLE_WORK (scratch dir).
+//! Env: MWDEC_ROOT (project root, read-only), MWDEC_ORACLE_WORK (scratch dir), MWDEC_PCODE_FLAGS
+//! (trace --pcode: mark memory operations `{ptr}` / `{const}` with the alias class the scheduler sees).
 use anyhow::{anyhow, bail, Result};
 use mwdec_oracle::asm::{self, AsmOpts};
 use mwdec_oracle::compile::Compiler;

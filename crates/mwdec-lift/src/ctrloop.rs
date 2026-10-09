@@ -507,7 +507,7 @@ pub fn recover(body: &mut Vec<Stmt>, vars: &mut Vec<Var>, is_temp: &mut Vec<bool
 
 /// `continue`/`break` of this loop level (not of nested loops; `break` in a switch is the
 /// switch's own).
-fn has_own_jump(b: &[Stmt], in_switch: bool) -> bool {
+pub(crate) fn has_own_jump(b: &[Stmt], in_switch: bool) -> bool {
     b.iter().any(|s| match s {
         Stmt::Continue => true,
         Stmt::Break => !in_switch,

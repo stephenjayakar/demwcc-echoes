@@ -106,6 +106,16 @@ pub fn register_only(f: &Fitness) -> bool {
 pub fn neighbours(src: &str, symbol: &str, hints: Option<&RegHints>, seeds: u64, seen: &mut HashSet<String>) -> Vec<(String, &'static str)> {
     let Some(p) = Parsed::new(src, symbol) else { return vec![] };
     let mut out = vec![];
+    for c in const_param_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "const_param"));
+        }
+    }
+    for c in param_copy_variants(src, symbol) {
+        if seen.insert(normalize(&c)) {
+            out.push((c, "param_copy"));
+        }
+    }
     for c in hoist_loads_variants(src, symbol) {
         if seen.insert(normalize(&c)) {
             out.push((c, "hoist_loads"));
@@ -1926,6 +1936,153 @@ struct Scored {
     src: String,
     fit: Fitness,
     ops: Vec<&'static str>,
+}
+
+/// Whether `symbol` is a C++-mangled name (`name__<class>F...`, `name__F...`): its parameter types
+/// are part of the symbol and cannot change.
+fn is_mangled(symbol: &str) -> bool {
+    let s = symbol.strip_prefix("__").unwrap_or(symbol);
+    match s.find("__") {
+        Some(i) => s[i + 2..].starts_with(|c: char| c.is_ascii_digit() || c == 'F' || c == 'Q' || c == 'C'),
+        None => false,
+    }
+}
+
+/// Parameters of a function whose symbol does not encode them (`extern "C"`, C units) declared
+/// pointer-to-const when they are only read through: the pointee of a pointer-to-const parameter
+/// is a known object to the compiler's alias analysis, so loads through it are no longer ordered
+/// after stores through other pointers or after the prologue's register saves (they move up into
+/// the first cycles). (A `const T*` whose class has a `mutable` non-pointer member gets no such
+/// benefit; the compile decides.) Complements the lifter's rule, which declares integer
+/// parameters used only as load bases `const char*` (variant `param.const_pointers`: all of
+/// them): here an integer parameter used as an address *and* as a value becomes `const void*`
+/// (the value uses read `(int)p`), a `T*` parameter `const T*`; one variant with all of those,
+/// and one per parameter (address-only integers included). A parameter that is stored through
+/// or passed on as a pointer is left alone.
+pub fn const_param_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    if is_mangled(symbol) {
+        return vec![];
+    }
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut params: Vec<&crate::func::Var> = info.vars.values().filter(|v| v.is_param).collect();
+    params.sort_by_key(|v| v.decl);
+    let mut per_param: Vec<Vec<Edit>> = vec![];
+    // per parameter: also in the combined variant (not covered by the lifter's rule)
+    let mut combined: Vec<bool> = vec![];
+    for v in params {
+        let name = v.name.as_str();
+        let ty = v.ty.trim();
+        let int_like = matches!(ty, "int" | "unsigned int" | "s32" | "u32" | "long" | "unsigned long");
+        let ptr = ty.ends_with('*') && !ty.starts_with("const ") && !ty.contains("**") && !ty.contains('(');
+        if !int_like && !ptr {
+            continue;
+        }
+        let uses: Vec<usize> = c.descendants(info.body).into_iter().filter(|&n| c.kind(n) == "identifier" && c.text(n) == name).collect();
+        // never assigned and its address never taken
+        let written = uses.iter().any(|&n| {
+            c.parent(n).is_some_and(|p| match c.kind(p) {
+                "assignment_expression" => c.child(p, "left") == Some(n),
+                "update_expression" => true,
+                "pointer_expression" => c.op(p) == Some("&"),
+                _ => false,
+            })
+        });
+        // ... nor stored through, nor passed on as a pointer
+        let stored = uses.iter().any(|&n| {
+            c.ancestors(n).into_iter().any(|a| c.kind(a) == "assignment_expression" && c.child(a, "left").is_some_and(|l| c.contains(l, n)))
+        });
+        let passed = ptr && uses.iter().any(|&n| c.parent(n).is_some_and(|p| c.kind(p) == "argument_list"));
+        if written || stored || passed {
+            continue;
+        }
+        let cast_parent = |n: usize| c.parent(n).filter(|&p| c.kind(p) == "cast_expression");
+        let pointer_cast = |n: usize| cast_parent(n).and_then(|p| c.child(p, "type")).is_some_and(|t| c.text(t).trim_end().ends_with('*'));
+        let mut edits = vec![];
+        let mut in_combined = true;
+        if int_like {
+            if !uses.iter().any(|&n| pointer_cast(n)) {
+                continue;
+            }
+            for &n in &uses {
+                if cast_parent(n).is_none() {
+                    edits.push(Edit::replace(&c, n, format!("(int){name}")));
+                }
+            }
+            // address-only: the lifter's rule (and its variant) already declares it
+            in_combined = !edits.is_empty();
+            let Some(d) = c.child(v.decl, "type") else { continue };
+            edits.push(Edit::replace(&c, d, "const void*"));
+        } else {
+            let reads = uses.iter().any(|&n| {
+                c.parent(n).is_some_and(|p| matches!(c.kind(p), "field_expression" | "subscript_expression" | "pointer_expression"))
+            });
+            if !reads {
+                continue;
+            }
+            let Some(d) = c.child(v.decl, "type") else { continue };
+            edits.push(Edit::replace(&c, d, format!("const {}", c.text(d))));
+        }
+        per_param.push(edits);
+        combined.push(in_combined);
+    }
+    if per_param.is_empty() {
+        return vec![];
+    }
+    let mut out = vec![];
+    let ok = |s: Option<String>| s.filter(|s| Cst::parse(s).errors <= c.errors);
+    let all: Vec<Edit> = per_param.iter().zip(&combined).filter(|(_, &k)| k).flat_map(|(e, _)| e.clone()).collect();
+    if !all.is_empty() {
+        if let Some(s) = ok(apply(src, &all)) {
+            out.push(s);
+        }
+    }
+    if per_param.len() > 1 || out.is_empty() {
+        for e in per_param.iter().take(4) {
+            if let Some(s) = ok(apply(src, e)) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// A parameter the function updates (`p = p + 36` in a loop) read through a local copy instead
+/// (`T it = p; ... it = it + 36`): the copy is a named local with a later virtual register than
+/// every parameter, so it is coloured first (takes the highest callee-saved register) where the
+/// updated parameter would come after the other parameters.
+pub fn param_copy_variants(src: &str, symbol: &str) -> Vec<String> {
+    use crate::cst::{apply, Cst, Edit};
+    let c = Cst::parse(src);
+    let Some(def) = crate::func::find_target(&c, symbol) else { return vec![] };
+    let Some(info) = crate::func::FuncInfo::analyze(&c, def) else { return vec![] };
+    let mut params: Vec<&crate::func::Var> = info.vars.values().filter(|v| v.is_param && crate::func::is_scalar_type(&v.ty)).collect();
+    params.sort_by_key(|v| v.decl);
+    let mut out = vec![];
+    for v in params {
+        let name = v.name.as_str();
+        let uses: Vec<usize> = c.descendants(info.body).into_iter().filter(|&n| c.kind(n) == "identifier" && c.text(n) == name).collect();
+        let updated = uses.iter().any(|&n| {
+            c.parent(n).is_some_and(|p| match c.kind(p) {
+                "assignment_expression" => c.child(p, "left") == Some(n),
+                "update_expression" => true,
+                _ => false,
+            })
+        });
+        let address_taken = uses.iter().any(|&n| c.parent(n).is_some_and(|p| c.kind(p) == "pointer_expression" && c.op(p) == Some("&")));
+        if !updated || address_taken {
+            continue;
+        }
+        let local = info.fresh_name(&c, &format!("{name}_it"));
+        let mut edits: Vec<Edit> = uses.iter().map(|&n| Edit::replace(&c, n, local.clone())).collect();
+        edits.push(Edit::insert(c.nodes[info.body].start + 1, format!("\n    {} {local} = {name};", v.ty)));
+        if let Some(s) = apply(src, &edits).filter(|s| Cst::parse(s).errors <= c.errors) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 fn interleave<T: Clone>(lists: Vec<Vec<T>>) -> Vec<T> {
