@@ -353,6 +353,22 @@ pub fn arg_order_variants(src: &str, symbol: &str) -> Vec<String> {
                 }
                 let rs: Option<Vec<usize>> = (i..i + k).map(|j| rhs(sibs[j])).collect();
                 let Some(rs) = rs else { break };
+                // a hoisted right-hand side must not read what an earlier assignment of the run
+                // writes (`p = p + 4; m = p;`: `m` would get the old `p`)
+                let lhs: Vec<usize> = (i..i + k).filter_map(|j| c.named(sibs[j]).first().and_then(|&a| c.child(a, "left"))).collect();
+                let clash = (1..k).any(|j| {
+                    (0..j).any(|e| {
+                        let l = lhs.get(e).copied();
+                        l.is_some_and(|l| {
+                            let lt = c.text(l);
+                            let ident_read = c.kind(l) == "identifier" && c.descendants(rs[j]).into_iter().any(|n| c.kind(n) == "identifier" && c.text(n) == lt);
+                            ident_read || c.text(rs[j]).contains(lt)
+                        })
+                    })
+                });
+                if clash {
+                    continue;
+                }
                 let at = c.nodes[sibs[i]].start;
                 let line_start = src[..at].rfind('\n').map(|x| x + 1).unwrap_or(0);
                 let ind = &src[line_start..at];

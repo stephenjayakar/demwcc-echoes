@@ -343,7 +343,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     debug::stage("reinline", &body, &l.vars);
     if let Some(db) = db {
         let is_temp = l.is_temp.clone();
-        aggregates::merge_copies_typing(&mut body, &mut l.vars, &|v| is_temp.get(v).copied().unwrap_or(false), db);
+        aggregates::merge_copies_typing(&mut body, &mut l.vars, &|v| is_temp.get(v).copied().unwrap_or(false), db, sig::is_ctor(&l.sig));
         arrays::container_members(&mut body, &l.vars, db);
         arrays::absolute_globals(&mut body, &l.vars, db);
         bitfields::recover(&mut body, &l.vars, db);

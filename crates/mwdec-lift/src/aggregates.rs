@@ -145,12 +145,12 @@ struct Copy {
 pub fn merge_copies(body: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> bool, db: &TypeDb) {
     let mut retype = vec![];
     let none = HashMap::new();
-    Stmt::for_each_block_mut(body, &mut |b| merge_in_list(b, vars, is_temp, db, &mut retype, &none));
+    Stmt::for_each_block_mut(body, &mut |b| merge_in_list(b, vars, is_temp, db, &mut retype, &none, false));
 }
 
 /// `merge_copies`, also typing untyped stack regions that receive a whole-object copy at their
 /// start (`T v = gSomeT;` copied member-wise into a buffer).
-pub fn merge_copies_typing(body: &mut Vec<Stmt>, vars: &mut [Var], is_temp: &dyn Fn(VarId) -> bool, db: &TypeDb) {
+pub fn merge_copies_typing(body: &mut Vec<Stmt>, vars: &mut [Var], is_temp: &dyn Fn(VarId) -> bool, db: &TypeDb, ctor: bool) {
     // a region that is a by-value argument's copy stays as it is (the by-value forwarding
     // turns `S = x; f(S)` into `f(x)`)
     let mut byval_arg: Vec<VarId> = vec![];
@@ -248,7 +248,7 @@ pub fn merge_copies_typing(body: &mut Vec<Stmt>, vars: &mut [Var], is_temp: &dyn
             snapshot[*v].ty = Type::Void;
         }
     }
-    Stmt::for_each_block_mut(body, &mut |b| merge_in_list(b, &snapshot, is_temp, db, &mut retype, &extent));
+    Stmt::for_each_block_mut(body, &mut |b| merge_in_list(b, &snapshot, is_temp, db, &mut retype, &extent, ctor));
     // one type per region (the first whole copy decides; conflicting copies keep it untyped)
     let mut seen: HashMap<VarId, Option<Type>> = HashMap::new();
     for (v, t) in retype {
@@ -267,7 +267,7 @@ pub fn merge_copies_typing(body: &mut Vec<Stmt>, vars: &mut [Var], is_temp: &dyn
     }
 }
 
-fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> bool, db: &TypeDb, retype: &mut Vec<(VarId, Type)>, extent: &HashMap<VarId, i64>) {
+fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> bool, db: &TypeDb, retype: &mut Vec<(VarId, Type)>, extent: &HashMap<VarId, i64>, ctor: bool) {
     let mut i = 0;
     while i < b.len() {
         // collect a window of temp loads + stores
@@ -358,6 +358,17 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
                 };
                 let sts = aggregate_at(db, &scls, smin);
                 for t in dts.iter().filter(|t| sts.iter().any(|s| sig::norm_name(&format!("{s:?}")) == sig::norm_name(&format!("{t:?}")))) {
+                    // (a class whose assignment is no member-wise copy, `single_ptr& operator=(single_ptr&)`
+                    // or `rc_ptr`'s counting one: its word copy into a member of the method's own
+                    // object is no `dst = src`; frame objects, a constructor's members and objects
+                    // behind other pointers (placement copies) may be under construction)
+                    let assigned = match &c0.dst_base {
+                        Expr::Var(v) => !ctor && c0.dst_ptr && matches!(vars[*v].kind, VarKind::This),
+                        _ => false,
+                    };
+                    if assigned && transfers_on_assign(db, t) {
+                        continue;
+                    }
                     let Some(fields) = flat(db, t) else { continue };
                     // a 64-bit integer member is copied as two words
                     let fields: Vec<_> = fields.into_iter().flat_map(|(o, s, f)| if s == 8 && !f { vec![(o, 4, f), (o + 4, 4, f)] } else { vec![(o, s, f)] }).collect();
@@ -416,6 +427,43 @@ fn merge_in_list(b: &mut Vec<Stmt>, vars: &[Var], is_temp: &dyn Fn(VarId) -> boo
             i += 1;
         }
     }
+}
+
+/// Does class `t` declare an assignment that is no member-wise copy: one taking its source by
+/// non-const reference (an ownership transfer: `auto_ptr`, `single_ptr`) or an inline one that
+/// tests or calls (`rc_ptr`'s reference counting)?
+fn transfers_on_assign(db: &TypeDb, t: &Type) -> bool {
+    let Some(name) = named(t) else { return false };
+    let base = |n: &str| -> String {
+        let n = n.trim();
+        let mut depth = 0;
+        let mut out = String::new();
+        for ch in n.chars() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                _ if depth == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        out.trim().to_string()
+    };
+    let cls = base(name);
+    let last = sig::split_scope(&cls).1.to_string();
+    let Some(ds) = db.decls.get(&format!("{cls}::operator=")) else { return false };
+    ds.iter().any(|d| {
+        d.params.len() == 1
+            && (match &d.params[0].ty {
+                Type::Ref(inner) => match &**inner {
+                    Type::Named(n) => {
+                        let b = base(n);
+                        b == cls || sig::split_scope(&b).1 == last
+                    }
+                    _ => false,
+                },
+                _ => false,
+            } || d.inline_body.as_deref().is_some_and(|b| b.split(' ').any(|w| w == "if" || w == "(" || w == "delete")))
+    })
 }
 
 fn stmt_uses(s: &Stmt, t: VarId) -> bool {
