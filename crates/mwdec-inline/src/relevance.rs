@@ -99,6 +99,13 @@ fn close(seeds: Vec<String>, db: &TypeDb, depth: u32) -> HashSet<String> {
         for m in &k.methods {
             classes_in_type(&m.ret, db, &mut fs);
         }
+        // a container's elements (`rstl::reserved_vector<rstl::pair<E, int>, 8>` keeps them as
+        // raw storage): the values it is filled with
+        for a in crate::complete::value_args(&c) {
+            if let Some(e) = mwdec_lift::sig::find_class(db, &a) {
+                fs.push(e.name.clone());
+            }
+        }
         frontier.extend(fs.into_iter().map(|x| (x, d + 1)));
     }
     seen

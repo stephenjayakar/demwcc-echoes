@@ -14,6 +14,7 @@ pub mod buffers;
 pub mod cflow;
 pub mod complete;
 pub mod composed;
+pub mod constfold;
 pub mod ctors;
 pub mod defctor;
 pub mod groups;
@@ -22,6 +23,7 @@ pub mod matcher;
 pub mod objlocals;
 pub mod post;
 pub mod probe;
+pub mod reflocal;
 pub mod relevance;
 pub mod safety;
 pub mod scalarinl;
@@ -148,6 +150,12 @@ fn probe_key(p: &probe::Probe) -> String {
 fn template_of(p: &probe::Probe, obj: &ObjectFile, f: &mwdec_core::Function, db: &TypeDb, db2: &TypeDb) -> Result<Template, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_lift::lift_function(obj, f, Some(db2)))) {
         Ok(Ok(ir)) => template::from_probe(p, &ir, db).and_then(|mut t| {
+            t.fixed = p.fixed.clone();
+            // a specialisation whose expansion no longer reads anything but constants and the
+            // fixed holes' neighbours is too generic to name (`f(x, false)` == `x`)
+            if !t.fixed.is_empty() && t.ops == 0 && matches!(t.shape, template::Shape::Scalar(_)) {
+                return Err("trivial specialisation".into());
+            }
             // (only trivial accessors depend on them: other inlines are told apart by their
             // code already)
             if p.needs_dead {
@@ -156,6 +164,7 @@ fn template_of(p: &probe::Probe, obj: &ObjectFile, f: &mwdec_core::Function, db:
                     return Err("accessor without dead stores".into());
                 }
             }
+            template::name_literals(&mut t, &ir);
             Ok(t)
         }),
         _ => Err("lift".into()),
@@ -322,7 +331,7 @@ pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     let t0 = std::time::Instant::now();
     let n = matcher::apply(ir, lib, db);
     if std::env::var("MWDI_DEBUG").is_ok() {
-        eprintln!("inline apply {}: {n} rewrites, {} templates, {:.2}s [{}]", ir.symbol, lib.templates.len(), t0.elapsed().as_secs_f64(), util::prof::report());
+        eprintln!("inline apply {}: {n} rewrites, {} templates, {} steps, {:.2}s [{}]", ir.symbol, lib.templates.len(), matcher::steps(), t0.elapsed().as_secs_f64(), util::prof::report());
     }
     n
 }

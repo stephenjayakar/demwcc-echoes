@@ -44,9 +44,11 @@ fn assigned_deep(b: &[Stmt], out: &mut Vec<VarId>) {
 }
 
 fn merged(global: &Defs, reach: &Defs) -> Defs {
+    // (a reaching value of a single-definition temp is its definition in terms of the values
+    // that reached it: see `update`)
     let mut d = global.clone();
     for (k, v) in reach {
-        d.entry(*k).or_insert_with(|| v.clone());
+        d.insert(*k, v.clone());
     }
     d
 }
@@ -81,6 +83,27 @@ fn update(reach: &mut Defs, s: &Stmt, cx: &Ctx) {
         }
     }
     if let Stmt::Assign { dst: Expr::Var(v), src } = s {
+        // a single-definition temp computed from a reassigned one's current value (`end = begin +
+        // n` before the walk moves `begin`): its value in terms of what reached it
+        if cx.global.contains_key(v) && !src.has_call() {
+            let mut uses_reached = false;
+            src.walk(&mut |x| {
+                if let Expr::Var(w) = x {
+                    uses_reached |= reach.contains_key(w) && !cx.global.contains_key(w);
+                }
+            });
+            if uses_reached {
+                let mut val = src.clone();
+                val.rewrite(&mut |x| {
+                    if let Expr::Var(w) = x {
+                        if let Some(d) = reach.get(w).filter(|_| !cx.global.contains_key(w)) {
+                            *x = d.clone();
+                        }
+                    }
+                });
+                reach.insert(*v, val);
+            }
+        }
         if matches!(cx.vars[*v].kind, VarKind::Local) && !cx.global.contains_key(v) && !src.has_call() && !src.uses_var(*v) {
             // no cycles through other known values
             let defs = merged(cx.global, reach);

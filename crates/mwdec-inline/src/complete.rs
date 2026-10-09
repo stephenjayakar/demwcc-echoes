@@ -53,8 +53,45 @@ pub fn incomplete_instances(db: &TypeDb) -> Vec<String> {
             }
         }
     }
+    // instances only named as template arguments (`rstl::pair<E, int>` of
+    // `rstl::reserved_vector<rstl::pair<E, int>, 8>`): the elements pushed into containers
+    let mut args: Vec<String> = vec![];
+    for cname in db.classes.keys() {
+        if cname.contains('<') {
+            instance_args(cname, &mut args);
+        }
+    }
+    for n in args {
+        let base = &n[..n.find('<').unwrap_or(n.len())];
+        if db.templates.contains_key(base) && !db.classes.contains_key(&n) && !out.contains(&n) && !n.contains('(') && !n.contains('@') && !n.contains('$') && !bare_template(&n, db) {
+            out.push(n);
+        }
+    }
     out.truncate(MAX_CLASSES);
     out
+}
+
+/// The type arguments of class template instance `name` held by value (`T` of
+/// `rstl::vector<T, A>`; not pointers or references).
+pub(crate) fn value_args(name: &str) -> Vec<String> {
+    let (Some(lt), true) = (name.find('<'), name.ends_with('>')) else { return vec![] };
+    mwdec_lift::sig::split_top(&name[lt + 1..name.len() - 1], ',')
+        .into_iter()
+        .map(|a| a.trim().strip_prefix("const ").unwrap_or(a.trim()).to_string())
+        .filter(|a| !a.contains('*') && !a.contains('&'))
+        .collect()
+}
+
+/// Template-instance spellings among the template arguments of `name`, at any depth.
+fn instance_args(name: &str, out: &mut Vec<String>) {
+    for a in value_args(name) {
+        if a.contains('<') && a.ends_with('>') {
+            if !out.contains(&a) {
+                out.push(a.clone());
+            }
+            instance_args(&a, out);
+        }
+    }
 }
 
 /// Does the spelling still name a class template without arguments (`rstl::basic_string`,

@@ -244,6 +244,11 @@ impl<'a, 'e> M<'a, 'e> {
     }
 
     pub fn m(&mut self, p: &Expr, t: &Expr) -> bool {
+        // (a bounded amount of matching per function: backtracking over commutative operands
+        // and nested candidates can otherwise grow without limit)
+        if !step() {
+            return false;
+        }
         let defs = self.defs();
         // a value an earlier fold already named (`size()`): matched in its expanded form
         if !matches!(p, Expr::Var(_) | Expr::Call { .. }) {
@@ -251,14 +256,38 @@ impl<'a, 'e> M<'a, 'e> {
                 return self.m(p, &u);
             }
         }
+        // a call the pattern makes that an earlier fold named as a forwarding inline
+        // (`ldexp(x, n)` folded as `scalbn(x, n)` before `ldexpf`'s `(float)ldexp(..)` is tried):
+        // inline expansion is transparent, so the pattern call matches the fold's expansion
+        if let (Expr::Call { callee: pc, .. }, Expr::Call { callee: tc, .. }) = (p, res(t, defs)) {
+            let name = |c: &Callee| match c {
+                Callee::Direct { sig, .. } | Callee::Method { sig, .. } => Some(sig.qualified_name.clone()),
+                _ => None,
+            };
+            let folded = matches!(tc, Callee::Direct { sig, .. } | Callee::Method { sig, .. } if sig.mangled.is_none());
+            if folded && name(pc) != name(tc) && std::env::var("MWDI_UNFOLD_CALL").is_ok() {
+                if let Some(u) = unfold(res(t, defs), self.env) {
+                    if matches!(u, Expr::Call { .. }) {
+                        let snap = self.b.clone();
+                        if self.m(p, &u) {
+                            return true;
+                        }
+                        self.b = snap;
+                    }
+                }
+            }
+        }
         // the value of a scalar reference parameter: bound to the lvalue read
         if let Expr::Load { base, offset: 0, .. } | Expr::Member { base, offset: 0, .. } = p {
             if let Expr::Var(h) = &**base {
                 if matches!(self.t.holes.get(*h), Some(HoleKind::ScalarRef(_))) {
                     let rt = res(t, defs);
-                    if !matches!(rt, Expr::Load { .. } | Expr::Member { .. } | Expr::Global { .. }) {
+                    // (or a variable: a parameter or local passed by reference)
+                    let var = matches!(t, Expr::Var(v) if matches!(self.env.vars[*v].kind, VarKind::Param { .. } | VarKind::Local | VarKind::Stack { .. }));
+                    if !matches!(rt, Expr::Load { .. } | Expr::Member { .. } | Expr::Global { .. }) && !var {
                         return false;
                     }
+                    let rt = if matches!(t, Expr::Var(_)) && !ok_lvalue(rt) { t } else { rt };
                     return match &self.b[*h] {
                         None => {
                             self.b[*h] = Some(Bind::Val(rt.clone()));
@@ -303,6 +332,11 @@ impl<'a, 'e> M<'a, 'e> {
                     HoleKind::Obj { class, .. } => class.clone(),
                     _ => return false,
                 };
+                // (an object starting before the address read: a same-shaped inline of another
+                // member, `GetAlpha()` at `p - 3` for `GetRed()` at `p`)
+                if to < k {
+                    return false;
+                }
                 return self.bind_addr(h, mk_addr(tb, to - k, &cls));
             }
         }
@@ -414,7 +448,7 @@ impl<'a, 'e> M<'a, 'e> {
                 (Expr::Cast { ty, e }, Expr::Cast { ty: ty2, e: e2 }) => vclass(ty, self.env.db) == vclass(ty2, self.env.db) && self.m(e, e2),
                 (Expr::Int { value, .. }, Expr::Int { value: v2, .. }) => value == v2,
                 (Expr::Float { bits, double }, Expr::Float { bits: b2, double: d2 }) => bits == b2 && double == d2,
-                (Expr::Global { symbol, .. }, Expr::Global { symbol: s2, .. }) => symbol == s2,
+                (Expr::Global { symbol, .. }, Expr::Global { symbol: s2, .. }) => symbol == s2 || symbol.strip_prefix(crate::template::LITERAL_PREFIX).is_some_and(|h| literal_hex(s2).as_deref() == Some(h)),
                 (Expr::FuncAddr { symbol }, Expr::FuncAddr { symbol: s2 }) => symbol == s2,
                 (Expr::Str { bytes }, Expr::Str { bytes: b2 }) => bytes == b2,
                 (Expr::AddrOf(a), Expr::AddrOf(b)) => self.m(a, b),
@@ -454,6 +488,19 @@ impl<'a, 'e> M<'a, 'e> {
                     };
                     ok && args.iter().zip(a2).all(|(x, y)| self.m(x, y))
                 }
+                // a ternary decided by constant arguments: the compiler kept one arm (constfold.rs)
+                (Expr::Ternary { c, t: a, f, .. }, _) if std::env::var("MWDI_NO_CONSTIF").is_err() && crate::constfold::decidable(c, &self.t.holes) => {
+                    let snap = self.b.clone();
+                    if self.m(a, t) && crate::constfold::solve(c, true, self) {
+                        return true;
+                    }
+                    self.b = snap.clone();
+                    if self.m(f, t) && crate::constfold::solve(c, false, self) {
+                        return true;
+                    }
+                    self.b = snap;
+                    false
+                }
                 _ => false,
             }
         }
@@ -463,6 +510,9 @@ impl<'a, 'e> M<'a, 'e> {
     /// pattern takes the matching target pointer term plus the constant difference; the other
     /// terms pair up with equal scales.
     fn m_linear(&mut self, pb: &Expr, po: i64, tb: &Expr, to: i64) -> bool {
+        // (an address an earlier fold named, `v.end()`: its expansion)
+        let unfolded = unfold(res(tb, self.defs()), self.env);
+        let tb = unfolded.as_ref().unwrap_or(tb);
         let mut pt = vec![];
         let mut pc = po;
         if !linear(pb, 1, &mut pt, &mut pc, None, 0) {
@@ -534,6 +584,11 @@ impl<'a, 'e> M<'a, 'e> {
             if matches!(k, HoleKind::Local) {
                 continue;
             }
+            // a constant-argument specialisation: the call passes the constant
+            if let Some((_, c)) = self.t.fixed.iter().find(|(fh, _)| *fh == h) {
+                out.push(c.clone());
+                continue;
+            }
             let b = self.b[h].as_ref()?;
             match (k, b) {
                 (HoleKind::Scalar(_), Bind::Val(e)) => out.push(e.clone()),
@@ -553,10 +608,20 @@ impl<'a, 'e> M<'a, 'e> {
                     match crate::addr::object_at(&b, o, class, self.env) {
                         Some((a, _)) => {
                             score -= class_depth(self.env.db, &b, o, class, self.env).unwrap_or(0) as i32;
-                            out.push(if !typed_ptr_to(e, class, self.env) { a } else { e.clone() });
+                            let a = if !typed_ptr_to(e, class, self.env) { a } else { e.clone() };
+                            // (a reference local is the object: its address is `&r`)
+                            let a = match a {
+                                Expr::Var(v) if matches!(self.env.vars[v].ty, Type::Ref(_)) => Expr::AddrOf(Box::new(Expr::Var(v))),
+                                a => a,
+                            };
+                            out.push(a);
                         }
                         None => {
                             if typed_ptr_to(e, class, self.env) {
+                                out.push(e.clone());
+                            } else if !*ptr && matches!(e, Expr::Var(_)) && class_name(&ty_of(e, self.env.vars), self.env.db).is_some_and(|c| is_base_or_same(self.env.db, class, &c)) {
+                                // a variable holding the object itself (a parameter the lifter
+                                // keeps as a value)
                                 out.push(e.clone());
                             } else if !*ptr && matches!(k, HoleKind::Obj { temp_ok: true, .. }) && matches!(strip(&ty_of(res(e, self.env.defs), self.env.vars)), Type::Ptr(x) if matches!(strip(x), Type::Int { size: 1, .. } | Type::Void | Type::Unknown { .. })) {
                                 // a const reference argument reached through a byte pointer
@@ -584,12 +649,26 @@ impl<'a, 'e> M<'a, 'e> {
                         score += sc;
                         // pointer holes (`this` of a const method) take the temporary's address
                         out.push(if *ptr { Expr::AddrOf(Box::new(v)) } else { v });
+                    } else if *temp_ok && !*ptr && depth < 3 && whole_object(self.env, class, m) {
+                        // a statement inline's argument built in place (`push_back(pair(a, b))`):
+                        // only as its class's constructor
+                        let (v, sc) = explain_object(self.env, class, m, depth + 1)?;
+                        if !matches!(v, Expr::Construct { .. }) {
+                            return None;
+                        }
+                        score += sc;
+                        out.push(v);
                     } else {
                         return None;
                     }
                 }
                 _ => return None,
             }
+        }
+        // an operand the source named (a reference local bound to an accessor's result): the
+        // value is an object expression, not member-wise arithmetic
+        if out.iter().any(|a| matches!(a, Expr::AddrOf(x) if matches!(&**x, Expr::Var(v) if matches!(self.env.vars[*v].ty, Type::Ref(_)) && matches!(self.env.vars[*v].kind, VarKind::Stack { .. })))) {
+            score += CTOR_PENALTY;
         }
         Some((out, score))
     }
@@ -694,6 +773,7 @@ pub fn reset_memos() {
         c.0 = 0;
         c.1.clear();
     });
+    ACCESSORS.with(|a| *a.borrow_mut() = (0, std::rc::Rc::new(vec![])));
 }
 
 pub fn class_at_pub(db: &TypeDb, outer: &str, off: i32, cls: &str) -> bool {
@@ -825,6 +905,11 @@ fn whole_value(env: &Env, m: &BTreeMap<i32, Expr>, cls: &str) -> Option<Expr> {
     (class_name(&bty, env.db).as_deref() == Some(cls)).then(|| b.clone())
 }
 
+/// Does `m` set every flat field of `cls`?
+fn whole_object(env: &Env, cls: &str, m: &BTreeMap<i32, Expr>) -> bool {
+    crate::template::flat_fields(env.db, cls).is_some_and(|f| f.len() == m.len() && f.iter().all(|(o, _)| m.contains_key(o)))
+}
+
 /// Is the object at address `a` const (reached from a pointer/reference to const)?
 fn const_object(a: &Expr, env: &Env) -> bool {
     let mut e = a;
@@ -852,9 +937,15 @@ fn const_object(a: &Expr, env: &Env) -> bool {
 pub fn explain_object(env: &Env, cls: &str, m: &BTreeMap<i32, Expr>, depth: u32) -> Option<(Expr, i32)> {
     let list = env.objects.get(&mwdec_lift::sig::norm_name(cls))?;
     let mut best: Option<(Expr, i32)> = None;
+    // one value in every component, computed once (`CVector3f(r, r, r)`): the member-wise
+    // constructor, not an operator that would compute it per component
+    let splat = m.len() > 1 && m.values().all(|v| teq(v, m.values().next().unwrap(), env.defs)) && !matches!(m.values().next(), Some(Expr::Int { .. } | Expr::Float { .. }));
     for &ti in list {
         let t = &env.lib.templates[ti];
         let Shape::Object { comps, .. } = &t.shape else { continue };
+        if splat && !matches!(t.kind, CallKind::Ctor) {
+            continue;
+        }
         // every bound component must be produced by the template
         if !m.keys().all(|o| comps.iter().any(|c| c.off == *o)) {
             continue;
@@ -966,6 +1057,13 @@ pub struct Index {
     pub objects: HashMap<String, Vec<usize>>,
     /// object + mutate templates usable on store groups, most specific first
     pub groups: Vec<usize>,
+    /// member accessors returning a member's address or a reference to it (`T& GetM() { return
+    /// m; }`, `T* GetM() { return &m; }`): (template, member offset)
+    pub member_refs: Vec<(usize, i32)>,
+    /// member accessors returning a member's value (`T GetM() const { return m; }`, also through
+    /// nested trivial inlines: `int GetNum() const { return x18_list.size(); }`): (template,
+    /// member offset, value type)
+    pub member_reads: Vec<(usize, i32, Type)>,
 }
 
 fn is_identity_copy(t: &Template) -> bool {
@@ -987,7 +1085,25 @@ pub fn index(lib: &InlineLib) -> Index {
     let mut cflow = vec![];
     let mut objects: HashMap<String, Vec<usize>> = HashMap::new();
     let mut groups = vec![];
+    let mut member_refs = vec![];
+    let mut member_reads = vec![];
     for (i, t) in lib.templates.iter().enumerate() {
+        let op_name = mwdec_lift::sig::split_scope(&t.name).1.starts_with("operator");
+        if let (Shape::Scalar(p), CallKind::Method, 1, false) = (&t.shape, &t.kind, t.holes.len(), op_name) {
+            // (a by-value class return is matched with its dead copy stores elsewhere)
+            if matches!(p, Expr::AddrOf(_)) && t.dead.is_empty() && matches!(strip(&t.sig.ret), Type::Ref(_) | Type::Ptr(_)) {
+                if let Some((0, k)) = pat_canon(p, &t.holes) {
+                    member_refs.push((i, k));
+                }
+            }
+            // (a scalar result: by-value class returns are object templates)
+            let scalar_ret = !matches!(strip(&t.sig.ret), Type::Named(_)) && mwdec_lift::scalar_size(strip(&t.sig.ret)).is_some();
+            if !t.ret_ref && t.dead.is_empty() && scalar_ret {
+                if let Some((0, k, ty)) = comp_of(p, &t.holes) {
+                    member_reads.push((i, k, ty.clone()));
+                }
+            }
+        }
         match &t.shape {
             Shape::Scalar(Expr::AddrOf(inner)) if t.ret_ref && matches!(&**inner, Expr::Index { .. }) => {
                 refs.push(i);
@@ -1009,7 +1125,9 @@ pub fn index(lib: &InlineLib) -> Index {
                 groups.push(i);
             }
             Shape::Mutate { comps, .. } => {
-                if !comps.is_empty() && (t.ops >= 1 || !t.dead.is_empty()) {
+                // (plain member stores only for members the caller may not name: see
+                // `groups::try_segment`)
+                if !comps.is_empty() && (t.ops >= 1 || !t.dead.is_empty() || comps.len() >= 2) {
                     groups.push(i);
                 }
             }
@@ -1028,24 +1146,652 @@ pub fn index(lib: &InlineLib) -> Index {
     for v in objects.values_mut() {
         v.sort_by_key(key);
     }
-    Index { stmts, refs, scalars, cflow, objects, groups }
+    Index { stmts, refs, scalars, cflow, objects, groups, member_refs, member_reads }
+}
+
+/// Pattern-match steps one function may take ([`M::m`] calls; train functions take at most ~10^5);
+/// past it every match fails.
+const MAX_STEPS: u64 = 5_000_000;
+
+thread_local! {
+    static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one matching step; false once the function's budget is spent.
+fn step() -> bool {
+    STEPS.with(|s| {
+        let n = s.get() + 1;
+        s.set(n);
+        n <= MAX_STEPS
+    })
+}
+
+/// Matching steps taken for the current function.
+pub fn steps() -> u64 {
+    STEPS.with(|s| s.get())
 }
 
 pub fn apply(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
+    STEPS.with(|s| s.set(0));
+    OWN.with(|o| *o.borrow_mut() = (ir.sig.this_class.clone(), ir.sig.qualified_name.clone()));
     // (per function: memos keyed by a TypeDb's address must not outlive it)
     reset_memos();
     TARGET_DEAD.with(|d| *d.borrow_mut() = ir.dead_stores.iter().map(|x| (x.size, x.value.clone())).collect());
     LITERALS.with(|d| *d.borrow_mut() = ir.literal_bytes.iter().cloned().collect());
+    TEMPS.with(|d| *d.borrow_mut() = ir.temp_bytes.iter().cloned().collect());
     crate::walkptr::apply(ir, lib, db);
     let n = apply_inner(ir, lib, db);
     TARGET_DEAD.with(|d| d.borrow_mut().clear());
     LITERALS.with(|d| d.borrow_mut().clear());
+    TEMPS.with(|d| d.borrow_mut().clear());
     n
+}
+
+thread_local! {
+    /// The function being rewritten: (its class, its qualified name), for member access checks.
+    static OWN: std::cell::RefCell<(Option<String>, String)> = const { std::cell::RefCell::new((None, String::new())) };
+}
+
+/// Can the function being rewritten name member `field` of `owner` (C++98 access: its own
+/// class, a friend, protected members from a derived class)?
+pub fn member_accessible(db: &TypeDb, owner: &str, field: &str) -> bool {
+    let (own, fname) = OWN.with(|o| o.borrow().clone());
+    let norm = mwdec_lift::sig::norm_name;
+    if own.as_deref().is_some_and(|o| norm(o) == norm(owner)) {
+        return true;
+    }
+    let befriended = || {
+        let strip_t = |s: &str| s.split('<').next().unwrap_or(s).to_string();
+        let fr = db.friends.get(owner).or_else(|| db.friends.get(&strip_t(owner)));
+        let last = |s: &str| mwdec_lift::sig::split_scope(&strip_t(s)).1.to_string();
+        let short = mwdec_lift::sig::split_scope(&fname).1.to_string();
+        fr.is_some_and(|fr| fr.iter().any(|f| own.as_deref().is_some_and(|o| norm(o) == norm(f) || last(o) == last(f)) || (own.is_none() && (short == *f || fname == *f))))
+    };
+    let access = mwdec_lift::sig::find_class(db, owner).and_then(|c| c.fields.iter().find(|f| f.name == field)).map(|f| f.access.clone());
+    match access {
+        Some(mwdec_core::Access::Public) | None => true,
+        Some(mwdec_core::Access::Protected) => befriended() || own.as_deref().is_some_and(|o| is_base_or_same_any(db, owner, o)),
+        Some(mwdec_core::Access::Private) => befriended(),
+    }
+}
+
+/// Can the function name the object at `delta` inside what `b` points at (every member on the
+/// way accessible)? An accessor of an object it can't reach by name doesn't help.
+fn object_path_ok(db: &TypeDb, b: &Expr, delta: i32, env: &Env) -> bool {
+    if delta == 0 {
+        return true;
+    }
+    let Some(outer) = crate::addr::outer_class(b, env) else { return false };
+    match mwdec_lift::types::field_path(db, &outer, delta, 0) {
+        Some((path, _)) => path.iter().all(|pe| !matches!(pe, mwdec_lift::types::PathElem::Field(n, owner) if !member_accessible(db, owner, n))),
+        None => true,
+    }
+}
+
+/// Is `derived` `base` or derived from it (at any offset)?
+fn is_base_or_same_any(db: &TypeDb, base: &str, derived: &str) -> bool {
+    if mwdec_lift::sig::norm_name(base) == mwdec_lift::sig::norm_name(derived) {
+        return true;
+    }
+    let Some(c) = mwdec_lift::sig::find_class(db, derived) else { return false };
+    c.bases.iter().any(|b| is_base_or_same_any(db, base, &b.name))
+}
+
+/// A trivial member accessor of the headers (`T GetM() const { return m; }`, `const T& M() const
+/// { return m; }`, `T* GetM() { return &m; }`, `return a.b;`): probes skip them (the emitter
+/// names them for plain reads), so they are read from the declarations.
+#[derive(Clone, Debug)]
+pub struct Accessor {
+    pub sig: mwdec_core::FuncSig,
+    pub class: String,
+    /// offset of the member in `class`, its type
+    pub off: i32,
+    pub ty: Type,
+    /// 0 value, 1 reference, 2 pointer (`return &m;`), 3 reference to a pointer member's
+    /// pointee (`return *m;`: the member's value is the result's address)
+    pub how: u8,
+    /// (field, owner) of every member named on the way (`a`, then `b` of `a`'s class)
+    pub fields: Vec<(String, String)>,
+}
+
+/// Field `name` of `class` or of one of its bases: (offset in `class`, type, owner).
+fn field_named(db: &TypeDb, class: &str, name: &str, depth: u32) -> Option<(i32, Type, String)> {
+    if depth > 8 {
+        return None;
+    }
+    let c = mwdec_lift::sig::find_class(db, class)?;
+    if let Some(f) = c.fields.iter().find(|f| f.name == name && f.bitfield.is_none()) {
+        return Some((f.offset as i32, f.ty.clone(), c.name.clone()));
+    }
+    for b in &c.bases {
+        if let Some((o, t, ow)) = field_named(db, &b.name, name, depth + 1) {
+            return Some((o + b.offset as i32, t, ow));
+        }
+    }
+    None
+}
+
+thread_local! {
+    static ACCESSORS: std::cell::RefCell<(usize, std::rc::Rc<Vec<Accessor>>)> = std::cell::RefCell::new((0, std::rc::Rc::new(vec![])));
+}
+
+/// The trivial accessors of the context's classes (memoised per TypeDb).
+pub fn accessors(db: &TypeDb) -> std::rc::Rc<Vec<Accessor>> {
+    let id = db as *const TypeDb as usize ^ db.decls.len();
+    if let Some(v) = ACCESSORS.with(|a| (a.borrow().0 == id).then(|| a.borrow().1.clone())) {
+        return v;
+    }
+    let mut out = vec![];
+    let ident = |s: &str| s.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_');
+    for (key, ds) in &db.decls {
+        let qname = crate::probe::norm_op_name(key);
+        let (scope, last) = mwdec_lift::sig::split_scope(&qname);
+        let Some(scope) = scope else { continue };
+        if scope.contains('<') || last.starts_with("operator") {
+            continue;
+        }
+        let Some(cls) = mwdec_lift::sig::find_class(db, scope) else { continue };
+        let class = cls.name.clone();
+        for d in ds {
+            if !d.is_inline_defined || d.is_static || d.is_virtual || !d.params.is_empty() || !d.template_params.is_empty() || d.access != mwdec_core::Access::Public {
+                continue;
+            }
+            let Some(body) = d.inline_body.as_deref() else { continue };
+            let t: Vec<&str> = body.split_whitespace().collect();
+            let (amp, names): (bool, Vec<&str>) = match t.as_slice() {
+                ["return", a, ";"] if ident(a) => (false, vec![a]),
+                ["return", "this", "->", a, ";"] if ident(a) => (false, vec![a]),
+                ["return", "&", a, ";"] if ident(a) => (true, vec![a]),
+                ["return", a, ".", b, ";"] if ident(a) && ident(b) => (false, vec![a, b]),
+                // a reference to what a pointer member points at (`T& GetOwner() { return *mOwner; }`)
+                ["return", "*", a, ";"] if ident(a) => (false, vec![a]),
+                _ => continue,
+            };
+            let deref = t.get(1) == Some(&"*");
+            let mut off = 0;
+            let mut cur = class.clone();
+            let mut ty = Type::Void;
+            let mut fields = vec![];
+            let mut ok = true;
+            for n in &names {
+                match field_named(db, &cur, n, 0) {
+                    Some((o, t, owner)) => {
+                        off += o;
+                        fields.push((n.to_string(), owner));
+                        ty = t;
+                        if let Some(c) = class_name(&ty, db) {
+                            cur = c;
+                        }
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || matches!(strip(&ty), Type::Ref(_)) || (deref && !matches!(strip(&ty), Type::Ptr(_))) {
+                continue;
+            }
+            let how = match (strip(&d.ret), amp) {
+                (Type::Ref(_), false) if deref => 3,
+                (Type::Ref(_), false) => 1,
+                (Type::Ptr(_), true) => 2,
+                (r, false) if mwdec_lift::scalar_size(strip(&mwdec_lift::types::resolve(Some(db), r).into_owned())).is_some() || mwdec_lift::types::is_enum(Some(db), r) => 0,
+                _ => continue,
+            };
+            let sig = mwdec_core::FuncSig {
+                qualified_name: format!("{class}::{last}"),
+                mangled: None,
+                ret: d.ret.clone(),
+                params: vec![],
+                this_class: Some(class.clone()),
+                is_const: d.is_const,
+                is_static: false,
+                is_virtual: false,
+                variadic: false,
+                runs_code: false,
+            };
+            if std::env::var("MWDI_TRACE_ACC").is_ok_and(|f| sig.qualified_name.contains(f.as_str())) {
+                eprintln!("ACC {} how {how} off {off:#x} ty {ty:?} ret {:?} key {key} body {body}", sig.qualified_name, d.ret);
+            }
+            out.push(Accessor { sig, class: class.clone(), off, ty, how, fields });
+        }
+    }
+    let rc = std::rc::Rc::new(out);
+    ACCESSORS.with(|a| *a.borrow_mut() = (id, rc.clone()));
+    rc
+}
+
+/// Final naming pass: member reads / member addresses the function can't name become the
+/// class's accessor calls. Runs after every other fold, so templates that read the same members
+/// (`ALAUp()` = `mAnaLeftY > 0.f ? mAnaLeftY : 0.f`) see them first.
+fn accessor_stmts(b: &mut [Stmt], env: &Env, idx: &Index) -> usize {
+    let mut n = 0;
+    for s in b.iter_mut() {
+        match s {
+            Stmt::Assign { dst, src } => {
+                n += accessor_expr(src, env, idx);
+                match dst {
+                    Expr::Load { base, .. } | Expr::Member { base, .. } => n += accessor_expr(base, env, idx),
+                    Expr::Index { base, index, .. } => n += accessor_expr(base, env, idx) + accessor_expr(index, env, idx),
+                    _ => {}
+                }
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => n += accessor_expr(e, env, idx),
+            Stmt::If { cond, then, els } => {
+                n += accessor_expr(cond, env, idx);
+                n += accessor_stmts(then, env, idx) + accessor_stmts(els, env, idx);
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                n += accessor_expr(cond, env, idx);
+                n += accessor_stmts(body, env, idx);
+            }
+            Stmt::For { init, cond, step, body } => {
+                n += accessor_expr(cond, env, idx);
+                n += accessor_stmts(init, env, idx) + accessor_stmts(step, env, idx) + accessor_stmts(body, env, idx);
+            }
+            Stmt::Switch { e, cases } => {
+                n += accessor_expr(e, env, idx);
+                for c in cases {
+                    n += accessor_stmts(&mut c.body, env, idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+fn accessor_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
+    // (then the accessor's own object: `bc.GetOwner().GetModelData()`)
+    if std::env::var("MWDI_NO_MEMBER_REFS").is_err() {
+        if let Some(call) = member_ref_call(e, env, idx) {
+            if std::env::var("MWDI_TRACE_ACC").is_ok() {
+                eprintln!("MREF {e:?} -> {call:?}");
+            }
+            return 1 + name_inside(e, call, env, idx);
+        }
+    }
+    if std::env::var("MWDI_NO_MEMBER_READS").is_err() {
+        if let Some(call) = member_read_call(e, env, idx) {
+            return 1 + name_inside(e, call, env, idx);
+        }
+    }
+    let mut n = 0;
+    match e {
+        // the address of a member lvalue: its base only (a value accessor's call is no lvalue)
+        Expr::AddrOf(x) if matches!(&**x, Expr::Load { .. } | Expr::Member { .. }) => {
+            if let Expr::Load { base, .. } | Expr::Member { base, .. } = &mut **x {
+                n += accessor_expr(base, env, idx);
+            }
+        }
+        Expr::AddrOf(x) | Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } => n += accessor_expr(x, env, idx),
+        Expr::Load { base, .. } | Expr::Member { base, .. } | Expr::BitField { base, .. } => n += accessor_expr(base, env, idx),
+        Expr::Index { base, index, .. } => n += accessor_expr(base, env, idx) + accessor_expr(index, env, idx),
+        Expr::Binary { l, r, .. } => n += accessor_expr(l, env, idx) + accessor_expr(r, env, idx),
+        Expr::Ternary { c, t, f, .. } => n += accessor_expr(c, env, idx) + accessor_expr(t, env, idx) + accessor_expr(f, env, idx),
+        Expr::Call { callee, args, .. } => {
+            match callee {
+                Callee::Method { this, .. } | Callee::Virtual { this, .. } => n += accessor_expr(this, env, idx),
+                Callee::Indirect(x) => n += accessor_expr(x, env, idx),
+                _ => {}
+            }
+            for a in args {
+                n += accessor_expr(a, env, idx);
+            }
+        }
+        // (a member-wise copy of an object, `T(p->a, p->b, p->c)`, stays one: the emitter
+        // spells it as the object read)
+        Expr::Construct { class, args, .. } if copied_object(class, args, env) => {}
+        Expr::Construct { args, .. } | Expr::New { args, .. } => {
+            for a in args {
+                n += accessor_expr(a, env, idx);
+            }
+        }
+        _ => {}
+    }
+    n
+}
+
+/// Are `args` the flat fields of `class`, read in layout from one address?
+fn copied_object(class: &Type, args: &[Expr], env: &Env) -> bool {
+    let Some(cn) = class_name(class, env.db) else { return false };
+    let Some(fields) = crate::template::flat_fields(env.db, &cn) else { return false };
+    if fields.len() != args.len() || args.len() < 2 {
+        return false;
+    }
+    let mut base: Option<(Expr, i32)> = None;
+    for ((off, _), a) in fields.iter().zip(args) {
+        let a = match a {
+            Expr::Cast { e, .. } => &**e,
+            a => a,
+        };
+        if !matches!(a, Expr::Load { .. } | Expr::Member { .. }) {
+            return false;
+        }
+        let Some((p, o)) = crate::addr::access(res(a, env.defs), env) else { return false };
+        match &base {
+            None => base = Some((p, o - off)),
+            Some((p0, d0)) => {
+                if *d0 != o - off || !teq(p0, &p, env.defs) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The address of the `cls` object a member access `e` reads, spelled from `e`'s own base where
+/// it can be (`t->m` keeps the temp `t`: resolving it would drop its definition's other uses),
+/// else from the canonical base `b` + `off`.
+fn object_as_written(e: &Expr, b: &Expr, off: i32, cls: &str, env: &Env) -> Option<Expr> {
+    let canon = crate::addr::object_at(b, off, cls, env)?.0;
+    let raw = match e {
+        Expr::AddrOf(x) => match &**x {
+            Expr::Load { base, offset, .. } => Some(((**base).clone(), *offset)),
+            Expr::Member { base, offset, .. } => Some((Expr::AddrOf(base.clone()), *offset)),
+            _ => None,
+        },
+        Expr::Load { base, offset, .. } => Some(((**base).clone(), *offset)),
+        Expr::Member { base, offset, .. } => Some((Expr::AddrOf(base.clone()), *offset)),
+        _ => None,
+    };
+    if let Some((rb, _)) = raw {
+        // the raw base's canonical form: the same pointer as `b`, `co` bytes on
+        let (cb, co) = crate::addr::canon_ptr(&rb, env);
+        if teq(&cb, b, env.defs) && off >= co {
+            if let Some((a, _)) = crate::addr::object_at(&rb, off - co, cls, env) {
+                return Some(a);
+            }
+        }
+    }
+    Some(canon)
+}
+
+/// Replace `e` by its accessor call, then name what the call's own object is reached through
+/// (`bc.GetOwner().GetModelData()`): not that object's address itself, which an accessor of an
+/// enclosing object at the same address would name again, around and around.
+fn name_inside(e: &mut Expr, call: Expr, env: &Env, idx: &Index) -> usize {
+    *e = call;
+    let c = match e {
+        Expr::AddrOf(x) => &mut **x,
+        c => c,
+    };
+    let Expr::Call { callee: Callee::Method { this, .. }, .. } = c else { return 0 };
+    match &mut **this {
+        Expr::AddrOf(x) => match &mut **x {
+            Expr::Load { base, .. } | Expr::Member { base, .. } => accessor_expr(base, env, idx),
+            _ => 0,
+        },
+        Expr::Load { base, .. } | Expr::Member { base, .. } => accessor_expr(base, env, idx),
+        other => accessor_expr(other, env, idx),
+    }
+}
+
+/// Rank of an accessor choice (lower is better): named const getters first, as the emitter.
+fn acc_rank(name: &str, is_const: bool) -> u8 {
+    if name.starts_with("operator") {
+        4
+    } else if is_const {
+        0
+    } else {
+        1
+    }
+}
+
+/// `&obj.m` / `(char*)obj + k` for a member the function can't name: the class's accessor
+/// returning a reference to it or its address (`obj.GetM()`), when the headers have one.
+fn member_ref_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
+    // explicit member addresses only (a plain object pointer is not the address of its first
+    // member)
+    let explicit = match e {
+        Expr::AddrOf(x) => matches!(&**x, Expr::Load { .. } | Expr::Member { .. }),
+        Expr::Binary { op: BinOp::Add, r, .. } => matches!(&**r, Expr::Int { value, .. } if *value > 0),
+        _ => false,
+    };
+    if !explicit || !matches!(vclass(&ty_of(e, env.vars), env.db), 2) {
+        return None;
+    }
+    let (b, o) = crate::addr::canon_ptr(e, env);
+    // the object the address is used as (`Dot(v, plane.mNormal)` wants a CVector3f): an accessor
+    // returning another class (a derived `const CUnitVector3f&`) would need a cast
+    let want = mwdec_lift::pointee(&ty_of(e, env.vars)).and_then(|t| class_name(t, env.db));
+    let fits = |ret: &Type| match (&want, mwdec_lift::pointee(strip(ret)).and_then(|t| class_name(t, env.db))) {
+        (Some(w), Some(r)) => mwdec_lift::sig::norm_name(w) == mwdec_lift::sig::norm_name(&r),
+        _ => true,
+    };
+    // (rank, template, object address)
+    let mut best: Option<(u8, usize, Expr)> = None;
+    for &(ti, k) in &idx.member_refs {
+        let t = &env.lib.templates[ti];
+        let HoleKind::Obj { class, .. } = &t.holes[0] else { continue };
+        if o < k || !fits(&t.sig.ret) {
+            continue;
+        }
+        let Some(addr) = object_as_written(e, &b, o - k, class, env) else { continue };
+        if !object_path_ok(env.db, &b, o - k, env) {
+            continue;
+        }
+        if k == 0 {
+            // the object's own address: only through an explicit member lvalue of another type
+            let Expr::AddrOf(x) = e else { continue };
+            if class_name(&ty_of(x, env.vars), env.db).map_or(true, |c| is_base_or_same(env.db, class, &c)) {
+                continue;
+            }
+        }
+        // the member must be one this function can't name itself
+        let Some((path, _)) = mwdec_lift::types::field_path(env.db, class, k, 0) else { continue };
+        // (the first member on the way the function can't name must be the accessor class's own:
+        // otherwise the inner object's accessor names it, `mPtr.get()`, not the outer one's)
+        let first_hidden = path.iter().find_map(|pe| match pe {
+            mwdec_lift::types::PathElem::Field(n, owner) if !member_accessible(env.db, owner, n) => Some(owner.clone()),
+            _ => None,
+        });
+        let hidden = first_hidden.is_some_and(|ow| is_base_or_same_any(env.db, &ow, class));
+        if !hidden {
+            continue;
+        }
+        // a const object only has its const accessors
+        let cobj = const_object(&addr, env);
+        if cobj && !t.sig.is_const {
+            continue;
+        }
+        let name = mwdec_lift::sig::split_scope(&t.name).1.to_string();
+        // named const getters first (as the emitter's accessor choice); of an overload pair the
+        // non-const one on a non-const object
+        let rank = if name.starts_with("operator") { 4 } else if t.sig.is_const { 0 } else { 1 } + if t.guessed { 8 } else { 0 };
+        let better = match &best {
+            None => true,
+            Some((r, bi, _)) => {
+                let bt = &env.lib.templates[*bi];
+                let bn = mwdec_lift::sig::split_scope(&bt.name).1.to_string();
+                if bn == name && !cobj {
+                    !t.sig.is_const && bt.sig.is_const
+                } else {
+                    rank < *r
+                }
+            }
+        };
+        if better {
+            best = Some((rank, ti, addr));
+        }
+    }
+    // trivial accessors from the declarations
+    let accs = accessors(env.db);
+    let mut best_d: Option<(u8, String, usize, Expr)> = None;
+    for (ai, a) in accs.iter().enumerate() {
+        if matches!(a.how, 0 | 3) || o < a.off || !fits(&a.sig.ret) {
+            continue;
+        }
+        let Some(addr) = object_as_written(e, &b, o - a.off, &a.class, env) else { continue };
+        if !object_path_ok(env.db, &b, o - a.off, env) {
+            continue;
+        }
+        if a.off == 0 {
+            let Expr::AddrOf(x) = e else { continue };
+            if class_name(&ty_of(x, env.vars), env.db).map_or(true, |c| is_base_or_same(env.db, &a.class, &c)) {
+                continue;
+            }
+        }
+        if !a.fields.iter().find(|(n, owner)| !member_accessible(env.db, owner, n)).is_some_and(|(_, ow)| is_base_or_same_any(env.db, ow, &a.class)) {
+            continue;
+        }
+        let cobj = const_object(&addr, env);
+        if cobj && !a.sig.is_const {
+            continue;
+        }
+        let name = mwdec_lift::sig::split_scope(&a.sig.qualified_name).1.to_string();
+        let rank = acc_rank(&name, a.sig.is_const);
+        let better = match &best_d {
+            None => true,
+            Some((r, bn, bi, _)) => {
+                if *bn == name && !cobj {
+                    !a.sig.is_const && accs[*bi].sig.is_const
+                } else {
+                    rank < *r || (rank == *r && name < *bn)
+                }
+            }
+        };
+        if better {
+            best_d = Some((rank, name, ai, addr));
+        }
+    }
+    if best.is_none() || best_d.is_some() {
+        if let Some((_, _, ai, addr)) = best_d {
+            let a = &accs[ai];
+            let ret = match (a.how, strip(&a.sig.ret)) {
+                (1, Type::Ref(inner)) => (**inner).clone(),
+                _ => a.sig.ret.clone(),
+            };
+            let call = Expr::Call { callee: Callee::Method { symbol: String::new(), sig: a.sig.clone(), this: Box::new(addr), qualified: false }, args: vec![], ret };
+            return Some(if a.how == 1 { Expr::AddrOf(Box::new(call)) } else { call });
+        }
+    }
+    let (_, ti, addr) = best?;
+    let t = &env.lib.templates[ti];
+    let mut call = make_call(t, vec![addr]);
+    if t.ret_ref {
+        if let (Expr::Call { ret, .. }, Type::Ref(inner)) = (&mut call, strip(&t.sig.ret)) {
+            *ret = (**inner).clone();
+        }
+        return Some(Expr::AddrOf(Box::new(call)));
+    }
+    Some(call)
+}
+
+/// A read `obj.m` / `*(T*)((char*)obj + k)` of a member the function can't name: the class's
+/// accessor returning its value (`obj.GetM()`), when the headers have one.
+fn member_read_call(e: &Expr, env: &Env, idx: &Index) -> Option<Expr> {
+    let ety = match e {
+        Expr::Load { ty, .. } | Expr::Member { ty, .. } => ty.clone(),
+        _ => return None,
+    };
+    let esize = mwdec_lift::scalar_size(strip(&ety))?;
+    let (b, o) = crate::addr::access(e, env)?;
+    let mut best: Option<(u8, String, usize, Expr)> = None;
+    for (ti, k, ty) in &idx.member_reads {
+        let t = &env.lib.templates[*ti];
+        if *k != o && o < *k {
+            continue;
+        }
+        if mwdec_lift::scalar_size(strip(ty)) != Some(esize) || vclass(ty, env.db) != vclass(&ety, env.db) {
+            continue;
+        }
+        let HoleKind::Obj { class, .. } = &t.holes[0] else { continue };
+        let Some(addr) = object_as_written(e, &b, o - k, class, env) else { continue };
+        if !object_path_ok(env.db, &b, o - k, env) {
+            continue;
+        }
+        let Some((path, _)) = mwdec_lift::types::field_path(env.db, class, *k, esize) else { continue };
+        // (the first member on the way the function can't name must be the accessor class's own:
+        // otherwise the inner object's accessor names it, `mPtr.get()`, not the outer one's)
+        let first_hidden = path.iter().find_map(|pe| match pe {
+            mwdec_lift::types::PathElem::Field(n, owner) if !member_accessible(env.db, owner, n) => Some(owner.clone()),
+            _ => None,
+        });
+        let hidden = first_hidden.is_some_and(|ow| is_base_or_same_any(env.db, &ow, class));
+        if !hidden {
+            continue;
+        }
+        let cobj = const_object(&addr, env);
+        if cobj && !t.sig.is_const {
+            continue;
+        }
+        let name = mwdec_lift::sig::split_scope(&t.name).1.to_string();
+        // the accessor of the innermost object first (the function names the way to it)
+        let depth = path.iter().filter(|pe| matches!(pe, mwdec_lift::types::PathElem::Field(..))).count() as u8;
+        let rank = depth * 16 + if name.starts_with("operator") { 4 } else if t.sig.is_const { 0 } else { 1 } + if t.guessed { 8 } else { 0 };
+        let better = match &best {
+            None => true,
+            Some((r, bn, _, _)) => rank < *r || (rank == *r && name < *bn),
+        };
+        if better {
+            best = Some((rank, name, *ti, addr));
+        }
+    }
+    // trivial accessors from the declarations (ranked together with the templates)
+    let accs = accessors(env.db);
+    let mut best_d: Option<(u8, String, usize, Expr)> = None;
+    for (ai, a) in accs.iter().enumerate() {
+        if !matches!(a.how, 0 | 3) || o < a.off {
+            continue;
+        }
+        let rt = mwdec_lift::types::resolve(Some(env.db), strip(&a.ty)).into_owned();
+        if mwdec_lift::scalar_size(strip(&rt)).or_else(|| mwdec_lift::types::is_enum(Some(env.db), &rt).then_some(4)) != Some(esize) || vclass(&a.ty, env.db) != vclass(&ety, env.db) {
+            continue;
+        }
+        let Some(addr) = object_as_written(e, &b, o - a.off, &a.class, env) else { continue };
+        if !object_path_ok(env.db, &b, o - a.off, env) {
+            continue;
+        }
+        if !a.fields.iter().find(|(n, owner)| !member_accessible(env.db, owner, n)).is_some_and(|(_, ow)| is_base_or_same_any(env.db, ow, &a.class)) {
+            continue;
+        }
+        let cobj = const_object(&addr, env);
+        if cobj && !a.sig.is_const {
+            continue;
+        }
+        let name = mwdec_lift::sig::split_scope(&a.sig.qualified_name).1.to_string();
+        let rank = a.fields.len() as u8 * 16 + acc_rank(&name, a.sig.is_const);
+        if best_d.as_ref().map_or(true, |(r, bn, _, _)| rank < *r || (rank == *r && name < *bn)) {
+            best_d = Some((rank, name, ai, addr));
+        }
+    }
+    let use_t = match (&best, &best_d) {
+        (Some((rt, nt, _, _)), Some((rd, nd, _, _))) => (*rt, nt) <= (*rd, nd),
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if std::env::var("MWDI_TRACE_ACC").is_ok() {
+        eprintln!("MREAD {e:?} -> t {:?} d {:?}", best.as_ref().map(|b| env.lib.templates[b.2].name.clone()), best_d.as_ref().map(|b| accs[b.2].sig.qualified_name.clone()));
+    }
+    if use_t {
+        let (_, _, ti, addr) = best?;
+        return Some(make_call(&env.lib.templates[ti], vec![addr]));
+    }
+    let (_, _, ai, addr) = best_d?;
+    let a = &accs[ai];
+    if a.how == 3 {
+        // the pointer value is the address of the returned reference's object
+        let Type::Ref(inner) = strip(&a.sig.ret) else { return None };
+        let call = Expr::Call { callee: Callee::Method { symbol: String::new(), sig: a.sig.clone(), this: Box::new(addr), qualified: false }, args: vec![], ret: (**inner).clone() };
+        return Some(Expr::AddrOf(Box::new(call)));
+    }
+    Some(Expr::Call { callee: Callee::Method { symbol: String::new(), sig: a.sig.clone(), this: Box::new(addr), qualified: false }, args: vec![], ret: a.sig.ret.clone() })
 }
 
 thread_local! {
     /// Bytes of the function's literal symbols while it is being rewritten.
     static LITERALS: std::cell::RefCell<HashMap<String, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
+    /// Bytes of its writable words that may be compiler temporaries (compared, never folded).
+    static TEMPS: std::cell::RefCell<HashMap<String, Vec<u8>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The bytes of the function's literal symbol `sym` in hex (see [`crate::template::LITERAL_PREFIX`]).
+fn literal_hex(sym: &str) -> Option<String> {
+    let hex = |b: &Vec<u8>| b.iter().map(|x| format!("{x:02x}")).collect();
+    LITERALS.with(|l| l.borrow().get(sym).map(hex)).or_else(|| TEMPS.with(|l| l.borrow().get(sym).map(hex)))
 }
 
 /// The value of literal symbol read `e` (`@N`, a splitter-named pool word) as type `t`.
@@ -1080,6 +1826,8 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
     // members' own constructors' stores at the start of a constructor body are implicit
     let (stripped, pending) = if std::env::var("MWDI_NO_CTORS").is_ok() { (0, Default::default()) } else { crate::defctor::strip(ir, db, &lib.default_ctors) };
     let stripped = stripped + crate::defctor::copy_ctor_inits(ir, db, &lib.copy_ctors);
+    // `if (dst) <copy construction>`: `new (dst) T(src)`
+    let stripped = stripped + crate::defctor::placement_copies(ir, db, &lib.copy_ctors);
     // stack buffers filled as a default construction and passed by reference: `T()`
     let stripped = stripped + crate::defctor::default_temps(ir, db, &lib.default_ctors);
     // stack buffers built as a default construction and used as a named object: `T v;`
@@ -1098,6 +1846,9 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         total += crate::buffers::type_object_slots(ir, db);
     }
     total += crate::util::prof::time(0, || crate::objlocals::group(ir, lib, &idx, db));
+    // by-value accessor results bound to a reference local (their dead stores), before folding
+    // so the folds read the local's members
+    total += crate::reflocal::apply(ir, lib, db);
     for _round in 0..4 {
         let raw = build_defs(&ir.body, &ir.vars);
         let vars = ir.vars.clone();
@@ -1152,9 +1903,21 @@ fn apply_inner(ir: &mut IrFunction, lib: &InlineLib, db: &TypeDb) -> usize {
         mwdec_lift::idioms::constructed_arg_temporaries(&mut ir.body, &vars);
         crate::post::fold_flag_chains(&mut ir.body, &ir.vars);
     }
+    // reference locals bound only to pass the accessor's result on once
+    total += crate::reflocal::unbind_single_use(ir);
+    // members the function can't name, through their accessors (last: a naming step after the
+    // temp-forwarding passes, which would treat the accessor calls as values to share)
+    let named = {
+        let raw = build_defs(&ir.body, &ir.vars);
+        let vars = ir.vars.clone();
+        let env0 = Env { db, vars: &vars, defs: &raw, lib, objects: &idx.objects };
+        let defs = crate::safety::safe_defs(&ir.body, &env0);
+        let env = Env { db, vars: &vars, defs: &defs, lib, objects: &idx.objects };
+        accessor_stmts(&mut ir.body, &env, &idx)
+    };
     crate::stmtinl::finish(ir);
     total += crate::walkptr::constructed_buffers(ir, db);
-    total
+    total + named
 }
 
 /// Stores to scalar stack slots that are never read (the dead component stores MWCC leaves
@@ -1266,6 +2029,37 @@ pub fn scalar_stmt(s: &mut Stmt, env: &Env, idx: &Index) -> usize {
     n
 }
 
+/// The member values of `cls(args...)` by constructor `sig`: each member its constructor template
+/// sets from one parameter (`mTime(time)`), when every argument sets one.
+fn ctor_members(env: &Env, cls: &str, sig: &mwdec_core::FuncSig, args: &[Expr]) -> Option<BTreeMap<i32, Expr>> {
+    let list = env.objects.get(&mwdec_lift::sig::norm_name(cls))?;
+    for &ti in list {
+        let t = &env.lib.templates[ti];
+        let Shape::Object { comps, .. } = &t.shape else { continue };
+        if !matches!(t.kind, CallKind::Ctor) || t.holes.len() != args.len() || t.sig.params.len() != sig.params.len() {
+            continue;
+        }
+        if t.sig.params.iter().zip(&sig.params).any(|(a, b)| strip(&a.ty) != strip(&b.ty)) {
+            continue;
+        }
+        let mut m = BTreeMap::new();
+        for c in comps {
+            let h = match &c.pat {
+                Expr::Var(h) => *h,
+                Expr::Load { base, offset: 0, .. } | Expr::Member { base, offset: 0, .. } => match &**base {
+                    Expr::Var(h) => *h,
+                    _ => return None,
+                },
+                Expr::Int { .. } | Expr::Float { .. } => continue,
+                _ => return None,
+            };
+            m.insert(c.off, args.get(h)?.clone());
+        }
+        return (m.len() == args.len()).then_some(m);
+    }
+    None
+}
+
 fn root_ok(p: &Expr, t: &Expr) -> bool {
     match (p, t) {
         (Expr::Binary { op, .. }, Expr::Binary { op: o2, .. }) => op == o2,
@@ -1307,11 +2101,14 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
     }
     // an object built member-wise (`CVector3f(a.x * s + b.x, ...)`): the value of object-valued
     // inlines (`a * s + b`)
-    if let Expr::Construct { class, args, .. } = &*e {
+    if let Expr::Construct { class, args, ctor } = &*e {
         if let Some(cn) = class_name(class, env.db) {
             if let Some(fields) = crate::template::flat_fields(env.db, &cn) {
                 if fields.len() == args.len() && args.len() > 1 && args.iter().any(|a| !matches!(a, Expr::Int { .. } | Expr::Float { .. })) {
-                    let m: BTreeMap<i32, Expr> = fields.iter().zip(args.iter()).map(|((o, _), a)| (*o, a.clone())).collect();
+                    // (a declared constructor's arguments are in its parameter order: the
+                    // members they initialise, per its template)
+                    let by_ctor = ctor.as_ref().and_then(|s| ctor_members(env, &cn, s, args));
+                    let m: BTreeMap<i32, Expr> = by_ctor.unwrap_or_else(|| fields.iter().zip(args.iter()).map(|((o, _), a)| (*o, a.clone())).collect());
                     if let Some((call, sc)) = explain_object(env, &cn, &m, 0) {
                         if sc >= MIN_SCORE && !matches!(call, Expr::Construct { .. }) {
                             *e = call;
@@ -1444,6 +2241,11 @@ fn scalar_expr(e: &mut Expr, env: &Env, idx: &Index) -> usize {
             if let Expr::Index { base, index, .. } = &mut **x {
                 n += scalar_expr(base, env, idx);
                 n += scalar_expr(index, env, idx);
+            }
+        }
+        Expr::AddrOf(x) if matches!(&**x, Expr::Load { .. } | Expr::Member { .. }) => {
+            if let Expr::Load { base, .. } | Expr::Member { base, .. } = &mut **x {
+                n += scalar_expr(base, env, idx);
             }
         }
         Expr::AddrOf(x) | Expr::Unary { e: x, .. } | Expr::Cast { e: x, .. } => n += scalar_expr(x, env, idx),
@@ -1589,6 +2391,10 @@ fn ok_lvalue(e: &Expr) -> bool {
     matches!(e, Expr::Load { .. } | Expr::Member { .. } | Expr::Global { .. })
 }
 
+pub fn unfold_pub(e: &Expr, env: &Env) -> Option<Expr> {
+    unfold(e, env)
+}
+
 /// The expansion of a folded scalar inline call (`v.size()` -> `v.mCount`), from its template,
 /// when every hole is a plain value or object pointer.
 fn unfold(e: &Expr, env: &Env) -> Option<Expr> {
@@ -1598,7 +2404,17 @@ fn unfold(e: &Expr, env: &Env) -> Option<Expr> {
         Callee::Direct { sig, .. } if sig.mangled.is_none() => (sig, None),
         _ => return None,
     };
-    let t = env.lib.templates.iter().find(|t| t.name == sig.qualified_name && matches!(t.shape, Shape::Scalar(_)) && !t.ret_ref && t.holes.len() == args.len() + this.is_some() as usize)?;
+    let Some(t) = env.lib.templates.iter().find(|t| t.name == sig.qualified_name && matches!(t.shape, Shape::Scalar(_)) && !t.ret_ref && t.holes.len() == args.len() + this.is_some() as usize) else {
+        // a trivial accessor folded from the declarations: its member read / address again
+        let this = this?;
+        if !args.is_empty() {
+            return None;
+        }
+        let accs = accessors(env.db);
+        let a = accs.iter().find(|a| matches!(a.how, 0 | 2) && a.sig.qualified_name == sig.qualified_name && a.sig.is_const == sig.is_const)?;
+        let load = Expr::Load { base: Box::new(this.clone()), offset: a.off, ty: a.ty.clone() };
+        return Some(if a.how == 2 { Expr::AddrOf(Box::new(load)) } else { load });
+    };
     let Shape::Scalar(p) = &t.shape else { return None };
     let vals: Vec<&Expr> = this.into_iter().chain(args.iter()).collect();
     for (h, k) in t.holes.iter().enumerate() {

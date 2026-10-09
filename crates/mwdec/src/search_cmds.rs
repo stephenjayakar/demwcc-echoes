@@ -699,7 +699,63 @@ fn draft_flipped(
     res.map(|s| (s, points))
 }
 
+/// Signatures of the placeholder-named C functions `f` calls that its object defines, lifted
+/// from their own code (as their drafts define them): drafts of the unit then declare and call
+/// them alike, so their definitions integrate into one translation unit.
+fn callee_sigs(ui: &UnitInputs, f: &Function) -> Option<Arc<HashMap<String, mwdec_core::FuncSig>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<mwdec_core::FuncSig>>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut out = HashMap::new();
+    for r in &f.relocs {
+        let t = &r.target;
+        if !t.starts_with("fn_") || *t == f.name || out.contains_key(t) || mwdec_lift::sig::demangle(t).is_some() {
+            continue;
+        }
+        if ui.db.as_ref().is_some_and(|db| db.decls.contains_key(t) || db.functions.contains_key(t)) {
+            continue;
+        }
+        let key = format!("{}:{t}", ui.ctx.hash);
+        let hit = cache.lock().unwrap().get(&key).cloned();
+        let sig = match hit {
+            Some(s) => s,
+            None => {
+                let s = mwdec_obj::find_function(&ui.target, t).filter(|g| g.code.len() <= 2048).and_then(|g| {
+                    let compiler = if std::env::var_os("MWDEC_NO_UNIT_COMPILER").is_some() { None } else { Some(ui.mwcc.compiler.clone()) };
+                    let lopts = mwdec_lift::LiftOptions { compiler, ..Default::default() };
+                    let ir = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mwdec_lift::sig::with_callee_sigs(None, || mwdec_lift::lift_function_with(ui.lift_obj.as_ref().unwrap_or(&ui.target), g, ui.db.as_ref(), &lopts)))).ok()?.ok()?;
+                    let params = ir
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| {
+                            let ty = ir.sig.params.get(i).map(|p| p.ty.clone()).filter(|t| !matches!(t, mwdec_core::Type::Unknown { .. })).unwrap_or_else(|| ir.vars[v].ty.clone());
+                            mwdec_core::Param { name: None, ty }
+                        })
+                        .collect();
+                    let ret = if matches!(ir.sig.ret, mwdec_core::Type::Unknown { size: 0 }) { mwdec_core::Type::Void } else { ir.sig.ret.clone() };
+                    Some(mwdec_core::FuncSig { qualified_name: t.clone(), mangled: Some(t.clone()), ret, params, this_class: None, is_const: false, is_static: false, is_virtual: false, variadic: false, runs_code: false })
+                });
+                let mut c = cache.lock().unwrap();
+                if c.len() > 20000 {
+                    c.clear();
+                }
+                c.insert(key, s.clone());
+                s
+            }
+        };
+        if let Some(s) = sig {
+            out.insert(t.clone(), s);
+        }
+    }
+    (!out.is_empty()).then(|| Arc::new(out))
+}
+
 fn draft_once(ui: &UnitInputs, f: &Function, inlines: bool, raw_offsets: bool, sinit_const: bool, sinit_variant: u8) -> std::result::Result<String, NoDraft> {
+    let sigs = if ui.c_mode { None } else { callee_sigs(ui, f) };
+    mwdec_lift::sig::with_callee_sigs(sigs, || draft_once_with(ui, f, inlines, raw_offsets, sinit_const, sinit_variant))
+}
+
+fn draft_once_with(ui: &UnitInputs, f: &Function, inlines: bool, raw_offsets: bool, sinit_const: bool, sinit_variant: u8) -> std::result::Result<String, NoDraft> {
     let ir = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // (`MWDEC_NO_UNIT_COMPILER=1`: lift as for the game compiler, to measure the compiler-specific rules)
         let compiler = if std::env::var_os("MWDEC_NO_UNIT_COMPILER").is_some() { None } else { Some(ui.mwcc.compiler.clone()) };
@@ -982,6 +1038,8 @@ struct Row {
     nat_final: Option<String>,
     /// `--drafts-only`: hash of the draft texts.
     draft_hash: Option<String>,
+    /// The final source seeds the unit's string pool (needs the real file's other strings).
+    needs_string_context: bool,
     /// The draft carries the lifter's "loop condition never changes" warning: a wrong-meaning
     /// structure (counted across lists).
     wrong_meaning: bool,
@@ -999,7 +1057,7 @@ impl Row {
             "evals": self.evals, "compiles": self.compiles, "seconds": self.seconds, "error": self.error,
             "winning_ops": self.winning_ops, "ops": self.ops, "polished": self.polished, "implicit": self.implicit,
             "first_profile": self.first_profile, "best_profile": self.best_profile, "traces": self.traces, "mem_mb": self.mem_mb,
-            "nat_draft": self.nat_draft, "nat_final": self.nat_final, "draft_hash": self.draft_hash, "wrong_meaning": self.wrong_meaning, "extra_data": self.extra_data,
+            "nat_draft": self.nat_draft, "nat_final": self.nat_final, "draft_hash": self.draft_hash, "wrong_meaning": self.wrong_meaning, "needs_string_context": self.needs_string_context, "extra_data": self.extra_data,
         })
     }
 }
@@ -1318,6 +1376,7 @@ fn run_one(
     row.wrong_meaning = src.contains(mwdec_lift::structure::WARN_INVARIANT_LOOP);
     let fin = if r.exact && std::env::var("MWDEC_EVAL_POLISH").is_ok() { polish_exact(ui, &scorer, &r.best_src) } else { r.best_src.clone() };
     row.nat_final = Some(mwdec_emit::tidy::measure(&fin).summary());
+    row.needs_string_context = fin.contains(mwdec_emit::STRING_CONTEXT_MARKER);
     for s in r.op_stats.iter().filter(|s| s.tries > 0) {
         row.ops.insert(s.name.to_string(), serde_json::json!([s.tries, s.improved, s.new_best]));
     }

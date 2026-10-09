@@ -222,6 +222,26 @@ thread_local! {
     static SPACED: std::cell::RefCell<((usize, usize), std::collections::HashMap<String, String>)> = std::cell::RefCell::new(((0, 0), std::collections::HashMap::new()));
 }
 
+thread_local! {
+    static CALLEE_SIGS: std::cell::RefCell<Option<std::sync::Arc<std::collections::HashMap<String, FuncSig>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the signatures of C functions the context doesn't declare that the drafter
+/// lifted from their own code (placeholder-named functions of the unit): calls of them pass
+/// those parameters and the draft declares them so (every draft of the unit agrees with the
+/// callee's own definition).
+pub fn with_callee_sigs<R>(sigs: Option<std::sync::Arc<std::collections::HashMap<String, FuncSig>>>, f: impl FnOnce() -> R) -> R {
+    let prev = CALLEE_SIGS.with(|c| std::mem::replace(&mut *c.borrow_mut(), sigs));
+    let r = f();
+    CALLEE_SIGS.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+/// The lifted signature of an undeclared C function (see [`with_callee_sigs`]).
+pub fn callee_sig(name: &str) -> Option<FuncSig> {
+    CALLEE_SIGS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))
+}
+
 /// Signature of a mangled function symbol. The return type is `Unknown{0}` ("not known") unless
 /// the TypeDb has the function; callers infer it.
 pub fn sig_of(mangled: &str, db: Option<&TypeDb>) -> FuncSig {

@@ -133,7 +133,9 @@ pub fn object_at(p: &Expr, off: i32, cls: &str, env: &Env) -> Option<(Expr, Expr
             let is_ref = matches!(strip(&ty_of(p, env.vars)), Type::Ref(_));
             if same {
                 let lv = if is_ref { p.clone() } else { Expr::Load { base: Box::new(p.clone()), offset: 0, ty: Type::Named(outer) } };
-                (p.clone(), lv)
+                // (a reference variable is the object: its address is `&r`)
+                let addr = if is_ref && matches!(p, Expr::Var(_)) { Expr::AddrOf(Box::new(p.clone())) } else { p.clone() };
+                (addr, lv)
             } else {
                 let lv = if is_ref { Expr::Member { base: Box::new(p.clone()), offset: off, ty: ct } } else { Expr::Load { base: Box::new(p.clone()), offset: off, ty: ct } };
                 (Expr::AddrOf(Box::new(lv.clone())), lv)

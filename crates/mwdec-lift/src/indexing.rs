@@ -439,6 +439,7 @@ pub fn pointer_walks(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
             let mut elem: Option<Type> = None;
             let mut whole = true;
             let mut inside = true;
+            let mut offs: Vec<i32> = vec![];
             Stmt::walk_exprs(&lb[..at], &mut |e| {
                 if matches!(e, Expr::Var(y) if *y == p) {
                     reads += 1;
@@ -446,6 +447,9 @@ pub fn pointer_walks(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
                 if let Expr::Load { base: lbase, offset, ty } = e {
                     if matches!(uncast(lbase), Expr::Var(y) if *y == p) {
                         loads += 1;
+                        if !offs.contains(offset) {
+                            offs.push(*offset);
+                        }
                         let sz = scalar_size(ty).unwrap_or(0) as i64;
                         if *offset != 0 || sz != kk {
                             whole = false;
@@ -461,9 +465,9 @@ pub fn pointer_walks(body: &mut Vec<Stmt>, vars: &[Var]) -> usize {
                 }
             });
             let Some(ety) = elem else { continue };
-            // (several members of one element per iteration: the source walked it through a
-            // pointer or reference of its own, which the walk spells better)
-            if reads != loads || !(whole || (inside && loads == 1)) {
+            // (several different members of one element per iteration: the source walked it
+            // through a pointer or reference of its own, which the walk spells better)
+            if reads != loads || !(whole || (inside && offs.len() == 1)) {
                 continue;
             }
             let base = base.clone();

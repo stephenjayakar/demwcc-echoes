@@ -296,6 +296,9 @@ pub struct IrFunction {
     /// Bytes of the compiler / splitter literals (`@N`, `lbl_` words) the function references:
     /// the values behind constants passed to `const T&` parameters.
     pub literal_bytes: Vec<(String, Vec<u8>)>,
+    /// Bytes of the writable splitter-named words (`lbl_` in `.sdata`) the function reads: maybe
+    /// compiler temporaries, never folded to values, only compared with an inline's own.
+    pub temp_bytes: Vec<(String, Vec<u8>)>,
     /// Frame stores nothing reads, dropped from `body` (see [`DeadStackStore`]).
     pub dead_stores: Vec<DeadStackStore>,
 }

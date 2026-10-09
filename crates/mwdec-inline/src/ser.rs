@@ -195,6 +195,8 @@ pub struct STemplate {
     dead: Vec<(u32, SExpr)>,
     #[serde(default)]
     guessed: bool,
+    #[serde(default)]
+    fixed: Vec<(usize, SExpr)>,
 }
 
 /// A cache entry: the template, or why the probe gives none.
@@ -235,6 +237,7 @@ pub fn encode(t: &Template) -> Option<Entry> {
         ret_ref: t.ret_ref,
         dead: t.dead.iter().map(|(n, e)| (*n, se(e))).collect(),
         guessed: t.guessed,
+        fixed: t.fixed.iter().map(|(h, e)| (*h, se(e))).collect(),
     }))
 }
 
@@ -273,6 +276,7 @@ pub fn decode(e: &Entry) -> Result<Template, String> {
         ret_ref: t.ret_ref,
         dead: t.dead.iter().map(|(n, e)| (*n, de(e))).collect(),
         guessed: t.guessed,
+        fixed: t.fixed.iter().map(|(h, e)| (*h, de(e))).collect(),
     })
 }
 

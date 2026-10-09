@@ -38,6 +38,10 @@ pub struct Probe {
     /// A trivial accessor (`m = x;`) probed only for the dead stores of its by-value class
     /// parameter or return: its template needs them.
     pub needs_dead: bool,
+    /// Constant-argument specialisation: (probe parameter index, constant) pairs the probe
+    /// passes instead of the parameter (the compiler folds constant arguments into the body
+    /// before optimising, so the expansion differs from the generic one).
+    pub fixed: Vec<(usize, mwdec_lift::Expr)>,
 }
 
 /// C++ spelling of a type, or None when the probe can't name it.
@@ -374,16 +378,210 @@ pub fn generate(db: &TypeDb, rel: Option<&std::collections::HashSet<String>>) ->
             }
             let sig = sig_of_decl(d, class.as_deref(), &qname);
             let _ = is_class_type;
-            out.push(Probe { name, decl: d.clone(), class: class.clone(), kind: kind.clone(), params: params.clone(), ret, ret_ref, sig: sig.clone(), line: 0, fn_template, needs_dead });
+            out.push(Probe { name, decl: d.clone(), class: class.clone(), kind: kind.clone(), params: params.clone(), ret: ret.clone(), ret_ref, sig: sig.clone(), line: 0, fn_template, needs_dead, fixed: vec![] });
             // stash the text in the decl body slot for rendering
             out.last_mut().unwrap().decl.inline_body = Some(text);
+            // constant-argument specialisations (see `specialisations`)
+            // (constructors only on request: their folds into differently typed stack objects
+            // render casts that don't compile)
+            if std::env::var("MWDI_NO_CONSTSPEC").is_err() && (!matches!(kind, CallKind::Ctor) || std::env::var("MWDI_CONSTSPEC_CTOR").is_ok()) {
+                let off = if matches!(kind, CallKind::Method) { 1 } else { 0 };
+                for spec in specialisations(d, db) {
+                    let mut args = call_args.clone();
+                    let mut fixed = vec![];
+                    for (i, lit, e) in &spec {
+                        args[*i] = lit.clone();
+                        fixed.push((*i + off, e.clone()));
+                    }
+                    let name = format!("__mwdi_p{}", out.len());
+                    let callee = if matches!(kind, CallKind::Method) { format!("self->{last}") } else if matches!(kind, CallKind::Ctor) { class.clone().unwrap_or_default() } else { qname.clone() };
+                    let call = format!("{callee}({})", args.join(", "));
+                    let body = if matches!(kind, CallKind::Ctor) { format!("return {call};") } else if ret_ref { format!("return &{call};") } else if matches!(strip_cv(&d.ret), Type::Void) { format!("{call};") } else { format!("return {call};") };
+                    let text = format!("{rspell} {name}({}) {{ {body} }}", all_params.join(", "));
+                    if !seen.insert(text.replace(&name, "")) {
+                        continue;
+                    }
+                    out.push(Probe { name, decl: d.clone(), class: class.clone(), kind: kind.clone(), params: params.clone(), ret: ret.clone(), ret_ref, sig: sig.clone(), line: 0, fn_template, needs_dead, fixed });
+                    out.last_mut().unwrap().decl.inline_body = Some(text);
+                }
+            }
             if let Some(call) = discard {
                 let name = format!("__mwdi_p{}", out.len());
                 let text = format!("void {name}({}) {{ {call}; }}", all_params.join(", "));
                 if seen.insert(text.replace(&name, "")) {
-                    out.push(Probe { name, decl: d.clone(), class: class.clone(), kind, params, ret: Type::Void, ret_ref: false, sig, line: 0, fn_template, needs_dead: false });
+                    out.push(Probe { name, decl: d.clone(), class: class.clone(), kind, params, ret: Type::Void, ret_ref: false, sig, line: 0, fn_template, needs_dead: false, fixed: vec![] });
                     out.last_mut().unwrap().decl.inline_body = Some(text);
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Constant-argument specialisations worth probing for one inline: each is a list of
+/// (parameter index, literal text, literal expression). MWCC substitutes a constant argument
+/// into the body and folds before optimising, so `f(x, true)` loses the branch on the flag and
+/// `clamp(x, 0, 1)` folds compares: the generic template (constant in a hole) can't match. Only
+/// parameters whose constant changes code are specialised: `bool` parameters (true/false), and
+/// integer / enum parameters with the literals they are compared or switched on.
+pub fn specialisations(d: &DeclInfo, db: &TypeDb) -> Vec<Vec<(usize, String, mwdec_lift::Expr)>> {
+    use mwdec_lift::Expr;
+    let Some(body) = d.inline_body.as_deref() else { return vec![] };
+    let toks: Vec<&str> = body.split_whitespace().collect();
+    let words: Vec<&str> = body.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).collect();
+    // tokens inside conditions: `if ( .. )`, `while ( .. )`, `switch ( .. )`, and a ternary's
+    // condition (from the statement start to `?`)
+    let mut in_cond = vec![false; toks.len()];
+    for k in 0..toks.len() {
+        if matches!(toks[k], "if" | "while" | "switch") && toks.get(k + 1) == Some(&"(") {
+            let mut d = 0;
+            for j in k + 1..toks.len() {
+                match toks[j] {
+                    "(" => d += 1,
+                    ")" => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => in_cond[j] = true,
+                }
+            }
+        }
+        if toks[k] == "?" {
+            let mut j = k;
+            while j > 0 && !matches!(toks[j - 1], ";" | "{" | "}" | "return" | "=" | ":") {
+                j -= 1;
+                in_cond[j] = true;
+            }
+        }
+    }
+    let conditioned = |n: &str| toks.iter().zip(&in_cond).any(|(t, c)| *c && *t == n);
+    // literals a parameter is compared with or switched on: `n == K`, `K != n`, `switch ( n ) { case K :`
+    let compared = |n: &str| -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        for k in 0..toks.len() {
+            if toks[k] != n {
+                continue;
+            }
+            for (a, b) in [(k + 1, k + 2), (k.wrapping_sub(1), k.wrapping_sub(2))] {
+                if matches!(toks.get(a), Some(&"==") | Some(&"!=")) {
+                    if let Some(v) = toks.get(b) {
+                        let v = if *v == "-" { toks.get(if b > k { b + 1 } else { b.wrapping_sub(1) }).map(|x| format!("-{x}")).unwrap_or_default() } else { v.to_string() };
+                        out.push(v);
+                    }
+                }
+            }
+            // switch ( n ) { case K : ... }
+            if k >= 2 && toks[k - 1] == "(" && toks[k - 2] == "switch" {
+                let mut depth = 0;
+                for t in &toks[k + 1..] {
+                    match *t {
+                        "{" => depth += 1,
+                        "}" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut it = toks[k + 1..].iter().peekable();
+                let mut d = 0;
+                while let Some(t) = it.next() {
+                    match *t {
+                        "{" => d += 1,
+                        "}" => {
+                            d -= 1;
+                            if d == 0 {
+                                break;
+                            }
+                        }
+                        "case" if d == 1 => {
+                            if let Some(v) = it.next() {
+                                let v = if *v == "-" { it.next().map(|x| format!("-{x}")).unwrap_or_default() } else { v.to_string() };
+                                out.push(v);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out.retain(|v| !v.is_empty());
+        out.dedup();
+        out
+    };
+    let all = std::env::var("MWDI_CONSTSPEC_ALL").is_ok();
+    let mut per: Vec<Vec<(usize, String, Expr)>> = vec![];
+    for (i, p) in d.params.iter().enumerate() {
+        let Some(n) = p.name.as_deref() else { continue };
+        if !words.iter().any(|t| *t == n) {
+            continue;
+        }
+        let pt = strip_cv(&p.ty);
+        let int_lit = |v: &str, t: &Type| -> Option<(String, Expr)> {
+            let x = if let Some(h) = v.strip_prefix("0x") { i64::from_str_radix(h.trim_end_matches(['u', 'U']), 16).ok()? } else { v.trim_end_matches(['u', 'U']).parse::<i64>().ok()? };
+            Some((v.to_string(), Expr::Int { value: x, ty: t.clone() }))
+        };
+        let mut vals: Vec<(String, Expr)> = match pt {
+            Type::Bool => vec![("true".into(), Expr::Int { value: 1, ty: Type::Bool }), ("false".into(), Expr::Int { value: 0, ty: Type::Bool })],
+            // (the literals it is tested against; other constants in conditions only with
+            // `MWDI_CONSTSPEC_ALL`)
+            t @ (Type::Int { .. } | Type::Long { .. } | Type::Char) => {
+                let mut v: Vec<(String, Expr)> = compared(n).iter().filter_map(|x| int_lit(x, t)).collect();
+                if conditioned(n) && all {
+                    for x in ["0", "1"] {
+                        if !v.iter().any(|(l, _)| l == x) {
+                            v.extend(int_lit(x, t));
+                        }
+                    }
+                }
+                v
+            }
+            Type::Float { size } if conditioned(n) && all => {
+                let f = |x: f64| Expr::Float { bits: if *size == 4 { (x as f32).to_bits() as u64 } else { x.to_bits() }, double: *size == 8 };
+                vec![("0.0f".into(), f(0.0)), ("1.0f".into(), f(1.0))]
+            }
+            Type::Named(en) if db.enums.contains_key(en.as_str()) => {
+                let e = &db.enums[en.as_str()];
+                let mut lbls = compared(n);
+                // the other side of a two-way test (`normalize == kN_Yes`): another enumerator
+                if lbls.len() == 1 {
+                    let short = lbls[0].rsplit("::").next().unwrap_or("").to_string();
+                    if let Some((nm, _)) = e.values.iter().find(|(nm, _)| nm.rsplit("::").next() != Some(short.as_str())) {
+                        lbls.push(nm.clone());
+                    }
+                }
+                lbls
+                    .iter()
+                    .filter_map(|lbl| {
+                        let short = lbl.rsplit("::").next().unwrap_or(lbl);
+                        let (_, v) = e.values.iter().find(|(nm, _)| nm == short || nm.rsplit("::").next() == Some(short))?;
+                        Some((format!("({en}){v}"), Expr::Cast { ty: pt.clone(), e: Box::new(Expr::Int { value: *v, ty: Type::Int { size: 4, signed: true } }) }))
+                    })
+                    .collect()
+            }
+            _ => vec![],
+        };
+        vals.truncate(8);
+        if !vals.is_empty() {
+            per.push(vals.into_iter().map(|(l, e)| (i, l, e)).collect());
+        }
+    }
+    // one parameter at a time (at most 3 parameters), plus every combination of two bools
+    let mut out = vec![];
+    for vals in per.iter().take(3) {
+        for v in vals {
+            out.push(vec![v.clone()]);
+        }
+    }
+    let bools: Vec<&Vec<(usize, String, Expr)>> = per.iter().filter(|v| matches!(v[0].2, Expr::Int { ty: Type::Bool, .. })).collect();
+    if bools.len() == 2 {
+        for a in bools[0] {
+            for b in bools[1] {
+                out.push(vec![a.clone(), b.clone()]);
             }
         }
     }

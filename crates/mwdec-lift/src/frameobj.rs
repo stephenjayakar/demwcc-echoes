@@ -314,6 +314,119 @@ pub fn unknown_callee_byval(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>
     ir.dead_stores = dead;
 }
 
+/// A function no declaration describes that only copies whole word objects its parameters point
+/// at into frame objects and passes those to a call no declaration describes either
+/// (`stack_c = *arg0; stack_8 = *arg1; fn(&stack_c, &stack_8);`): both take the objects by value
+/// (MWCC passes a class by value as a pointer to a copy), `fn(a, b)` with word-object parameters.
+/// A declared callee taking a one-word class by value gives the parameters that class.
+pub fn forwarded_byval_params(ir: &mut IrFunction, db: Option<&mwdec_core::TypeDb>) {
+    let declared = |sym: &str| crate::sig::demangle(sym).is_some() || db.is_some_and(|db| db.decls.contains_key(sym) || db.decls.contains_key(&format!("::{sym}")) || db.functions.contains_key(sym));
+    if declared(&ir.symbol) || ir.this_var.is_some() {
+        return;
+    }
+    let real: Vec<&Stmt> = ir.body.iter().filter(|s| !matches!(s, Stmt::Label(_) | Stmt::Comment(_) | Stmt::Return(None))).collect();
+    let Some((Stmt::Expr(call), copies)) = real.split_last() else { return };
+    let Expr::Call { callee: Callee::Direct { symbol, sig: csig }, args, .. } = call else { return };
+    if copies.is_empty() {
+        return;
+    }
+    // a declared callee: its by-value one-word class parameters
+    let callee_declared = declared(symbol);
+    let class_param = |n: usize| -> Option<Type> {
+        let t = &csig.params.get(n)?.ty;
+        // (a template instance the context hasn't sized: the 4-byte frame copy says one word)
+        (named(strip_cv(t)).is_some() && matches!(crate::types::size_of(db, t), Some(0 | 4) | None)).then(|| t.clone())
+    };
+    let mut uses: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Var(v) = e {
+            *uses.entry(*v).or_default() += 1;
+        }
+    });
+    let is_param = |v: VarId| matches!(ir.vars[v].kind, VarKind::Param { .. });
+    // temps holding a parameter's word, frame objects filled with one: frame -> parameter
+    let mut temps: std::collections::HashMap<VarId, VarId> = std::collections::HashMap::new();
+    let mut frames: std::collections::HashMap<VarId, VarId> = std::collections::HashMap::new();
+    let word_of = |e: &Expr, temps: &std::collections::HashMap<VarId, VarId>| -> Option<VarId> {
+        let e = match e {
+            Expr::Cast { e, .. } => &**e,
+            e => e,
+        };
+        match e {
+            Expr::Load { base, offset: 0, ty } if scalar_size(ty) == Some(4) => match **base {
+                Expr::Var(p) if is_param(p) && uses.get(&p) == Some(&1) => Some(p),
+                _ => None,
+            },
+            Expr::Var(t) => temps.get(t).copied(),
+            _ => None,
+        }
+    };
+    for s in copies {
+        let Stmt::Assign { dst, src } = s else { return };
+        let Some(p) = word_of(src, &temps) else { return };
+        match dst {
+            Expr::Var(t) if matches!(ir.vars[*t].kind, VarKind::Local) && ir.vars[*t].name.starts_with("temp_") && uses.get(t) == Some(&2) => {
+                temps.insert(*t, p);
+            }
+            Expr::Member { base, offset: 0, ty } if scalar_size(ty) == Some(4) => match **base {
+                Expr::Var(f) if matches!(ir.vars[f].kind, VarKind::Stack { size: 4, .. }) && uses.get(&f) == Some(&2) => {
+                    frames.insert(f, p);
+                }
+                _ => return,
+            },
+            _ => return,
+        }
+    }
+    if frames.is_empty() || frames.len() + temps.len() != copies.len() {
+        return;
+    }
+    let words = crate::helpers::words(4);
+    let mut call = call.clone();
+    let mut ptys: Vec<(VarId, Type)> = vec![];
+    let Expr::Call { callee: Callee::Direct { sig, .. }, args: cargs, .. } = &mut call else { return };
+    let mut n_hit = 0;
+    for (n, a) in cargs.iter_mut().enumerate() {
+        // (the frame object itself when a declared callee takes it by value)
+        let f = match a {
+            Expr::AddrOf(x) => match **x {
+                Expr::Var(f) => f,
+                _ => continue,
+            },
+            Expr::Var(f) if callee_declared => *f,
+            _ => continue,
+        };
+        let Some(&p) = frames.get(&f) else { continue };
+        let ty = if callee_declared {
+            match class_param(n) {
+                Some(t) => t,
+                None => return,
+            }
+        } else {
+            words.clone()
+        };
+        *a = Expr::Var(p);
+        if !callee_declared {
+            if let Some(sp) = sig.params.get_mut(n) {
+                sp.ty = ty.clone();
+            }
+        }
+        ptys.push((p, ty));
+        n_hit += 1;
+    }
+    if n_hit != frames.len() || args.len() != cargs.len() {
+        return;
+    }
+    for (p, ty) in ptys {
+        ir.vars[p].ty = ty.clone();
+        if let VarKind::Param { index } = ir.vars[p].kind {
+            if let Some(sp) = ir.sig.params.get_mut(index) {
+                sp.ty = ty.clone();
+            }
+        }
+    }
+    ir.body = vec![Stmt::Expr(call)];
+}
+
 /// `v.@0 = <member>` where the member is a class object of exactly the stored size and `v` a
 /// frame object: (v, the member as that class, the class).
 fn whole_member_store(s: &Stmt, vars: &[Var], db: &mwdec_core::TypeDb) -> Option<(VarId, Expr, Type)> {

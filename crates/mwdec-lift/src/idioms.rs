@@ -44,6 +44,27 @@ pub fn constructs_into_param0(ir: &IrFunction) -> bool {
         return false;
     }
     let Some(&p0) = ir.params.first() else { return false };
+    // a construction guarded by a null test of the first parameter is a placement construction
+    // into it (`if (p) new (p) T(v)`): nobody tests the struct-return slot
+    let mut tested = false;
+    each_stmt(&ir.body, &mut |s| {
+        if let Stmt::If { cond, .. } = s {
+            let mut c = cond;
+            while let Expr::Cast { e, .. } = c {
+                c = e;
+            }
+            let t = match c {
+                Expr::Var(v) => *v == p0,
+                Expr::Binary { op: BinOp::Ne | BinOp::Eq, l, r, .. } => matches!(&**l, Expr::Var(v) if *v == p0) && r.as_int() == Some(0),
+                Expr::Unary { op: UnOp::Not, e, .. } => matches!(&**e, Expr::Var(v) if *v == p0),
+                _ => false,
+            };
+            tested |= t;
+        }
+    });
+    if tested {
+        return false;
+    }
     // a declared `void*` first parameter constructed into is a placement destination
     // (`new (p) T(src)`), not a hidden return pointer
     if ir.sig.params.first().is_some_and(|p| matches!(strip_cv(&p.ty), Type::Ptr(x) if matches!(strip_cv(x), Type::Void))) {
@@ -227,6 +248,62 @@ fn type_guessed_sret(ir: &mut IrFunction, db: Option<&TypeDb>) -> bool {
                 // (the stores fill exactly such an object)
                 (types::size_of(Some(db), &t)? as i32 == extent && types::is_aggregate(Some(db), &t)).then_some(n)
             });
+        }
+    }
+    // or the class of a whole object every store copies there (`*ret = kInvalidUniqueId.value`:
+    // the value read as its only member is a `TUniqueId`)
+    if let (None, Some(db)) = (&cls, db) {
+        let mut found: Vec<Option<String>> = vec![];
+        let vars = ir.vars.clone();
+        // single-definition temps (`t = g.value; ... *ret = t`)
+        let mut defs: HashMap<VarId, (usize, Expr)> = HashMap::new();
+        each_stmt(&ir.body, &mut |s| {
+            if let Stmt::Assign { dst: Expr::Var(t), src } = s {
+                let e = defs.entry(*t).or_insert((0, src.clone()));
+                e.0 += 1;
+            }
+        });
+        each_stmt(&ir.body, &mut |s| {
+            if let Stmt::Assign { dst: Expr::Load { base, offset, ty }, src } = s {
+                if matches!(&**base, Expr::Var(v) if *v == sret) {
+                    let w = scalar_size(ty).unwrap_or(0);
+                    let src = match src {
+                        Expr::Var(t) => match defs.get(t) {
+                            Some((1, d)) => d,
+                            _ => src,
+                        },
+                        _ => src,
+                    };
+                    let obj = match src {
+                        Expr::Member { base: b, offset: 0, .. } => Some(types::ty_of(b, &vars)),
+                        Expr::Load { base: b, offset: 0, .. } => pointee(&types::ty_of(b, &vars)).cloned(),
+                        _ => None,
+                    };
+                    let c = obj.and_then(|t| {
+                        let r = types::resolve(Some(db), strip_cv(&t)).into_owned();
+                        let n = named(&r)?.to_string();
+                        (*offset == 0 && types::is_aggregate(Some(db), &r) && types::size_of(Some(db), &r) == Some(w)).then_some(n)
+                    });
+                    found.push(c);
+                }
+            }
+        });
+        if let Some(c) = found.iter().flatten().next().cloned() {
+            let c = &c;
+            // (any other store must be of the same width at the start: a plain value of it)
+            let all = found.iter().all(|f| f.as_ref().map_or(true, |x| x == c));
+            let n_stores = found.len();
+            let mut widths_ok = true;
+            each_stmt(&ir.body, &mut |s| {
+                if let Stmt::Assign { dst: Expr::Load { base, offset, .. }, .. } = s {
+                    if matches!(&**base, Expr::Var(v) if *v == sret) && *offset != 0 {
+                        widths_ok = false;
+                    }
+                }
+            });
+            if all && widths_ok && n_stores > 0 {
+                cls = Some(c.clone());
+            }
         }
     }
     // or an optional value of one of the function's template argument types

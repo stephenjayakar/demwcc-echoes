@@ -551,9 +551,16 @@ impl<'a> Lifter<'a> {
             let lay = layout(&s, false, false, self.db);
             return Some((s, lay, false));
         }
+        // (one the drafter lifted from its own code: those parameters)
+        if s.params.is_empty() && self.unprototyped_c(&r.target) {
+            if let Some(cs) = sig::callee_sig(&r.target) {
+                s.params = cs.params.clone();
+                s.ret = cs.ret.clone();
+            }
+        }
         // C callee without a prototype in the context: arguments are the registers set up
         // for this call (up to the highest one written since the previous call)
-        if s.params.is_empty() && self.unprototyped_c(&r.target) {
+        if s.params.is_empty() && sig::callee_sig(&r.target).is_none() && self.unprototyped_c(&r.target) {
             // words stored to the outgoing parameter area: the GPR arguments are all used, and
             // registers still holding this function's own arguments are passed on
             let outgoing = self.outgoing_stack_words(k);
@@ -1059,19 +1066,28 @@ impl<'a> Lifter<'a> {
         // whose result isn't otherwise used.
         let mut other_uses: HashMap<Site, u32> = HashMap::new();
         let mut ret_defs: HashMap<Reg, Vec<u32>> = HashMap::new();
+        // defs returned by a conditional return (`beqlr`): the value may be reused after it
+        let mut cond_ret_defs: HashSet<Site> = HashSet::new();
+        let mut plain_ret_defs: HashSet<Site> = HashSet::new();
         // defs reaching each use (to see through register copies)
         let mut use_defs: HashMap<(u32, Reg), Vec<u32>> = HashMap::new();
         self.ret_reg = None;
+        let mut cmp_uses: HashMap<Site, u32> = HashMap::new();
+        let is_cmp: Vec<bool> = self.insns.iter().map(|i| matches!(i.op(), Opcode::Cmp | Opcode::Cmpl | Opcode::Cmpi | Opcode::Cmpli)).collect();
         self.for_each_use(|k, r, defs| {
             for &d in defs {
                 *other_uses.entry((d, r)).or_default() += 1;
+                if is_cmp[k] {
+                    *cmp_uses.entry((d, r)).or_default() += 1;
+                }
             }
             use_defs.insert((k as u32, r), defs.to_vec());
         });
         for b in 0..self.cfg.blocks.len() {
-            if self.cfg.idom[b] == usize::MAX || !matches!(self.cfg.blocks[b].term, Term::Return) {
+            if self.cfg.idom[b] == usize::MAX || !matches!(self.cfg.blocks[b].term, Term::Return | Term::CondReturn { .. }) {
                 continue;
             }
+            // (a conditional return `bnelr` returns too: what r3 holds there)
             let mut cur = self.rd_in[b].clone();
             let blk = &self.cfg.blocks[b];
             for k in blk.start..blk.end {
@@ -1082,14 +1098,21 @@ impl<'a> Lifter<'a> {
                     cur[r as usize] = vec![k as u32];
                 }
             }
+            let cond = matches!(self.cfg.blocks[b].term, Term::CondReturn { .. });
             for r in [gpr(3), fpr(1)] {
                 ret_defs.entry(r).or_default().extend(cur[r as usize].iter().copied());
+                if cond {
+                    cond_ret_defs.extend(cur[r as usize].iter().map(|&d| (d, r)));
+                } else {
+                    plain_ret_defs.extend(cur[r as usize].iter().map(|&d| (d, r)));
+                }
             }
         }
         let name = sig::split_scope(&self.sig.qualified_name).1.to_string();
         let getter_like = ["Get", "Is", "Has", "Can", "Should", "Does", "Are", "Was", "Find", "Check"]
             .iter()
             .any(|p| name.starts_with(p));
+        let has_cond_return = self.cfg.blocks.iter().any(|b| matches!(b.term, Term::CondReturn { .. }));
         let judge = |r: Reg, this: &Lifter| -> (bool, bool) {
             // (all defs are value-producing, some def is a non-call)
             let defs = ret_defs.get(&r).cloned().unwrap_or_default();
@@ -1109,7 +1132,10 @@ impl<'a> Lifter<'a> {
                     continue;
                 }
                 any_noncall = true;
-                if other_uses.get(&(d, r)).copied().unwrap_or(0) > 0 {
+                // (a value only compared besides, where a conditional return returns it: `p ? p : 0`)
+                // (returned only by a conditional return: a value reused after it is a different one)
+                let cmp_only = (cond_ret_defs.contains(&(d, r)) && !plain_ret_defs.contains(&(d, r))) || (has_cond_return && other_uses.get(&(d, r)).copied().unwrap_or(0) == cmp_uses.get(&(d, r)).copied().unwrap_or(0));
+                if other_uses.get(&(d, r)).copied().unwrap_or(0) > 0 && !cmp_only {
                     return (false, false);
                 }
             }
@@ -1916,6 +1942,22 @@ impl<'a> Lifter<'a> {
                 // splitter-named word may be a variable)
                 let ro = matches!(d.section.as_str(), ".sdata2" | ".rodata");
                 if !matches!(d.size, 4 | 8) || !d.relocs.is_empty() || !(ro || s.starts_with('@')) {
+                    return None;
+                }
+                Some((s.clone(), self.data_bytes(s, 0, d.size as usize)?))
+            })
+            .collect()
+    }
+
+    /// Bytes of the writable splitter-named word symbols the function references (see
+    /// [`crate::IrFunction::temp_bytes`]).
+    pub fn temp_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        self.globals
+            .keys()
+            .filter(|s| s.starts_with("lbl_"))
+            .filter_map(|s| {
+                let d = self.obj.data.get(s)?;
+                if !matches!(d.size, 4 | 8) || !d.relocs.is_empty() || d.section != ".sdata" {
                     return None;
                 }
                 Some((s.clone(), self.data_bytes(s, 0, d.size as usize)?))

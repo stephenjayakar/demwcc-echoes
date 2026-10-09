@@ -618,6 +618,22 @@ impl<'t> Scanner<'t> {
         if decl.is_empty() {
             return;
         }
+        // a leading `__declspec(section ".init")` (a variable placed in a section) is no
+        // function call syntax: the declaration after it
+        if decl[0].is("__declspec") && decl.get(1).is_some_and(|t| t.is("(")) {
+            let mut d = 0;
+            for (i, t) in decl.iter().enumerate().skip(1) {
+                if t.is("(") {
+                    d += 1;
+                } else if t.is(")") {
+                    d -= 1;
+                    if d == 0 {
+                        return self.plain_decl(scope, is_class, &decl[i + 1..]);
+                    }
+                }
+            }
+            return;
+        }
         let first = decl[0].s.as_str();
         if first == "typedef" {
             if let Some(n) = declarator_name(&decl[1..]) {

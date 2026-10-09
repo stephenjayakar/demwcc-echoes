@@ -1011,3 +1011,91 @@ pub fn float_word_copies(body: &mut Vec<Stmt>, vars: &[Var]) {
         }
     });
 }
+
+/// An undeclared word return whose value is a local returned or replaced by 0 after an unsigned
+/// test against zero (`cmplwi; bnelr; li r3, 0`: `p ? p : 0`) is a pointer: the local and the
+/// return become `void*` (an `int` tests signed and returns through another form).
+pub fn pointer_returns(body: &mut Vec<Stmt>, vars: &mut [Var], ret: &mut Type) {
+    if !matches!(ret, Type::Unknown { size: 4 }) {
+        return;
+    }
+    let word = |t: &Type| matches!(strip_cv(t), Type::Int { size: 4, .. } | Type::Unknown { size: 4 });
+    fn zero_test(e: &Expr) -> Option<VarId> {
+        let Expr::Binary { op: BinOp::Eq | BinOp::Ne, l, r, .. } = e else { return None };
+        if r.as_int() != Some(0) {
+            return None;
+        }
+        match &**l {
+            Expr::Cast { ty: Type::Int { size: 4, signed: false }, e } => match &**e {
+                Expr::Var(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    // returned values: 0 or one local (directly or through `t ==/!= 0 ? .. : ..`)
+    let mut rets: Vec<Expr> = vec![];
+    let mut snap = body.clone();
+    Stmt::for_each_block_mut(&mut snap, &mut |b| {
+        for s in b.iter() {
+            if let Stmt::Return(Some(e)) = s {
+                rets.push(e.clone());
+            }
+        }
+    });
+    let mut cand: Option<VarId> = None;
+    let mut ok = !rets.is_empty();
+    let mut tested = false;
+    let mut note = |v: VarId, cand: &mut Option<VarId>, ok: &mut bool| match cand {
+        None => *cand = Some(v),
+        Some(c) if *c == v => {}
+        _ => *ok = false,
+    };
+    for e in &rets {
+        match e {
+            Expr::Int { value: 0, .. } => {}
+            Expr::Var(v) => note(*v, &mut cand, &mut ok),
+            Expr::Ternary { c, t, f, .. } => {
+                let Some(v) = zero_test(c) else {
+                    ok = false;
+                    continue;
+                };
+                tested = true;
+                note(v, &mut cand, &mut ok);
+                for x in [t, f] {
+                    match &**x {
+                        Expr::Int { value: 0, .. } => {}
+                        Expr::Var(w) if *w == v => {}
+                        _ => ok = false,
+                    }
+                }
+            }
+            _ => ok = false,
+        }
+    }
+    let Some(v) = cand else { return };
+    if !ok || !matches!(vars[v].kind, VarKind::Local) || !word(&vars[v].ty) {
+        return;
+    }
+    if !tested {
+        Stmt::walk_exprs(body, &mut |e| {
+            if zero_test(e) == Some(v) {
+                tested = true;
+            }
+        });
+    }
+    if !tested {
+        return;
+    }
+    let vp = Type::Ptr(Box::new(Type::Void));
+    vars[v].ty = vp.clone();
+    *ret = vp;
+    // the tests compare the pointer itself
+    Stmt::rewrite_exprs(body, &mut |e| {
+        if let Expr::Cast { ty: Type::Int { size: 4, signed: false }, e: inner } = e {
+            if matches!(**inner, Expr::Var(w) if w == v) {
+                *e = Expr::Var(v);
+            }
+        }
+    });
+}

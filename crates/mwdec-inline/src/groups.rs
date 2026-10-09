@@ -201,6 +201,7 @@ fn touches(s: &Stmt, addr: &Expr, lo: i32, hi: i32, env: &Env) -> bool {
 pub fn rewrite_groups(b: &mut Vec<Stmt>, env: &Env, idx: &Index) -> usize {
     let mut n = 0;
     let mut start = 0;
+    let mut seg_limit: Option<usize> = None;
     // (bounded: every rewrite folds stores into fewer statements, but stay safe)
     while start < b.len() && n < 64 {
         // segment [start, end)
@@ -209,7 +210,15 @@ pub fn rewrite_groups(b: &mut Vec<Stmt>, env: &Env, idx: &Index) -> usize {
             end += 1;
         }
         if end > start {
-            if let Some((new, rm_lo)) = try_segment(b, start, end, env, idx) {
+            // (retries must not grow the segment without bound: a value rebuilt around itself
+            // on every retry grows geometrically)
+            let nodes = |ss: &[Stmt]| {
+                let mut k = 0usize;
+                Stmt::walk_exprs(ss, &mut |_| k += 1);
+                k
+            };
+            let limit = *seg_limit.get_or_insert_with(|| 2 * nodes(&b[start..end]) + 32);
+            if let Some((new, rm_lo)) = try_segment(b, start, end, env, idx).filter(|(new, _)| nodes(new) <= limit) {
                 if std::env::var("MWDI_TRACE_REWRITE").is_ok() {
                     eprintln!("GROUP rewrite {start}..{end} -> {} stmts: {}", new.len(), format!("{:?}", new).chars().take(300).collect::<String>());
                 }
@@ -225,6 +234,7 @@ pub fn rewrite_groups(b: &mut Vec<Stmt>, env: &Env, idx: &Index) -> usize {
             }
         }
         start = end + 1;
+        seg_limit = None;
     }
     n
 }
@@ -264,7 +274,9 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
     if let Some(r) = crate::util::prof::time(9, || try_copy(b, start, end, &stores, env)) {
         return Some(r);
     }
-    let mut best: Option<(i32, Vec<Stmt>, usize)> = None;
+    let mut best: Option<(i32, Vec<Stmt>, usize, bool, Vec<usize>)> = None;
+    // the best in-place mutator (for the `x = x op v` / `x op= v` variant point)
+    let mut best_mut: Option<(i32, Vec<Stmt>, usize, Vec<usize>)> = None;
     // object_at per (anchor store, offset, class): many templates share a class
     let mut objs: std::collections::HashMap<(usize, i32, String), Option<(Expr, Expr)>> = std::collections::HashMap::new();
     for &ti in &idx.groups {
@@ -278,6 +290,11 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
             _ => continue,
         };
         let tr = std::env::var("MWDI_TRACE_G").is_ok_and(|f| t.name.contains(f.as_str()));
+        // a mutator of plain member stores (`SetTranslation`): only for private members of
+        // another class, which the caller could not have written itself
+        if mutate.is_some() && t.ops == 0 && t.dead.is_empty() && !foreign_private(&cls, env) {
+            continue;
+        }
         let min_off = comps.iter().map(|c| c.off).min()?;
         let max_end = comps.iter().map(|c| c.off + 4).max()?;
         let first = comps.iter().find(|c| c.off == min_off)?;
@@ -313,13 +330,20 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
             if !covered {
                 continue;
             }
-            // one statement that already assigns a whole object of this class
-            if stmts.len() == 1 && matches!(&b[stmts[0]], Stmt::Assign { dst, .. } if class_name(&ty_of(dst, env.vars), env.db).as_deref() == Some(cls.as_str())) {
+            // one statement that already assigns a whole object of this class (or of a class
+            // derived from it: rebuilding `CUnitVector3f u = -v;` member-wise as a `CVector3f`
+            // would wrap the value again on every retry)
+            if stmts.len() == 1 && matches!(&b[stmts[0]], Stmt::Assign { dst, .. } if class_name(&ty_of(dst, env.vars), env.db).is_some_and(|c| c == cls || crate::util::is_base_or_same(env.db, &cls, &c))) {
                 continue;
             }
             if t.ops == 0 && is_copy(&pick, delta, &cls, env) {
-                // a plain member-wise copy stays an assignment
-                continue;
+                // a plain member-wise copy stays an assignment (but a mutator copying part of an
+                // object whose members the function can't name is the call:
+                // `xf.SetTranslation(other.GetTranslation())`)
+                let whole = flat_fields(env.db, &cls).map_or(true, |f| f.len() == comps.len());
+                if mutate.is_none() || whole {
+                    continue;
+                }
             }
             if matches!(t.kind, crate::probe::CallKind::Ctor) && t.ops == 0 {
                 // constructor fallback: only for consecutive stores of a class whose members
@@ -411,12 +435,30 @@ fn try_segment(b: &[Stmt], start: usize, end: usize, env: &Env, idx: &Index) -> 
                     out.push(new_stmt.clone());
                 }
             }
-            if best.as_ref().map_or(true, |(b, _, _)| score > *b) {
-                best = Some((score, out, lo));
+            if mutate.is_some() && best_mut.as_ref().map_or(true, |(b, ..)| score > *b) {
+                best_mut = Some((score, out.clone(), lo, stmts.clone()));
+            }
+            if best.as_ref().map_or(true, |(b, ..)| score > *b) {
+                best = Some((score, out, lo, mutate.is_some(), stmts));
             }
         }
     }
-    best.map(|(_, o, l)| (o, l))
+    let (_, o, l, is_mut, ss) = best?;
+    if !is_mut {
+        if let Some((_, mo, ml, mss)) = best_mut.filter(|(.., mss)| *mss == ss) {
+            if mwdec_lift::variants::alt(mwdec_lift::variants::INPLACE_MUTATOR) {
+                return Some((mo, ml));
+            }
+        }
+    }
+    Some((o, l))
+}
+
+/// Does `cls` have non-public members and the function isn't one of its own?
+fn foreign_private(cls: &str, env: &Env) -> bool {
+    let hidden = mwdec_lift::sig::find_class(env.db, cls).map_or(false, |c| c.fields.iter().any(|f| f.access != mwdec_core::Access::Public));
+    let own = env.vars.iter().any(|v| v.kind == mwdec_lift::VarKind::This && mwdec_lift::pointee(&v.ty).and_then(|t| class_name(t, env.db)).as_deref() == Some(cls));
+    hidden && !own
 }
 
 /// Are the stored values the same-layout components of one other object (a copy)?

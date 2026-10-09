@@ -57,6 +57,9 @@ pub struct Template {
     /// From a function template instantiated with a guessed scalar type: a declared function
     /// with the same expansion is preferred.
     pub guessed: bool,
+    /// Holes passed a constant by a constant-argument specialisation (hole, constant): the
+    /// pattern doesn't contain them, the call gets the constant.
+    pub fixed: Vec<(usize, Expr)>,
 }
 
 pub fn hole_kind(t: &Type, db: &TypeDb) -> HoleKind {
@@ -133,6 +136,48 @@ fn subst(e: &mut Expr, defs: &HashMap<VarId, Expr>) {
 pub fn dead_patterns(ir: &IrFunction) -> Option<Vec<(u32, Expr)>> {
     let map: HashMap<VarId, usize> = ir.params.iter().enumerate().map(|(i, v)| (*v, i)).collect();
     ir.dead_stores.iter().map(|d| Some((d.size, to_holes(&d.value, &map)?))).collect()
+}
+
+/// Symbol prefix of a compiler-made temporary in a template (`@N`, a constant bound to a const
+/// reference parameter): the rest is the temporary's bytes in hex, matched by value against
+/// the target's temporaries (the compiler never writes them, wherever they live).
+pub const LITERAL_PREFIX: &str = "@=";
+
+/// Name the probe's compiler-made temporaries by their values (see [`LITERAL_PREFIX`]).
+pub fn name_literals(t: &mut Template, ir: &IrFunction) {
+    let lits: HashMap<&str, String> = ir
+        .literal_bytes
+        .iter()
+        .filter(|(s, _)| s.starts_with('@'))
+        .map(|(s, b)| (s.as_str(), format!("{LITERAL_PREFIX}{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())))
+        .collect();
+    if lits.is_empty() {
+        return;
+    }
+    // (a value matched is as specific as an operator: `ZeroFlat()` vs `ZeroPlus()`)
+    let mut named = 0;
+    let mut f = |e: &mut Expr| {
+        if let Expr::Global { symbol, .. } = e {
+            if let Some(n) = lits.get(symbol.as_str()) {
+                *symbol = n.clone();
+                named += 1;
+            }
+        }
+    };
+    match &mut t.shape {
+        Shape::Scalar(e) => e.rewrite(&mut f),
+        Shape::Object { comps, .. } | Shape::Mutate { comps, .. } => comps.iter_mut().for_each(|c| c.pat.rewrite(&mut f)),
+        Shape::Stmts { stmts, result } => {
+            Stmt::rewrite_exprs(stmts, &mut f);
+            if let Some(r) = result {
+                r.rewrite(&mut f);
+            }
+        }
+    }
+    for (_, e) in &mut t.dead {
+        e.rewrite(&mut f);
+    }
+    t.ops += named;
 }
 
 fn to_holes(e: &Expr, map: &HashMap<VarId, usize>) -> Option<Expr> {
@@ -348,7 +393,7 @@ fn from_probe_expr(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, 
         Shape::Object { comps, .. } | Shape::Mutate { comps, .. } => comps.iter().map(|c| count_ops(&c.pat)).sum(),
         Shape::Stmts { .. } => 0,
     };
-    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape, ops, ret_ref: p.ret_ref, dead: vec![], guessed: p.fn_template })
+    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape, ops, ret_ref: p.ret_ref, dead: vec![], guessed: p.fn_template, fixed: vec![] })
 }
 
 /// A probe whose body has control flow: fold it into one value expression (ternaries).
@@ -371,5 +416,5 @@ fn from_cflow_probe(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template,
         }
     }
     let ops = count_ops(&e);
-    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape: Shape::Scalar(e), ops, ret_ref: p.ret_ref, dead: vec![], guessed: p.fn_template })
+    Ok(Template { name: p.sig.qualified_name.clone(), kind: p.kind.clone(), sig: p.sig.clone(), class: p.class.clone(), holes, shape: Shape::Scalar(e), ops, ret_ref: p.ret_ref, dead: vec![], guessed: p.fn_template, fixed: vec![] })
 }

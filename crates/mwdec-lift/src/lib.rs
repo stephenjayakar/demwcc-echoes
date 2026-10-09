@@ -385,10 +385,14 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         }
     }
 
+    if sig::ret_unknown(&l.sig) || matches!(l.sig.ret, mwdec_core::Type::Unknown { .. }) {
+        localtypes::pointer_returns(&mut body, &mut l.vars, &mut l.ret_ty);
+    }
     let mut sig = l.sig.clone();
     sig.ret = l.ret_ty.clone();
     let string_pool = l.string_pool_prefix();
     let literal_bytes = l.literal_bytes();
+    let temp_bytes = l.temp_bytes();
     let mut ir = IrFunction {
         symbol: f.name.clone(),
         sig,
@@ -402,6 +406,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
         frame: l.frame.info,
         string_pool,
         literal_bytes,
+        temp_bytes,
         warnings: l.warnings,
         decl_params: l.decl_params,
         dead_stores,
@@ -411,6 +416,7 @@ fn lift_once(obj: &ObjectFile, f: &Function, db: Option<&TypeDb>, opts: &LiftOpt
     frameobj::fold_block_copies(&mut ir, db);
     frameobj::whole_object_copies(&mut ir, db);
     frameobj::unknown_callee_byval(&mut ir, db);
+    frameobj::forwarded_byval_params(&mut ir, db);
     frameobj::fold_converting_return(&mut ir, db);
     frameobj::drop_default_construction_stores(&mut ir, db);
     frameobj::fold_default_constructed_return(&mut ir, db);

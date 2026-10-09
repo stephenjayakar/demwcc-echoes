@@ -1274,6 +1274,22 @@ pub fn copy_key(cls: &str, from: &str) -> String {
 pub fn wanted_pairs<'a>(symbols: impl Iterator<Item = &'a str> + Clone, db: &TypeDb) -> Vec<(String, String)> {
     let classes = wanted(symbols.clone(), db);
     let mut out: Vec<(String, String)> = classes.iter().map(|c| (c.clone(), c.clone())).collect();
+    // `f(void* dst, const T& src)`: a placement copy (`construct_impl`)
+    for s in symbols.clone() {
+        let sig = mwdec_lift::sig::sig_of(s, Some(db));
+        if let [d, r, ..] = sig.params.as_slice() {
+            if !matches!(strip_cv(&d.ty), Type::Ptr(x) if matches!(strip_cv(x), Type::Void)) {
+                continue;
+            }
+            let Type::Ref(x) = strip_cv(&r.ty) else { continue };
+            if let Some(c) = crate::util::class_name(strip_cv(x), db) {
+                let pair = (c.clone(), c);
+                if !out.contains(&pair) && out.len() < 96 {
+                    out.push(pair);
+                }
+            }
+        }
+    }
     for s in symbols {
         if !s.starts_with("__ct__") {
             continue;
@@ -1985,6 +2001,60 @@ pub fn inline_destructor_tests(body: &mut Vec<Stmt>) -> usize {
             n += 1;
         }
     });
+    n
+}
+
+// ---------------------------------------------------------------- placement copies
+
+/// `if (dst) { <T's copy construction from src> }` with `dst` a `void*` parameter and `src` a
+/// `const T&` one: the placement copy `new (dst) T(src);` (its null test included).
+pub fn placement_copies(ir: &mut IrFunction, db: &TypeDb, cc: &CopyCtors) -> usize {
+    let params: Vec<VarId> = ir.params.clone();
+    let mut n = 0;
+    for k in 0..ir.body.len() {
+        let Stmt::If { cond, then, els } = &ir.body[k] else { continue };
+        if !els.is_empty() || then.is_empty() {
+            continue;
+        }
+        let tested = match cond {
+            Expr::Binary { op: BinOp::Ne, l, r, .. } if r.as_int() == Some(0) => &**l,
+            c => c,
+        };
+        let tested = match tested {
+            Expr::Cast { e, .. } => &**e,
+            t => t,
+        };
+        let Expr::Var(dst) = tested else { continue };
+        let dst = *dst;
+        if !params.contains(&dst) || !matches!(strip_cv(&ir.vars[dst].ty), Type::Ptr(x) if matches!(strip_cv(x), Type::Void)) {
+            continue;
+        }
+        let defs = temp_defs(&ir.body, &ir.vars);
+        let cn = Canon { this: Some(dst), unset: unset_vars(ir), params: param_vars(ir), calls: call_defs(ir), cur: Default::default(), mem: Default::default(), defs: &defs, db };
+        let got: Option<Vec<COp>> = then.iter().filter(|s| !matches!(s, Stmt::Assign { dst: Expr::Var(v), .. } if defs.contains_key(v))).map(|s| cn.op(s)).collect();
+        let Some(got) = got else { continue };
+        let mut hit = None;
+        for &src in &params {
+            if src == dst {
+                continue;
+            }
+            let Some(cls) = crate::util::class_name(strip_cv(&ir.vars[src].ty), db) else { continue };
+            let Some(ops) = cc.get(&copy_key(&cls, &cls)) else { continue };
+            let Some(ps) = first_param(ops) else { continue };
+            let want: Vec<COp> = ops.iter().map(|o| bind_op(o, 0, ps, src)).collect();
+            if want == got {
+                hit = Some((src, cls));
+                break;
+            }
+        }
+        let Some((src, cls)) = hit else { continue };
+        ir.body[k] = Stmt::Expr(Expr::New { class: Type::Named(cls), placement: vec![Expr::Var(dst)], ctor: None, args: vec![Expr::Var(src)] });
+        n += 1;
+    }
+    if n > 0 {
+        let vars = ir.vars.clone();
+        drop_unused_temps(&mut ir.body, &vars);
+    }
     n
 }
 

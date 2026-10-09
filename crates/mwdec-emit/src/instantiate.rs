@@ -119,7 +119,8 @@ fn scope_is_class(scope: &str, is_class: &dyn Fn(&str) -> bool) -> bool {
 /// forms); `is_class` says whether a qualifier names a class (vs a namespace).
 pub fn triggers(symbol: &str, ret: Option<&Type>, is_class: &dyn Fn(&str) -> bool) -> Vec<String> {
     match parts(symbol) {
-        Some(p) => triggers_for(&p, ret, is_class),
+        // (classes of the unit's anonymous namespace are named without the compiler's scope)
+        Some(p) => triggers_for(&p, ret, is_class).into_iter().map(|s| crate::strip_unnamed_ns(&s)).collect(),
         None => Vec::new(),
     }
 }

@@ -138,6 +138,14 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
         let copies = copies + mwdec_lift::postinline::const_bool_locals(&mut fixed.body, &mut fixed.vars, matches!(fixed.sig.ret, Type::Bool));
         narrowed = mwdec_lift::postinline::narrow_by_defs(&mut fixed.body, &mut fixed.vars);
         let copies = copies + narrowed.len();
+        // (an override in a class the context lacks returns what the base's virtual returns)
+        let copies = copies + match base_virtual_ret(&fixed, db.unwrap()) {
+            Some(r) => {
+                fixed.sig.ret = r;
+                1
+            }
+            None => 0,
+        };
         if fixed.vars != ir.vars || forwarded > 0 || copies > 0 {
             &fixed
         } else {
@@ -211,6 +219,9 @@ pub fn emit_function(ir: &IrFunction, db: Option<&TypeDb>, opts: &EmitOptions) -
     Emitted { preamble: if preamble.is_empty() { preamble } else { preamble + "\n" }, body: em.out }
 }
 
+/// Marks the string-pool context line of a draft (see [`string_pool_decl`]).
+pub const STRING_CONTEXT_MARKER: &str = "// mwdec: unit string pool context (drop when integrating)";
+
 /// The unit's string literals that precede this function's in the target's string pool: the
 /// compiler pools a unit's literals in order of appearance (sharing equal ones), so listing them
 /// first puts the function's strings at their target offsets.
@@ -219,7 +230,11 @@ fn string_pool_decl(ir: &IrFunction) -> Option<String> {
         return None;
     }
     let strs: Vec<String> = ir.string_pool.iter().map(|b| float::c_string(b)).collect();
-    Some(format!("const char* __unit_strings[] = {{ {} }};", strs.join(", ")))
+    let tag: String = ir.symbol.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    // (context for compiling the function alone: in its real file the unit's other functions
+    // supply these strings, so integration drops the line by its marker)
+    Some(format!("{STRING_CONTEXT_MARKER}
+static const char* const __unit_strings_{tag}[] = {{ {} }};", strs.join(", ")))
 }
 
 /// Demangle a data/function symbol to a C++ qualified name (`sZero__9CVector3f` ->
@@ -624,6 +639,12 @@ impl<'a> Em<'a> {
         let ns_vars = ir.globals.iter().any(|g| sig::demangle(&g.symbol).map_or(false, |d| sig::split_scope(&d).0 == Some(cls.as_str())));
         // (a class its enclosing class only declares can be defined out of line)
         let declared_nested = cls.contains("::") && sig::find_class(db, &cls).is_some_and(|c| c.is_declaration) && sig::split_scope(&cls).0.is_some_and(|sc| sig::find_class(db, sc).is_some_and(|p| !p.is_declaration));
+        // an instance of a class template the context lacks: the template is synthesized
+        let tshape = template_shape(&cls).filter(|(b, _)| !b.contains("::") && self.unknown_type(db, b));
+        let (cls, targs) = match tshape {
+            Some((b, k)) => (b, k),
+            None => (cls, vec![]),
+        };
         if (cls.chars().next().map_or(true, |c| c.is_ascii_lowercase()) && ns_vars) || (cls.contains("::") && !declared_nested) || cls.contains('<') || cls.contains('@') || sig::find_class(db, &cls).is_some_and(|c| !c.is_declaration || !declared_nested) || db.namespaces.contains(&cls) || db.templates.contains_key(&cls) {
             return;
         }
@@ -639,10 +660,10 @@ impl<'a> Em<'a> {
                 }
             }
             // a direct call of another class's method on `this` (`this->Base::Method(...)`):
-            // that class is a base
+            // that class is a base (also one of the unit's own classes, synthesized too)
             Expr::Call { callee: Callee::Method { sig: s, this: o, .. }, .. } if matches!(&**o, Expr::Var(v) if Some(*v) == this) => {
                 if let Some(c) = &s.this_class {
-                    if sig::norm_name(c) != sig::norm_name(&cls) && sig::find_class(db, c).is_some() {
+                    if sig::norm_name(c) != sig::norm_name(&cls) && (sig::find_class(db, c).is_some() || (!c.contains(['<', '@', ':']) && sig::find_class(db, c).is_none() && self.unknown_type(db, c))) {
                         base.get_or_insert(c.clone());
                     }
                 }
@@ -701,6 +722,9 @@ impl<'a> Em<'a> {
         }
         let e = self.synth.entry(cls.clone()).or_default();
         e.base = base;
+        if !targs.is_empty() {
+            e.targs = targs;
+        }
         e.add_method(&format!("{name}({})", ps.join(", ")), m);
         for (n, d) in statics {
             e.add_method(&format!("static {n}"), d);
@@ -789,7 +813,8 @@ impl<'a> Em<'a> {
         let mut calls: Vec<(String, String, String)> = vec![];
         Stmt::walk_exprs(&ir.body, &mut |e| match e {
             Expr::Call { callee: Callee::Method { sig: s, .. } | Callee::Direct { sig: s, .. }, ret, .. } => {
-                names.extend(fn_types(&s.qualified_name));
+                // (a free function's scope is a namespace: declared as one, not a class)
+                names.extend(fn_types(&s.qualified_name).into_iter().filter(|n| s.this_class.is_some() || n.starts_with('<')));
                 for p in &s.params {
                     tnames(&p.ty, &mut names);
                 }
@@ -817,6 +842,16 @@ impl<'a> Em<'a> {
             Expr::New { class, .. } | Expr::Construct { class, .. } | Expr::Cast { ty: class, .. } | Expr::Load { ty: class, .. } | Expr::Member { ty: class, .. } => tnames(class, &mut names),
             _ => {}
         });
+        // a nested type of an instance of a class template the context lacks
+        // (`T<A>::Inner`): the template is synthesized with the nested type inside
+        let mut tmpl_targs: Vec<(String, Vec<bool>)> = vec![];
+        for n in names.clone() {
+            let (Some(sc), last) = sig::split_scope(&n) else { continue };
+            if let Some((b, k)) = template_shape(sc).filter(|(b, _)| !b.contains(['<', ':']) && self.unknown_type(db, b)) {
+                names.push(format!("{b}::{last}"));
+                tmpl_targs.push((b, k));
+            }
+        }
         for n in &names {
             note(n, &mut chains);
         }
@@ -834,6 +869,13 @@ impl<'a> Em<'a> {
         for (c, key, d) in calls {
             if wanted.contains(&c) {
                 self.synth.entry(c).or_default().add_method(&key, d);
+            } else if let Some((b, k)) = template_shape(&c).filter(|(b, _)| wanted.contains(b) && !b.contains("::")) {
+                // (a method of an instance of a class template the context lacks)
+                let e = self.synth.entry(b).or_default();
+                e.add_method(&key, d);
+                if e.targs.is_empty() {
+                    e.targs = k;
+                }
             }
         }
         for v in &ir.vars {
@@ -851,10 +893,29 @@ impl<'a> Em<'a> {
         for n in &all {
             self.synth.entry(n.clone()).or_default();
         }
+        for (b, k) in tmpl_targs {
+            if let Some(e) = self.synth.get_mut(&b).filter(|e| e.targs.is_empty()) {
+                e.targs = k;
+            }
+        }
         let render = |me: &Self, n: &str| -> String { me.render_synth(n, &all) };
         let mut defs = vec![];
         let mut fwd = vec![];
-        for n in all.iter().filter(|n| !is_nested(n)) {
+        // (a synthesized base, or a class whose nested type a method names, before the classes
+        // that need it complete)
+        let tops: Vec<&String> = all.iter().filter(|n| !is_nested(n)).collect();
+        let needs = |n: &str, m: &str| -> bool {
+            let Some(e) = self.synth.get(n) else { return false };
+            let last = sig::split_scope(m).1;
+            e.base.as_deref() == Some(m) || e.methods.iter().any(|(_, d)| d.contains(&format!("{last}<")) || d.contains(&format!("{last}::")))
+        };
+        let mut order: Vec<&String> = vec![];
+        let mut left = tops.clone();
+        while !left.is_empty() {
+            let pick = left.iter().position(|n| !left.iter().any(|m| m != n && needs(n, m))).unwrap_or(0);
+            order.push(left.remove(pick));
+        }
+        for n in order {
             let (scope, last) = sig::split_scope(n);
             let body = render(self, n);
             // a nested class its (defined) enclosing class only declares: defined out of line
@@ -862,7 +923,7 @@ impl<'a> Em<'a> {
                 defs.push(body.replacen(&format!("struct {last}"), &format!("struct {n}"), 1));
                 continue;
             }
-            let mut f = format!("struct {last};");
+            let mut f = format!("{}struct {last};", synth_template_prefix(&self.synth.get(n.as_str()).map(|s| s.targs.clone()).unwrap_or_default()));
             let mut d = body;
             if let Some(sc) = scope {
                 for part in sc.split("::").collect::<Vec<_>>().into_iter().rev() {
@@ -1092,7 +1153,7 @@ impl<'a> Em<'a> {
             let _ = write!(body, " unsigned char __mwdec_data[{}];", s.size);
         }
         let b = s.base.map(|b| format!(" : public {b}")).unwrap_or_default();
-        format!("struct {last}{b} {{{body} }};")
+        format!("{}struct {last}{b} {{{body} }};", synth_template_prefix(&s.targs))
     }
 
     /// One declared type per global symbol: the single type it's used with, else the largest
@@ -2956,6 +3017,12 @@ impl<'a> Em<'a> {
 
     /// Render an lvalue access of `ty` at byte `off` from pointer expression `base`.
     fn ptr_access(&mut self, base: &Expr, off: i32, ty: &Type) -> String {
+        // through a reference local (`const T& r = f();`): the referent's member, `r.m`
+        if let Expr::Var(v) = base {
+            if matches!(self.ir.vars[*v].ty, Type::Ref(_)) && matches!(self.ir.vars[*v].kind, VarKind::Stack { .. }) {
+                return self.member_access(base, off, ty);
+            }
+        }
         let read = !std::mem::replace(&mut self.lvalue_ctx, false);
         // `*&f()` of a value-returning call: the value (an rvalue has no address)
         if let (0, true, Expr::AddrOf(x)) = (off, read, base) {
@@ -3091,7 +3158,7 @@ impl<'a> Em<'a> {
                 let br = mwdec_lift::types::resolve(Some(db), &bt).into_owned();
                 // a member of a reference member: of the referenced object
                 let br = match strip_cv(&br) {
-                    Type::Ref(inner) => mwdec_lift::types::resolve(Some(db), inner).into_owned(),
+                    Type::Ref(inner) => mwdec_lift::types::resolve(Some(db), strip_cv(inner)).into_owned(),
                     _ => br,
                 };
                 // the object a class template keeps in raw storage (`optional_object<T>`'s bytes):
@@ -3407,6 +3474,12 @@ impl<'a> Em<'a> {
     /// Prefix for calling a method on the object `this_e` points at; `is_const_method` false
     /// adds a `const_cast` when the object is const.
     fn object_prefix_c(&mut self, this_e: &Expr, class: Option<&str>, is_const_method: bool) -> String {
+        // a reference local is the object itself
+        if let Expr::Var(v) = this_e {
+            if matches!(self.ir.vars[*v].ty, Type::Ref(_)) && matches!(self.ir.vars[*v].kind, VarKind::Stack { .. }) {
+                return format!("{}.", self.ir.vars[*v].name);
+            }
+        }
         // a method of the member at offset 0 (`this->mPos.IsEqu(...)` called with `this`)
         if let Some(c) = class {
             if let Some(s) = self.offset0_member(this_e, c, is_const_method) {
@@ -4232,6 +4305,10 @@ impl<'a> Em<'a> {
                             Some(p) => self.coerce(&args[1], &p.ty),
                             None => self.expr(&args[1], 0),
                         };
+                        // (a scalar operand that is itself an operation: `v * (1.0f / t)`, not
+                        // `v * 1.0f / t`)
+                        let wrap = |a: &Expr, t: String| if matches!(a, Expr::Binary { .. } | Expr::Ternary { .. }) { format!("({t})") } else { t };
+                        let (l, r) = (wrap(&args[0], l), wrap(&args[1], r));
                         return format!("({l} {op} {r})");
                     }
                     if args.len() == 1 && matches!(op, "-" | "!" | "~") {
@@ -4250,7 +4327,7 @@ impl<'a> Em<'a> {
                         return c;
                     }
                 }
-                let name = if symbol.starts_with("__") && sig::demangle(symbol).is_none() { symbol.clone() } else { strip_unnamed_ns(&s.qualified_name) };
+                let name = if symbol.starts_with("__") && sig::demangle(symbol).is_none() { symbol.clone() } else { types::split_closers(&strip_unnamed_ns(&s.qualified_name)) };
                 // (an argument explicitly narrowed from a value of that same narrow type: the
                 // extension is the conversion to a wider parameter)
                 let arg_tys: Vec<Type> = args
@@ -4270,7 +4347,14 @@ impl<'a> Em<'a> {
                         value_type(&ty_of(a, self.vars()))
                     })
                     .collect();
-                self.declare_function(symbol, Some(s), Some((&arg_tys, ret)), 2);
+                // (a placeholder-named callee the drafter lifted: its own parameters and return)
+                match sig::callee_sig(symbol).filter(|c| c.params.len() == args.len()) {
+                    Some(cs) => {
+                        let tys: Vec<Type> = cs.params.iter().map(|p| p.ty.clone()).collect();
+                        self.declare_function(symbol, Some(s), Some((&tys, &cs.ret)), 3);
+                    }
+                    None => self.declare_function(symbol, Some(s), Some((&arg_tys, ret)), 2),
+                }
                 let self_decl = sig::demangle(symbol).is_none() && self.fn_decls.contains_key(symbol);
                 // (later calls with other argument types: converted to the declared ones)
                 let declared_tys = if self_decl { self.fn_param_tys.get(symbol).cloned().filter(|t| t.len() == args.len()) } else { None };
@@ -4482,6 +4566,55 @@ fn vexing_parens(a: String) -> String {
     }
 }
 
+/// The return type of the base-class virtual a method of a class the context lacks overrides:
+/// the method calls `this->Base::Same(...)` with the same parameters (a mangled name has no
+/// return type; the override's must be the base's).
+fn base_virtual_ret(ir: &IrFunction, db: &TypeDb) -> Option<Type> {
+    let own = ir.sig.this_class.as_ref()?;
+    if sig::find_class(db, own).is_some_and(|c| !c.is_declaration) || sig::is_ctor(&ir.sig) || sig::is_dtor(&ir.sig) {
+        return None;
+    }
+    let name = sig::split_scope(&ir.sig.qualified_name).1.to_string();
+    let this = ir.this_var?;
+    let mut ret = None;
+    Stmt::walk_exprs(&ir.body, &mut |e| {
+        if let Expr::Call { callee: Callee::Method { sig: s, this: o, .. }, .. } = e {
+            if ret.is_none() && matches!(&**o, Expr::Var(v) if *v == this) && sig::split_scope(&s.qualified_name).1 == name {
+                if let Some(b) = s.this_class.as_ref().filter(|b| sig::norm_name(b) != sig::norm_name(own)) {
+                    let decl = db.decls.get(&format!("{b}::{name}")).and_then(|ds| ds.iter().find(|d| d.params.len() == ir.params.len() && d.is_const == ir.sig.is_const));
+                    if let Some(d) = decl.filter(|d| !matches!(d.ret, Type::Void | Type::Unknown { .. })) {
+                        ret = Some(d.ret.clone());
+                    }
+                }
+            }
+        }
+    });
+    ret.filter(|r| *r != ir.sig.ret)
+}
+
+/// `N<a, b>` -> (`N`, per argument whether it is a type rather than a constant).
+fn template_shape(n: &str) -> Option<(String, Vec<bool>)> {
+    let open = n.find('<')?;
+    if !n.ends_with('>') {
+        return None;
+    }
+    let args = sig::split_top(&n[open + 1..n.len() - 1], ',');
+    let kinds = args.iter().map(|a| {
+        let a = a.trim();
+        !(a.starts_with(|c: char| c.is_ascii_digit() || c == '-') || a == "true" || a == "false")
+    });
+    Some((n[..open].trim().to_string(), kinds.collect()))
+}
+
+/// `template <typename T0, int T1> ` for a synthesized class template.
+fn synth_template_prefix(kinds: &[bool]) -> String {
+    if kinds.is_empty() {
+        return String::new();
+    }
+    let ps: Vec<String> = kinds.iter().enumerate().map(|(i, t)| if *t { format!("typename T{i}") } else { format!("int T{i}") }).collect();
+    format!("template <{}> ", ps.join(", "))
+}
+
 /// A splitter placeholder (`fn_80073C7C`, `lbl_...`): no source name.
 fn placeholder_name(n: &str) -> bool {
     (n.starts_with("fn_") || n.starts_with("lbl_")) && sig::demangle(n).is_none()
@@ -4606,6 +4739,9 @@ fn reg_of_name(n: &str) -> (u8, u8) {
 #[derive(Clone, Debug, Default)]
 struct Synth {
     base: Option<String>,
+    /// a class template (the function's class or a callee's is an instance of one the context
+    /// lacks): per template parameter, whether it is a type
+    targs: Vec<bool>,
     /// (signature key, declaration)
     methods: Vec<(String, String)>,
     size: u32,

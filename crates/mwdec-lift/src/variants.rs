@@ -105,6 +105,8 @@ pub const INDEX_NAMED_SCALED: &str = "index.named_scaled";
 /// A free algorithm's result (`it = rstl::find(...)`) used once by the next condition stays a named
 /// local instead of being written into the condition.
 pub const NAMED_ALGORITHM_RESULT: &str = "inline.named_algorithm_result";
+/// Member stores explained both as `x = x op v` and as `x op= v`: the in-place mutator.
+pub const INPLACE_MUTATOR: &str = "inline.inplace_mutator";
 
 /// Successive webs of one callee-saved register (`temp_r31`, `temp_r31_2`) are one variable.
 pub const MERGE_REGISTER_WEBS: &str = "regs.merge_webs";
@@ -174,6 +176,7 @@ pub const POINTS: &[(&str, &str)] = &[
     (PARAM_CONST_POINTERS, "parameters only loaded through are declared pointer-to-const (their loads ignore stores)"),
     (ORDER_ADDRESS_FIRST, "an address temp computed after an independent value temp moves before it"),
     (NAMED_ALGORITHM_RESULT, "a free algorithm's result used by the next condition stays a named local"),
+    (INPLACE_MUTATOR, "member stores explained as `x = x op v` and as `x op= v` take the in-place mutator"),
     (ORDER_SPLIT_LAST_FIELD, "a packed word built from field inserts gets its last field in a statement of its own"),
     (BOOL_CONST_LOCAL, "bool locals defined once are const (re-extended at their uses)"),
     (LOOP_INVARIANT_READS, "temps read before a loop and used once inside it are read in the loop"),

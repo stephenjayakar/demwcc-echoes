@@ -146,6 +146,7 @@ pub fn from_probe(p: &Probe, ir: &IrFunction, db: &TypeDb) -> Result<Template, S
         ret_ref: p.ret_ref,
         dead: vec![],
         guessed: p.fn_template,
+        fixed: vec![],
     })
 }
 
@@ -359,6 +360,27 @@ fn match_seq(m: &mut M, p: &[Stmt], t: &[Stmt], ti: usize) -> Option<usize> {
                 return Some(e);
             }
             m.folded.pop();
+            m.b = snap.clone();
+        }
+    }
+    // an `if` decided by constant arguments: the compiler kept only one arm (constfold.rs)
+    if let Stmt::If { cond, then, els } = first {
+        if std::env::var("MWDI_NO_CONSTIF").is_err() && crate::constfold::decidable(cond, &m.t.holes) {
+            for (arm, want) in [(then, true), (els, false)] {
+                let mut rest: Vec<Stmt> = arm.clone();
+                rest.extend_from_slice(&p[1..]);
+                if !has_effect(&rest) {
+                    continue;
+                }
+                m.b = snap.clone();
+                let nf = m.folded.len();
+                if let Some(e) = match_seq(m, &rest, t, ti) {
+                    if crate::constfold::solve(cond, want, m) {
+                        return Some(e);
+                    }
+                }
+                m.folded.truncate(nf);
+            }
             m.b = snap;
         }
     }
@@ -702,7 +724,14 @@ fn try_ctor_at(b: &mut Vec<Stmt>, i: usize, whole: &[Stmt], env: &Env, t: &Templ
     if nonlocal_before >= args.len() {
         return false;
     }
-    let dest = args.remove(nonlocal_before);
+    let mut dest = args.remove(nonlocal_before);
+    // the destination is written: a `const T*` cast made for a constructor's pointer argument
+    // (finalize) would render `*(const T*)&x = T(..)`, which doesn't compile
+    if let Expr::Cast { ty: mwdec_core::Type::Ptr(inner), e } = &dest {
+        if let mwdec_core::Type::Const(x) = &**inner {
+            dest = Expr::Cast { ty: mwdec_core::Type::Ptr(x.clone()), e: e.clone() };
+        }
+    }
     let lv = match dest {
         Expr::AddrOf(x) => *x,
         p => Expr::Load { base: Box::new(p), offset: 0, ty: mwdec_core::Type::Named(t.class.clone().unwrap_or_default()) },
